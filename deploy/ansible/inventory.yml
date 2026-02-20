@@ -1,0 +1,38 @@
+---
+all:
+  vars:
+    aether_user: aether
+    aether_group: aether
+    aether_dir: /opt/aether
+    aether_config_dir: /opt/aether/config
+    aether_bin_dir: /opt/aether/bin
+    aether_data_dir: /opt/aether/data
+    aether_log_dir: /opt/aether/logs
+    postgres_db: aether
+    postgres_user: aether
+    redis_port: 6379
+    prometheus_port: 9091
+    grafana_port: 3000
+
+  children:
+    production:
+      hosts:
+        aether-primary:
+          ansible_host: 10.0.1.10
+          ansible_user: deploy
+          aether_role: primary
+          rust_cpu_affinity: "0-3"
+          go_cpu_affinity: "4-5"
+        aether-standby:
+          ansible_host: 10.0.1.11
+          ansible_user: deploy
+          aether_role: standby
+          rust_cpu_affinity: "0-3"
+          go_cpu_affinity: "4-5"
+
+    staging:
+      hosts:
+        aether-staging:
+          ansible_host: 10.0.2.10
+          ansible_user: deploy
+          aether_role: primary

@@ -1,0 +1,50 @@
+[Unit]
+Description=Aether Arbitrage Engine - Rust Core
+Documentation=https://github.com/aether/docs
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+Requires=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=aether
+Group=aether
+WorkingDirectory=/opt/aether
+ExecStart=/opt/aether/bin/aether-grpc-server
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Environment
+Environment=RUST_LOG=info
+Environment=AETHER_CONFIG_DIR=/opt/aether/config
+EnvironmentFile=-/opt/aether/.env
+
+# Performance tuning — CPU pinning and scheduling
+CPUAffinity=0 1 2 3
+Nice=-20
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# Memory limits
+MemoryMax=2G
+MemoryHigh=1800M
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/aether/data /opt/aether/logs
+ReadOnlyPaths=/opt/aether/config
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aether-rust
+
+[Install]
+WantedBy=multi-user.target

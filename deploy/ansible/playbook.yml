@@ -1,0 +1,174 @@
+---
+- name: Provision Aether Arbitrage Engine
+  hosts: all
+  become: true
+  vars:
+    rust_version: "1.83"
+    go_version: "1.23"
+
+  tasks:
+    # --- System Setup ---
+    - name: Update system packages
+      apt:
+        update_cache: true
+        upgrade: safe
+      when: ansible_os_family == "Debian"
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - protobuf-compiler
+          - ca-certificates
+          - curl
+          - wget
+          - jq
+          - htop
+          - iotop
+          - net-tools
+          - postgresql-client
+          - redis-tools
+        state: present
+      when: ansible_os_family == "Debian"
+
+    # --- User and Directories ---
+    - name: Create aether system user
+      user:
+        name: "{{ aether_user }}"
+        group: "{{ aether_group }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ aether_dir }}"
+        create_home: false
+
+    - name: Create aether group
+      group:
+        name: "{{ aether_group }}"
+        system: true
+
+    - name: Create directory structure
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ aether_user }}"
+        group: "{{ aether_group }}"
+        mode: "0755"
+      loop:
+        - "{{ aether_dir }}"
+        - "{{ aether_bin_dir }}"
+        - "{{ aether_config_dir }}"
+        - "{{ aether_data_dir }}"
+        - "{{ aether_log_dir }}"
+        - "{{ aether_dir }}/run"
+
+    # --- Kernel Tuning ---
+    - name: Apply kernel tuning for low-latency
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        state: present
+        reload: true
+      loop:
+        - { key: "net.ipv4.tcp_nodelay", value: "1" }
+        - { key: "net.ipv4.tcp_low_latency", value: "1" }
+        - { key: "vm.swappiness", value: "0" }
+        - { key: "net.core.rmem_max", value: "16777216" }
+        - { key: "net.core.wmem_max", value: "16777216" }
+        - { key: "net.ipv4.tcp_rmem", value: "4096 87380 16777216" }
+        - { key: "net.ipv4.tcp_wmem", value: "4096 65536 16777216" }
+        - { key: "kernel.sched_rt_runtime_us", value: "-1" }
+
+    - name: Configure huge pages
+      sysctl:
+        name: vm.nr_hugepages
+        value: "1024"
+        sysctl_set: true
+        state: present
+        reload: true
+
+    # --- Deploy Binaries ---
+    - name: Copy Rust binary
+      copy:
+        src: "../../target/release/aether-grpc-server"
+        dest: "{{ aether_bin_dir }}/aether-grpc-server"
+        owner: "{{ aether_user }}"
+        group: "{{ aether_group }}"
+        mode: "0755"
+      notify: Restart aether-rust
+
+    - name: Copy Go executor binary
+      copy:
+        src: "../../bin/aether-executor"
+        dest: "{{ aether_bin_dir }}/aether-executor"
+        owner: "{{ aether_user }}"
+        group: "{{ aether_group }}"
+        mode: "0755"
+      notify: Restart aether-go
+
+    # --- Configuration ---
+    - name: Deploy configuration files
+      copy:
+        src: "../../config/{{ item }}"
+        dest: "{{ aether_config_dir }}/{{ item }}"
+        owner: "{{ aether_user }}"
+        group: "{{ aether_group }}"
+        mode: "0640"
+      loop:
+        - pools.toml
+        - risk.yaml
+        - nodes.yaml
+        - builders.yaml
+      notify: Restart aether-rust
+
+    # --- Systemd Services ---
+    - name: Install systemd service files
+      copy:
+        src: "../systemd/{{ item }}"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - aether-rust.service
+        - aether-go.service
+      notify: Reload systemd
+
+    - name: Enable and start services
+      systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - aether-rust
+        - aether-go
+
+    # --- Firewall ---
+    - name: Configure iptables rules
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item.port }}"
+        source: "{{ item.source }}"
+        jump: ACCEPT
+        comment: "{{ item.comment }}"
+      loop:
+        - { port: "9090", source: "10.0.0.0/8", comment: "Prometheus metrics" }
+        - { port: "8080", source: "10.0.0.0/8", comment: "Dashboard" }
+        - { port: "50051", source: "127.0.0.1", comment: "gRPC local only" }
+
+  handlers:
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Restart aether-rust
+      systemd:
+        name: aether-rust
+        state: restarted
+
+    - name: Restart aether-go
+      systemd:
+        name: aether-go
+        state: restarted

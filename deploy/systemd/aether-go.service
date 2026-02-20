@@ -1,0 +1,50 @@
+[Unit]
+Description=Aether Arbitrage Engine - Go Executor
+Documentation=https://github.com/aether/docs
+After=network-online.target aether-rust.service
+Wants=network-online.target
+Requires=aether-rust.service
+
+[Service]
+Type=simple
+User=aether
+Group=aether
+WorkingDirectory=/opt/aether
+ExecStart=/opt/aether/bin/aether-executor
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Environment
+Environment=GOMAXPROCS=2
+Environment=GOGC=200
+Environment=GRPC_ADDRESS=unix:///opt/aether/run/aether.sock
+Environment=METRICS_PORT=9090
+Environment=DASHBOARD_PORT=8080
+EnvironmentFile=-/opt/aether/.env
+
+# Performance tuning — CPU pinning and scheduling
+CPUAffinity=4 5
+Nice=-15
+LimitNOFILE=65536
+
+# Memory limits
+MemoryMax=512M
+MemoryHigh=480M
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/aether/data /opt/aether/logs /opt/aether/run
+ReadOnlyPaths=/opt/aether/config
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aether-go
+
+[Install]
+WantedBy=multi-user.target
