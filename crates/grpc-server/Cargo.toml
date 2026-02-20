@@ -19,6 +19,7 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [build-dependencies]
 tonic-build = { workspace = true }
