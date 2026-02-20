@@ -1,0 +1,13 @@
+[package]
+name = "aether-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+alloy = { workspace = true }
+aether-common = { path = "../common" }
+aether-pools = { path = "../pools" }
+aether-state = { path = "../state" }
+aether-detector = { path = "../detector" }
+aether-simulator = { path = "../simulator" }

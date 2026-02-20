@@ -1,0 +1,78 @@
+version: "3.8"
+
+services:
+  aether-rust:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.rust
+    container_name: aether-rust
+    ports:
+      - "50051:50051"
+    volumes:
+      - ../../config:/app/config:ro
+    environment:
+      - RUST_LOG=info
+      - AETHER_CONFIG_DIR=/app/config
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - aether-net
+
+  aether-go:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.go
+    container_name: aether-go
+    ports:
+      - "9090:9090"
+      - "8080:8080"
+    environment:
+      - GRPC_ADDRESS=aether-rust:50051
+      - METRICS_PORT=9090
+      - DASHBOARD_PORT=8080
+    restart: unless-stopped
+    depends_on:
+      - aether-rust
+    networks:
+      - aether-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aether-postgres
+    environment:
+      - POSTGRES_DB=aether
+      - POSTGRES_USER=aether
+      - POSTGRES_PASSWORD=aether_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - aether-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: aether-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - aether-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aether-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - aether-net
+
+volumes:
+  postgres-data:
+
+networks:
+  aether-net:
+    driver: bridge

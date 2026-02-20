@@ -8,6 +8,7 @@ members = [
     "crates/detector",
     "crates/simulator",
     "crates/grpc-server",
+    "crates/integration-tests",
 ]
 
 [workspace.package]
