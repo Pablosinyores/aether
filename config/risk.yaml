@@ -1,0 +1,19 @@
+circuit_breakers:
+  max_gas_gwei: 300
+  consecutive_reverts_pause: 3
+  revert_window_minutes: 10
+  daily_loss_halt_eth: 0.5
+  min_eth_balance: 0.1
+  max_node_latency_ms: 500
+  bundle_miss_rate_alert_pct: 80
+  bundle_miss_rate_window_minutes: 60
+
+position_limits:
+  max_single_trade_eth: 50.0
+  max_daily_volume_eth: 500.0
+  min_profit_eth: 0.001
+  max_tip_share_pct: 95
+
+system:
+  initial_state: "running"
+  manual_reset_required_from_halted: true

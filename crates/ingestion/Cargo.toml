@@ -1,0 +1,14 @@
+[package]
+name = "aether-ingestion"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aether-common = { path = "../common" }
+aether-pools = { path = "../pools" }
+tokio = { workspace = true }
+alloy = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

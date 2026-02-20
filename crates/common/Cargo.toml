@@ -1,0 +1,11 @@
+[package]
+name = "aether-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alloy = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ruint = { workspace = true }
+prost = { workspace = true }

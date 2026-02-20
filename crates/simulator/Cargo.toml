@@ -1,0 +1,16 @@
+[package]
+name = "aether-simulator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aether-common = { path = "../common" }
+aether-pools = { path = "../pools" }
+alloy = { workspace = true }
+revm = { workspace = true }
+revm-database = { workspace = true }
+tracing = { workspace = true }
+ruint = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "aether-detector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aether-common = { path = "../common" }
+aether-pools = { path = "../pools" }
+aether-state = { path = "../state" }
+alloy = { workspace = true }
+tracing = { workspace = true }
+ruint = { workspace = true }

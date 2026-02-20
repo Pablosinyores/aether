@@ -1,0 +1,106 @@
+syntax = "proto3";
+package aether;
+
+service ArbService {
+    rpc SubmitArb(ValidatedArb) returns (SubmitArbResponse);
+    rpc StreamArbs(StreamArbsRequest) returns (stream ValidatedArb);
+}
+
+service HealthService {
+    rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+service ControlService {
+    rpc SetState(SetStateRequest) returns (SetStateResponse);
+    rpc ReloadConfig(ReloadConfigRequest) returns (ReloadConfigResponse);
+}
+
+enum ProtocolType {
+    PROTOCOL_UNKNOWN = 0;
+    UNISWAP_V2 = 1;
+    UNISWAP_V3 = 2;
+    SUSHISWAP = 3;
+    CURVE = 4;
+    BALANCER_V2 = 5;
+    BANCOR_V3 = 6;
+}
+
+enum SystemState {
+    STATE_UNKNOWN = 0;
+    RUNNING = 1;
+    DEGRADED = 2;
+    PAUSED = 3;
+    HALTED = 4;
+}
+
+message SwapStep {
+    ProtocolType protocol = 1;
+    bytes pool_address = 2;
+    bytes token_in = 3;
+    bytes token_out = 4;
+    bytes amount_in = 5;
+    bytes min_amount_out = 6;
+    bytes calldata = 7;
+}
+
+message ArbHop {
+    ProtocolType protocol = 1;
+    bytes pool_address = 2;
+    bytes token_in = 3;
+    bytes token_out = 4;
+    bytes amount_in = 5;
+    bytes expected_out = 6;
+    uint64 estimated_gas = 7;
+}
+
+message ValidatedArb {
+    string id = 1;
+    repeated ArbHop hops = 2;
+    bytes total_profit_wei = 3;
+    uint64 total_gas = 4;
+    bytes gas_cost_wei = 5;
+    bytes net_profit_wei = 6;
+    uint64 block_number = 7;
+    int64 timestamp_ns = 8;
+    bytes flashloan_token = 9;
+    bytes flashloan_amount = 10;
+    repeated SwapStep steps = 11;
+    bytes calldata = 12;
+}
+
+message SubmitArbResponse {
+    bool accepted = 1;
+    string bundle_hash = 2;
+    string error = 3;
+}
+
+message StreamArbsRequest {
+    double min_profit_eth = 1;
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+    bool healthy = 1;
+    string status = 2;
+    int64 uptime_seconds = 3;
+    uint64 last_block = 4;
+    uint32 active_pools = 5;
+}
+
+message SetStateRequest {
+    SystemState state = 1;
+    string reason = 2;
+}
+message SetStateResponse {
+    bool success = 1;
+    SystemState previous_state = 2;
+}
+
+message ReloadConfigRequest {
+    string config_path = 1;
+}
+message ReloadConfigResponse {
+    bool success = 1;
+    uint32 pools_loaded = 2;
+    string error = 3;
+}

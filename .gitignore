@@ -1,0 +1,15 @@
+target/
+Cargo.lock
+contracts/out/
+contracts/cache/
+*.key
+*.pem
+.env
+.env.*
+*.log
+.DS_Store
+
+# Go binaries
+/executor
+/monitor
+/risk

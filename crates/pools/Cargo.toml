@@ -1,0 +1,13 @@
+[package]
+name = "aether-pools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aether-common = { path = "../common" }
+alloy = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+ruint = { workspace = true }
+dashmap = { workspace = true }

@@ -1,0 +1,11 @@
+nodes:
+  - name: "alchemy-ws"
+    url: "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+    type: "websocket"
+    priority: 1
+  - name: "local-reth"
+    url: "/tmp/reth.ipc"
+    type: "ipc"
+    priority: 0
+
+min_healthy_nodes: 2

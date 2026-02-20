@@ -1,0 +1,13 @@
+builders:
+  - name: "flashbots"
+    url: "https://relay.flashbots.net"
+    enabled: true
+    timeout_ms: 2000
+  - name: "titan"
+    url: "https://rpc.titanbuilder.xyz"
+    enabled: true
+    timeout_ms: 2000
+
+submission:
+  fan_out: true
+  max_retries: 2
