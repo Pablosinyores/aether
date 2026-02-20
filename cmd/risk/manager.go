@@ -1,7 +1,216 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+	"math/big"
+	"sync"
+	"time"
+)
 
-func main() {
-	fmt.Println("aether-risk service")
+// RiskConfig holds all risk management parameters
+type RiskConfig struct {
+	MaxGasGwei              float64
+	ConsecutiveRevertsPause int
+	RevertWindowMinutes     int
+	DailyLossHaltETH        float64
+	MinETHBalance           float64
+	MaxNodeLatencyMs        int64
+	BundleMissRateAlertPct  float64
+	BundleMissRateWindowMin int
+	MaxSingleTradeETH       float64
+	MaxDailyVolumeETH       float64
+	MinProfitETH            float64
+	MaxTipSharePct          float64
+}
+
+// DefaultRiskConfig returns the default risk parameters from CLAUDE.md
+func DefaultRiskConfig() RiskConfig {
+	return RiskConfig{
+		MaxGasGwei:              300,
+		ConsecutiveRevertsPause: 3,
+		RevertWindowMinutes:     10,
+		DailyLossHaltETH:        0.5,
+		MinETHBalance:           0.1,
+		MaxNodeLatencyMs:        500,
+		BundleMissRateAlertPct:  80,
+		BundleMissRateWindowMin: 60,
+		MaxSingleTradeETH:       50.0,
+		MaxDailyVolumeETH:       500.0,
+		MinProfitETH:            0.001,
+		MaxTipSharePct:          95.0,
+	}
+}
+
+// PreflightResult holds the result of a preflight check
+type PreflightResult struct {
+	Approved bool
+	Reason   string
+}
+
+// RiskManager implements circuit breakers and position limits
+type RiskManager struct {
+	mu               sync.RWMutex
+	config           RiskConfig
+	state            *SystemStateMachine
+	recentReverts    []time.Time
+	dailyVolume      *big.Int // Wei
+	dailyPnL         *big.Int // Wei (can be negative)
+	dailyResetTime   time.Time
+	bundlesSubmitted int
+	bundlesIncluded  int
+}
+
+// NewRiskManager creates a new risk manager
+func NewRiskManager(config RiskConfig) *RiskManager {
+	return &RiskManager{
+		config:         config,
+		state:          NewSystemStateMachine(),
+		recentReverts:  make([]time.Time, 0),
+		dailyVolume:    big.NewInt(0),
+		dailyPnL:       big.NewInt(0),
+		dailyResetTime: time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour),
+	}
+}
+
+// PreflightCheck validates an arb opportunity against all risk limits
+func (rm *RiskManager) PreflightCheck(
+	profitWei *big.Int,
+	tradeValueWei *big.Int,
+	gasGwei float64,
+	tipSharePct float64,
+	ethBalance float64,
+) PreflightResult {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	// Check system state
+	if rm.state.Current() != StateRunning && rm.state.Current() != StateDegraded {
+		return PreflightResult{false, fmt.Sprintf("system state: %s", rm.state.Current())}
+	}
+
+	// Circuit breaker: gas price
+	if gasGwei > rm.config.MaxGasGwei {
+		return PreflightResult{false, fmt.Sprintf("gas too high: %.1f > %.1f gwei", gasGwei, rm.config.MaxGasGwei)}
+	}
+
+	// Circuit breaker: ETH balance
+	if ethBalance < rm.config.MinETHBalance {
+		return PreflightResult{false, fmt.Sprintf("ETH balance too low: %.4f < %.4f", ethBalance, rm.config.MinETHBalance)}
+	}
+
+	// Position limit: single trade size
+	tradeETH := weiToETH(tradeValueWei)
+	if tradeETH > rm.config.MaxSingleTradeETH {
+		return PreflightResult{false, fmt.Sprintf("trade too large: %.2f > %.2f ETH", tradeETH, rm.config.MaxSingleTradeETH)}
+	}
+
+	// Position limit: daily volume
+	newVolume := new(big.Int).Add(rm.dailyVolume, tradeValueWei)
+	if weiToETH(newVolume) > rm.config.MaxDailyVolumeETH {
+		return PreflightResult{false, fmt.Sprintf("daily volume exceeded: %.2f ETH", rm.config.MaxDailyVolumeETH)}
+	}
+
+	// Position limit: minimum profit
+	profitETH := weiToETH(profitWei)
+	if profitETH < rm.config.MinProfitETH {
+		return PreflightResult{false, fmt.Sprintf("profit too low: %.6f < %.6f ETH", profitETH, rm.config.MinProfitETH)}
+	}
+
+	// Position limit: max tip share
+	if tipSharePct > rm.config.MaxTipSharePct {
+		return PreflightResult{false, fmt.Sprintf("tip share too high: %.1f%% > %.1f%%", tipSharePct, rm.config.MaxTipSharePct)}
+	}
+
+	return PreflightResult{true, "approved"}
+}
+
+// RecordRevert records a transaction revert for circuit breaker tracking
+func (rm *RiskManager) RecordRevert() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	now := time.Now()
+	rm.recentReverts = append(rm.recentReverts, now)
+
+	// Clean old reverts outside window
+	cutoff := now.Add(-time.Duration(rm.config.RevertWindowMinutes) * time.Minute)
+	cleaned := make([]time.Time, 0)
+	for _, t := range rm.recentReverts {
+		if t.After(cutoff) {
+			cleaned = append(cleaned, t)
+		}
+	}
+	rm.recentReverts = cleaned
+
+	// Check consecutive reverts threshold
+	if len(rm.recentReverts) >= rm.config.ConsecutiveRevertsPause {
+		log.Printf("CIRCUIT BREAKER: %d reverts in %d minutes, pausing",
+			len(rm.recentReverts), rm.config.RevertWindowMinutes)
+		rm.state.Transition(StatePaused)
+	}
+}
+
+// RecordTrade records a completed trade for daily tracking
+func (rm *RiskManager) RecordTrade(volumeWei *big.Int, pnlWei *big.Int) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	rm.maybeResetDaily()
+	rm.dailyVolume.Add(rm.dailyVolume, volumeWei)
+	rm.dailyPnL.Add(rm.dailyPnL, pnlWei)
+
+	// Check daily loss halt
+	lossETH := weiToETH(new(big.Int).Neg(rm.dailyPnL))
+	if lossETH > rm.config.DailyLossHaltETH {
+		log.Printf("CIRCUIT BREAKER: daily loss %.4f ETH exceeds threshold %.4f ETH, halting",
+			lossETH, rm.config.DailyLossHaltETH)
+		rm.state.Transition(StateHalted)
+	}
+}
+
+// RecordBundleResult records bundle inclusion/miss for rate tracking
+func (rm *RiskManager) RecordBundleResult(included bool) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	rm.bundlesSubmitted++
+	if included {
+		rm.bundlesIncluded++
+	}
+}
+
+// BundleMissRate returns the current bundle miss rate as a percentage
+func (rm *RiskManager) BundleMissRate() float64 {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	if rm.bundlesSubmitted == 0 {
+		return 0.0
+	}
+	missRate := float64(rm.bundlesSubmitted-rm.bundlesIncluded) / float64(rm.bundlesSubmitted) * 100
+	return missRate
+}
+
+// State returns the current system state
+func (rm *RiskManager) State() SystemState {
+	return rm.state.Current()
+}
+
+func (rm *RiskManager) maybeResetDaily() {
+	if time.Now().After(rm.dailyResetTime) {
+		rm.dailyVolume = big.NewInt(0)
+		rm.dailyPnL = big.NewInt(0)
+		rm.dailyResetTime = time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour)
+		log.Println("Daily counters reset")
+	}
+}
+
+// weiToETH converts wei to ETH as float64
+func weiToETH(wei *big.Int) float64 {
+	eth := new(big.Float).SetInt(wei)
+	divisor := new(big.Float).SetFloat64(1e18)
+	eth.Quo(eth, divisor)
+	f, _ := eth.Float64()
+	return f
 }
