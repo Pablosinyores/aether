@@ -23,7 +23,7 @@ services:
   aether-go:
     build:
       context: ../..
-      dockerfile: deploy/docker/Dockerfile.go
+      dockerfile: deploy/docker/go.Dockerfile
     container_name: aether-go
     ports:
       - "9090:9090"
