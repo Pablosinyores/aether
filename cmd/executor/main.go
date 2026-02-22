@@ -4,11 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/aether-arb/aether/internal/config"
+	aethergrpc "github.com/aether-arb/aether/internal/grpc"
+	pb "github.com/aether-arb/aether/internal/pb"
+	"github.com/aether-arb/aether/internal/risk"
 )
 
 // Config holds executor service configuration
@@ -19,6 +25,8 @@ type Config struct {
 	ChainID        int64
 	MaxGasGwei     float64
 	TipSharePct    float64
+	ExecutorAddr   string  // On-chain AetherExecutor contract address
+	EthBalance     float64 // Current ETH balance of searcher wallet (simulated)
 }
 
 func defaultConfig() Config {
@@ -28,19 +36,62 @@ func defaultConfig() Config {
 		ChainID:        1,
 		MaxGasGwei:     300.0,
 		TipSharePct:    90.0,
+		ExecutorAddr:   "0x0000000000000000000000000000000000000000",
+		EthBalance:     0.5,
 	}
+}
+
+// loadConfig attempts to load the executor Config from YAML config files,
+// falling back to defaults for any config that cannot be loaded.
+func loadConfig() Config {
+	cfg := defaultConfig()
+
+	// Try loading builders from config/builders.yaml
+	buildersPath := config.ConfigPath("builders.yaml")
+	bc, err := config.LoadBuildersConfig(buildersPath)
+	if err != nil {
+		log.Printf("Config: builders.yaml not loaded (%v), using defaults", err)
+	} else {
+		builders := make([]BuilderConfig, 0, len(bc.Builders))
+		for _, b := range bc.Builders {
+			builders = append(builders, BuilderConfig{
+				Name:      b.Name,
+				URL:       b.URL,
+				Enabled:   b.Enabled,
+				TimeoutMs: b.TimeoutMs,
+			})
+		}
+		cfg.BuilderConfigs = builders
+		log.Printf("Config: loaded %d builders from %s", len(builders), buildersPath)
+	}
+
+	return cfg
+}
+
+// loadRiskConfig attempts to load risk parameters from config/risk.yaml,
+// falling back to DefaultRiskConfig if the file cannot be loaded.
+func loadRiskConfig() risk.RiskConfig {
+	riskPath := config.ConfigPath("risk.yaml")
+	rc, err := risk.LoadRiskConfig(riskPath)
+	if err != nil {
+		log.Printf("Config: risk.yaml not loaded (%v), using defaults", err)
+		return risk.DefaultRiskConfig()
+	}
+	log.Printf("Config: loaded risk config from %s", riskPath)
+	return rc
 }
 
 func main() {
 	fmt.Println("aether-executor: bundle construction and submission service")
 
-	cfg := defaultConfig()
+	cfg := loadConfig()
 
 	// Initialize components
 	nonceManager := NewNonceManager(0)
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
 	submitter := NewSubmitter(cfg.BuilderConfigs)
 	bundler := NewBundleConstructor(nonceManager, gasOracle, cfg.TipSharePct, cfg.ChainID)
+	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -68,9 +119,23 @@ func main() {
 	log.Printf("Executor service started, gRPC target: %s", cfg.GRPCAddress)
 	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
 
-	// Prevent unused variable errors — these will be used when gRPC client is wired
-	_ = submitter
-	_ = bundler
+	// Connect to Rust engine gRPC server.
+	// grpc.NewClient is lazy — the TCP connection is established on first RPC,
+	// so this call returns immediately even if the Rust server is not running.
+	grpcClient, err := aethergrpc.Dial(cfg.GRPCAddress)
+	if err != nil {
+		log.Printf("WARNING: could not create gRPC client for %s: %v", cfg.GRPCAddress, err)
+		log.Printf("Executor will start without arb stream")
+	} else {
+		defer grpcClient.Close()
+
+		// Start arb stream consumer goroutine
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
+		}()
+	}
 
 	// Wait for shutdown signal
 	select {
@@ -83,4 +148,100 @@ func main() {
 	// Wait for goroutines
 	wg.Wait()
 	log.Println("Executor service stopped")
+}
+
+// processArb handles a single validated arb through the full pipeline:
+// parse -> preflight -> bundle -> submit -> record result
+func processArb(
+	ctx context.Context,
+	arb *pb.ValidatedArb,
+	rm *risk.RiskManager,
+	bundler *BundleConstructor,
+	submitter *Submitter,
+	executorAddr string,
+	tipSharePct float64,
+	ethBalance float64,
+) (submitted bool, err error) {
+	// Parse net_profit_wei from proto bytes to big.Int
+	profitWei := new(big.Int).SetBytes(arb.NetProfitWei)
+
+	// Parse flashloan_amount as trade value
+	tradeValueWei := new(big.Int).SetBytes(arb.FlashloanAmount)
+
+	// Get current gas price from the bundler's gas oracle
+	gasFees := bundler.gasOracle.CurrentFees()
+	gasGwei := gasFees.GasPriceGwei
+
+	// Preflight risk check
+	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
+	if !result.Approved {
+		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
+		return false, nil
+	}
+
+	// Build bundle
+	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1)
+	if err != nil {
+		return false, fmt.Errorf("build bundle: %w", err)
+	}
+
+	// Submit to all builders
+	results := submitter.SubmitToAll(ctx, bundle)
+	successes := SuccessCount(results)
+
+	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
+
+	// Record result for miss rate tracking
+	rm.RecordBundleResult(successes > 0)
+
+	return successes > 0, nil
+}
+
+// consumeArbStream connects to the Rust engine's StreamArbs RPC and
+// processes validated arbitrage opportunities as they arrive. On stream
+// errors it reconnects with a backoff delay. The function exits when ctx
+// is cancelled.
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, tipSharePct float64, ethBalance float64) {
+	const (
+		minProfitETH   = 0.001 // Minimum profit threshold in ETH
+		reconnectDelay = 5 * time.Second
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := client.StreamArbs(ctx, minProfitETH)
+		if err != nil {
+			log.Printf("StreamArbs connect error: %v, retrying in %v...", err, reconnectDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+				continue
+			}
+		}
+
+		log.Println("Connected to Rust engine arb stream")
+
+		for {
+			arb, err := stream.Recv()
+			if err != nil {
+				log.Printf("Arb stream recv error: %v, reconnecting...", err)
+				break
+			}
+
+			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
+				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
+
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter, executorAddr, tipSharePct, ethBalance)
+			if err != nil {
+				log.Printf("Error processing arb %s: %v", arb.Id, err)
+			}
+			_ = submitted
+		}
+	}
 }
