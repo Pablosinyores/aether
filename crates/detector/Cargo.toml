@@ -10,3 +10,10 @@ aether-state = { path = "../state" }
 alloy = { workspace = true }
 tracing = { workspace = true }
 ruint = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "detection"
+harness = false
