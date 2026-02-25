@@ -7,7 +7,10 @@ publish = false
 [dev-dependencies]
 alloy = { workspace = true }
 aether-common = { path = "../common" }
+aether-ingestion = { path = "../ingestion" }
 aether-pools = { path = "../pools" }
 aether-state = { path = "../state" }
 aether-detector = { path = "../detector" }
 aether-simulator = { path = "../simulator" }
+tokio = { workspace = true }
+url = "2"
