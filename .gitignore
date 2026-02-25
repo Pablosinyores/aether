@@ -13,3 +13,11 @@ contracts/cache/
 /executor
 /monitor
 /risk
+
+# Claude/AI tooling
+.mcp.json
+.claude/
+
+# Build artifacts (top-level)
+cache/
+out/
