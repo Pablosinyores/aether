@@ -11,3 +11,10 @@ dashmap = { workspace = true }
 arc-swap = { workspace = true }
 tracing = { workspace = true }
 ruint = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "graph"
+harness = false
