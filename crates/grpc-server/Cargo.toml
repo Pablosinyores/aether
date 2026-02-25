@@ -14,12 +14,16 @@ aether-pools = { path = "../pools" }
 aether-state = { path = "../state" }
 aether-detector = { path = "../detector" }
 aether-simulator = { path = "../simulator" }
+alloy = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { workspace = true }
+toml = { workspace = true }
+url = "2"
 
 [build-dependencies]
 tonic-build = { workspace = true }
