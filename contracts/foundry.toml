@@ -5,6 +5,7 @@ libs = ["../lib"]
 solc = "0.8.20"
 optimizer = true
 optimizer_runs = 200
+remappings = ["@openzeppelin/=../lib/openzeppelin-contracts/"]
 
 [profile.default.fuzz]
 runs = 256

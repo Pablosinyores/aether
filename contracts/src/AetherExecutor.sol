@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title AetherExecutor - Flash loan arbitrage executor
 /// @notice Executes cross-DEX arbitrage using Aave V3 flash loans
 /// @dev All swap steps must be profitable after gas + flash loan premium
 contract AetherExecutor {
+    using SafeERC20 for IERC20;
+
     address public owner;
     address public immutable aavePool;
 
@@ -101,7 +104,7 @@ contract AetherExecutor {
 
         // Repay flash loan (amount + premium)
         uint256 totalDebt = amount + premium;
-        IERC20(asset).approve(aavePool, totalDebt);
+        IERC20(asset).forceApprove(aavePool, totalDebt);
 
         // Calculate and transfer profit
         uint256 balance = IERC20(asset).balanceOf(address(this));
@@ -109,7 +112,7 @@ contract AetherExecutor {
         uint256 profit = balance - totalDebt;
 
         // Transfer profit to owner
-        IERC20(asset).transfer(owner, profit);
+        IERC20(asset).safeTransfer(owner, profit);
 
         uint256 gasUsed = gasStart - gasleft();
         emit ArbExecuted(asset, amount, profit, gasUsed);
@@ -120,7 +123,7 @@ contract AetherExecutor {
     /// @dev Execute a single swap step based on protocol
     function _executeSwap(SwapStep memory step, uint256 index) internal {
         // Transfer tokens to pool (for protocols that require it)
-        IERC20(step.tokenIn).transfer(step.pool, step.amountIn);
+        IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
 
         uint256 balanceBefore = IERC20(step.tokenOut).balanceOf(address(this));
 
@@ -174,7 +177,7 @@ contract AetherExecutor {
 
     /// @notice Emergency token rescue - owner only
     function rescue(address token, uint256 amount) external onlyOwner {
-        IERC20(token).transfer(owner, amount);
+        IERC20(token).safeTransfer(owner, amount);
     }
 
     /// @notice Transfer ownership
