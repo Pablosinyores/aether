@@ -1,8 +1,77 @@
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, U256};
+use alloy::providers::DynProvider;
 use revm::database::CacheDB;
 use revm::database_interface::EmptyDB;
 use revm::state::AccountInfo;
+use revm_database::{AlloyDB, BlockId, WrapDatabaseAsync};
 use tracing::debug;
+
+// ── RPC-backed forked state (AlloyDB) ──────────────────────────────
+
+/// Inner AlloyDB parameterized on the type-erased provider.
+type AlloyDbInner = AlloyDB<Ethereum, DynProvider<Ethereum>>;
+
+/// Synchronous wrapper around the async AlloyDB.
+type SyncAlloyDb = WrapDatabaseAsync<AlloyDbInner>;
+
+/// The database type used by `RpcForkedState`: a local cache backed by
+/// lazy RPC fetches via AlloyDB.
+pub type RpcDB = CacheDB<SyncAlloyDb>;
+
+/// Forked EVM state backed by a real Ethereum RPC endpoint.
+///
+/// On every cache miss (unknown account, storage slot, or block hash)
+/// the underlying `AlloyDB` fetches the value from the remote node.
+/// Subsequent reads are served from the in-memory `CacheDB`.
+///
+/// **Must** be created inside a multi-threaded tokio runtime
+/// (`WrapDatabaseAsync::new` uses `block_in_place`).
+pub struct RpcForkedState {
+    pub db: RpcDB,
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub base_fee: u64,
+    pub chain_id: u64,
+}
+
+impl RpcForkedState {
+    /// Create a new RPC-backed forked state.
+    ///
+    /// Returns `None` when called outside a multi-threaded tokio runtime
+    /// (required by `WrapDatabaseAsync`).
+    pub fn new(
+        provider: DynProvider<Ethereum>,
+        block_number: u64,
+        block_timestamp: u64,
+        base_fee: u64,
+    ) -> Option<Self> {
+        let alloy_db = AlloyDB::new(provider, BlockId::from(block_number));
+        let sync_db = WrapDatabaseAsync::new(alloy_db)?;
+        let cache_db = CacheDB::new(sync_db);
+
+        Some(Self {
+            db: cache_db,
+            block_number,
+            block_timestamp,
+            base_fee,
+            chain_id: 1, // Ethereum mainnet
+        })
+    }
+
+    /// Override the ETH balance for an address (e.g. the simulation caller).
+    pub fn insert_account_balance(&mut self, address: Address, balance: U256) {
+        let info = AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash: revm::primitives::KECCAK_EMPTY,
+            code: None,
+            ..Default::default()
+        };
+        self.db.insert_account_info(address, info);
+        debug!(%address, %balance, "RpcForkedState: inserted EOA override");
+    }
+}
 
 /// Forked EVM state using revm's CacheDB.
 /// In production, this would be backed by AlloyDB for actual RPC state.
