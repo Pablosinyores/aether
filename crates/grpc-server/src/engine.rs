@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info};
 
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, U256};
+use alloy::providers::{DynProvider, Provider};
 
 use aether_common::types::{ArbHop, ArbOpportunity, PoolId, ProtocolType, SwapStep};
 use aether_detector::bellman_ford::BellmanFord;
@@ -12,7 +15,7 @@ use aether_detector::gas::{estimate_total_gas, gas_cost_wei};
 use aether_ingestion::event_decoder::PoolEvent;
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
 use aether_simulator::calldata::build_execute_arb_calldata;
-use aether_simulator::fork::ForkedState;
+use aether_simulator::fork::{ForkedState, RpcForkedState};
 use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
@@ -31,6 +34,12 @@ pub struct EngineConfig {
     pub min_profit_threshold_wei: u128,
     /// Gas price assumption in gwei for profit calculations.
     pub gas_price_gwei: f64,
+    /// Optional RPC URL for real fork simulation. When `None`, falls back to
+    /// the empty-state `ForkedState` (no on-chain data).
+    pub rpc_url: Option<String>,
+    /// Executor contract address used as the simulation target.
+    /// Defaults to `Address::ZERO` (empty call) when unset.
+    pub executor_address: Address,
 }
 
 impl Default for EngineConfig {
@@ -40,6 +49,8 @@ impl Default for EngineConfig {
             detection_time_budget_us: 3_000, // 3ms
             min_profit_threshold_wei: 1_000_000_000_000_000, // 0.001 ETH
             gas_price_gwei: 30.0,
+            rpc_url: None,
+            executor_address: Address::ZERO,
         }
     }
 }
@@ -88,6 +99,10 @@ pub struct AetherEngine {
     token_index: Arc<RwLock<TokenIndex>>,
     /// Pool address → metadata mapping for event handling.
     pool_registry: Arc<RwLock<HashMap<Address, PoolMetadata>>>,
+    /// Optional type-erased alloy provider for RPC-backed simulation.
+    /// When `Some`, `run_detection_cycle` uses `RpcForkedState` instead of
+    /// the empty `ForkedState`.
+    rpc_provider: Option<DynProvider<Ethereum>>,
 }
 
 /// Lightweight snapshot of the current block's key fields.
@@ -125,6 +140,20 @@ impl AetherEngine {
         let detector = BellmanFord::new(config.max_hops, config.detection_time_budget_us);
         let simulator = EvmSimulator::with_defaults();
 
+        // Build the RPC provider when an RPC URL is configured.
+        let rpc_provider = config.rpc_url.as_ref().and_then(|url_str| {
+            let parsed: url::Url = match url_str.parse() {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(error = %e, url = %url_str, "Invalid RPC URL, falling back to empty state");
+                    return None;
+                }
+            };
+            let provider = alloy::providers::ProviderBuilder::new().connect_http(parsed);
+            info!(url = %url_str, "RPC provider created for fork simulation");
+            Some(provider.erased())
+        });
+
         // Start with a reasonable initial graph size (can grow dynamically).
         let price_graph = Arc::new(RwLock::new(PriceGraph::new(100)));
 
@@ -138,6 +167,7 @@ impl AetherEngine {
             current_block: Arc::new(RwLock::new(BlockInfo::default())),
             token_index: Arc::new(RwLock::new(TokenIndex::new())),
             pool_registry: Arc::new(RwLock::new(HashMap::new())),
+            rpc_provider,
         }
     }
 
@@ -368,6 +398,8 @@ impl AetherEngine {
 
     /// Run a detection cycle: scan for negative cycles, simulate, publish.
     async fn run_detection_cycle(&self) {
+        let t_cycle = Instant::now();
+
         // Phase 1: Detect cycles and extract candidate data under read locks.
         let candidates = {
             let graph = self.price_graph.read().await;
@@ -379,12 +411,15 @@ impl AetherEngine {
             // Get affected vertices for partial scan.
             let affected = graph.affected_vertices();
 
+            let t_detect = Instant::now();
             let cycles = if affected.is_empty() {
                 // Full scan (e.g., on first run).
                 self.detector.detect_negative_cycles(&graph)
             } else {
                 self.detector.detect_from_affected(&graph, &affected)
             };
+            let detect_us = t_detect.elapsed().as_micros();
+            info!(detect_us, "Bellman-Ford detection complete");
 
             if cycles.is_empty() {
                 drop(graph);
@@ -495,7 +530,12 @@ impl AetherEngine {
             // graph and token_index read locks released here.
         };
 
+        let phase1_us = t_cycle.elapsed().as_micros();
+
         // Phase 2: Simulate and publish (no graph lock needed).
+        let t_phase2 = Instant::now();
+        let mut sim_count: u32 = 0;
+        let mut sim_success: u32 = 0;
         let block_info = self.current_block.read().await.clone();
 
         for candidate in &candidates {
@@ -565,20 +605,47 @@ impl AetherEngine {
             };
 
             // Simulate on forked state.
-            let forked_state = ForkedState::new_empty(
-                block_info.number,
-                block_info.timestamp,
-                block_info.base_fee as u64,
-            );
+            let executor_addr = self.config.executor_address;
 
-            // Executor contract address (placeholder — would be loaded from config).
-            let executor_addr = Address::ZERO;
-            let sim_result =
+            let t_sim = Instant::now();
+            let sim_result = if let Some(ref provider) = self.rpc_provider {
+                // RPC-backed fork: lazily fetches real contract code/storage.
+                match RpcForkedState::new(
+                    provider.clone(),
+                    block_info.number,
+                    block_info.timestamp,
+                    block_info.base_fee as u64,
+                ) {
+                    Some(rpc_state) => {
+                        self.simulator
+                            .simulate_rpc(rpc_state, executor_addr, calldata.clone())
+                    }
+                    None => {
+                        debug!("RpcForkedState::new returned None (not in multi-threaded runtime?), falling back to empty state");
+                        let forked_state = ForkedState::new_empty(
+                            block_info.number,
+                            block_info.timestamp,
+                            block_info.base_fee as u64,
+                        );
+                        self.simulator
+                            .simulate(&forked_state, executor_addr, calldata.clone())
+                    }
+                }
+            } else {
+                // Empty state fallback (no RPC configured).
+                let forked_state = ForkedState::new_empty(
+                    block_info.number,
+                    block_info.timestamp,
+                    block_info.base_fee as u64,
+                );
                 self.simulator
-                    .simulate(&forked_state, executor_addr, calldata.clone());
+                    .simulate(&forked_state, executor_addr, calldata.clone())
+            };
+            let sim_us = t_sim.elapsed().as_micros();
+            sim_count += 1;
 
             if !sim_result.success {
-                debug!(reason = ?sim_result.revert_reason, "Simulation failed, skipping");
+                debug!(sim_us, reason = ?sim_result.revert_reason, "Simulation failed, skipping");
                 continue;
             }
 
@@ -595,17 +662,32 @@ impl AetherEngine {
             if let Err(e) = self.arb_tx.send(proto_arb) {
                 debug!(error = %e, "No arb subscribers connected");
             } else {
+                sim_success += 1;
                 info!(
                     id = %opp.id,
                     net_profit_wei = net_profit,
+                    sim_us,
                     "Published validated arb"
                 );
             }
         }
 
+        let phase2_us = t_phase2.elapsed().as_micros();
+        let total_cycle_us = t_cycle.elapsed().as_micros();
+
         // Phase 3: Clear dirty flags.
         let mut graph = self.price_graph.write().await;
         graph.clear_dirty();
+
+        info!(
+            total_cycle_us,
+            phase1_us,
+            phase2_us,
+            candidates = candidates.len(),
+            simulated = sim_count,
+            sim_passed = sim_success,
+            "Detection cycle complete"
+        );
     }
 
     /// Get the minimum profit threshold in wei.
@@ -777,6 +859,7 @@ mod tests {
             detection_time_budget_us: 5_000,
             min_profit_threshold_wei: 2_000_000_000_000_000,
             gas_price_gwei: 50.0,
+            ..EngineConfig::default()
         };
         let (tx, _rx) = broadcast::channel(100);
         let engine = AetherEngine::new(config, tx);

@@ -42,7 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the AetherEngine with a broadcast sender connected to the
     // ArbService's stream.
     let arb_tx = arb_service.arb_sender();
-    let engine = Arc::new(AetherEngine::new(EngineConfig::default(), arb_tx));
+    let engine_config = EngineConfig {
+        rpc_url: std::env::var("ETH_RPC_URL").ok(),
+        ..EngineConfig::default()
+    };
+    if engine_config.rpc_url.is_some() {
+        info!("ETH_RPC_URL set — engine will use RPC-backed fork simulation");
+    } else {
+        info!("ETH_RPC_URL not set — engine will use empty-state simulation");
+    }
+    let engine = Arc::new(AetherEngine::new(engine_config, arb_tx));
 
     // Create the RpcProvider, sharing the engine's event channels so events
     // flow from the provider into the engine's event loop.
