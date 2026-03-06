@@ -3,7 +3,7 @@ pub mod fork;
 
 use alloy::primitives::{Address, U256};
 use aether_common::types::SimulationResult;
-use fork::{ForkedState, SimConfig};
+use fork::{ForkedState, RpcDB, RpcForkedState, SimConfig};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
 use revm::database::{CacheDB, EmptyDBTyped};
@@ -220,6 +220,93 @@ impl EvmSimulator {
             }
             Err(e) => {
                 error!(error = %e, "EVM transact error");
+                SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some(format!("EVM error: {}", e)),
+                }
+            }
+        }
+    }
+
+    /// Simulate a transaction against a real RPC-backed fork state.
+    ///
+    /// Takes ownership of `RpcForkedState` because the underlying `AlloyDB`
+    /// is not `Clone`. Creating a new `RpcForkedState` per simulation is cheap
+    /// since the provider is `Arc`-wrapped internally.
+    pub fn simulate_rpc(
+        &self,
+        state: RpcForkedState,
+        to: Address,
+        calldata: Vec<u8>,
+    ) -> SimulationResult {
+        let block = BlockEnv {
+            number: U256::from(state.block_number),
+            timestamp: U256::from(state.block_timestamp),
+            basefee: state.base_fee,
+            ..Default::default()
+        };
+
+        let tx = TxEnv::builder()
+            .caller(self.config.caller)
+            .kind(revm::primitives::TxKind::Call(to))
+            .data(revm::primitives::Bytes::copy_from_slice(&calldata))
+            .value(self.config.value)
+            .gas_limit(self.config.gas_limit)
+            .gas_price(state.base_fee as u128)
+            .nonce(0)
+            .chain_id(Some(state.chain_id))
+            .build_fill();
+
+        let ctx = Context::<BlockEnv, TxEnv, _, RpcDB, revm::context::Journal<RpcDB>, ()>::new(
+            state.db,
+            SpecId::CANCUN,
+        )
+        .with_block(block)
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = state.chain_id;
+            cfg.disable_nonce_check = true;
+        });
+
+        let mut evm = ctx.build_mainnet();
+
+        match evm.transact(tx) {
+            Ok(result_and_state) => match result_and_state.result {
+                ExecutionResult::Success {
+                    gas_used, output: _, ..
+                } => {
+                    debug!(gas_used, "RPC simulation succeeded");
+                    SimulationResult {
+                        success: true,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: None,
+                    }
+                }
+                ExecutionResult::Revert { gas_used, output } => {
+                    let reason = format!("0x{}", alloy::hex::encode(&output));
+                    debug!(gas_used, reason = %reason, "RPC simulation reverted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason),
+                    }
+                }
+                ExecutionResult::Halt { reason, gas_used } => {
+                    let reason_str = format!("{:?}", reason);
+                    debug!(gas_used, reason = %reason_str, "RPC simulation halted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason_str),
+                    }
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "RPC EVM transact error");
                 SimulationResult {
                     success: false,
                     profit_wei: U256::ZERO,
