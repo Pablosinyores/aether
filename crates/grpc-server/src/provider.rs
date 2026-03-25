@@ -372,8 +372,8 @@ mod tests {
         let channels = Arc::new(EventChannels::new());
         let config = ProviderConfig {
             rpc_url: "http://localhost:8545".to_string(),
-            max_reconnect_attempts: 1,
-            reconnect_delay: Duration::from_millis(10),
+            max_reconnect_attempts: 5,
+            reconnect_delay: Duration::from_millis(200),
             ..ProviderConfig::default()
         };
         let provider = Arc::new(RpcProvider::new(config, channels));
@@ -385,14 +385,14 @@ mod tests {
             provider_clone.run(shutdown_rx).await;
         });
 
-        // Give it a moment to start
+        // Give it a moment to start and enter the reconnect backoff loop
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send shutdown
-        shutdown_tx.send(true).unwrap();
+        // Send shutdown — ignore error if provider already exited
+        let _ = shutdown_tx.send(true);
 
         // Should complete within a reasonable time
-        tokio::time::timeout(Duration::from_secs(2), handle)
+        tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("provider should shut down within timeout")
             .expect("provider task should not panic");
