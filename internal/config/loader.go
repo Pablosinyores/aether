@@ -197,7 +197,15 @@ type NodesFileConfig struct {
 	MinHealthyNodes int         `yaml:"min_healthy_nodes"`
 }
 
+// expandEnvVars replaces ${VAR} patterns in the input with their
+// corresponding environment variable values. Unset variables are
+// replaced with an empty string.
+func expandEnvVars(data []byte) []byte {
+	return []byte(os.ExpandEnv(string(data)))
+}
+
 // LoadNodesConfig reads and parses a nodes YAML config file.
+// Environment variables in ${VAR} format are expanded before parsing.
 func LoadNodesConfig(path string) (NodesFileConfig, error) {
 	var cfg NodesFileConfig
 
@@ -205,6 +213,8 @@ func LoadNodesConfig(path string) (NodesFileConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read nodes config %s: %w", path, err)
 	}
+
+	data = expandEnvVars(data)
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse nodes config %s: %w", path, err)
