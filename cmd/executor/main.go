@@ -11,6 +11,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
+
 	"github.com/aether-arb/aether/internal/config"
 	aethergrpc "github.com/aether-arb/aether/internal/grpc"
 	pb "github.com/aether-arb/aether/internal/pb"
@@ -86,11 +89,39 @@ func main() {
 
 	cfg := loadConfig()
 
+	// Load searcher private key for transaction signing.
+	var txSigner *TransactionSigner
+	searcherKey := os.Getenv("SEARCHER_KEY")
+	if searcherKey != "" {
+		var err error
+		txSigner, err = NewTransactionSigner(searcherKey, cfg.ChainID)
+		if err != nil {
+			log.Fatalf("Failed to load SEARCHER_KEY: %v", err)
+		}
+		log.Printf("Searcher address: %s", txSigner.Address().Hex())
+	} else {
+		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
+	}
+
+	// Connect to Ethereum node for block header queries (coinbase).
+	var ethClient *ethclient.Client
+	if rpcURL := os.Getenv("ETH_RPC_URL"); rpcURL != "" {
+		var err error
+		ethClient, err = ethclient.Dial(rpcURL)
+		if err != nil {
+			log.Printf("WARNING: failed to connect to ETH_RPC_URL: %v", err)
+		} else {
+			log.Printf("Connected to Ethereum node for coinbase lookups")
+		}
+	} else {
+		log.Println("WARNING: ETH_RPC_URL not set — coinbase will use zero address")
+	}
+
 	// Initialize components
 	nonceManager := NewNonceManager(0)
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
 	submitter := NewSubmitter(cfg.BuilderConfigs)
-	bundler := NewBundleConstructor(nonceManager, gasOracle, cfg.TipSharePct, cfg.ChainID)
+	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
 	// Setup graceful shutdown
@@ -133,7 +164,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
 		}()
 	}
 
@@ -158,6 +189,7 @@ func processArb(
 	rm *risk.RiskManager,
 	bundler *BundleConstructor,
 	submitter *Submitter,
+	ethClient *ethclient.Client,
 	executorAddr string,
 	tipSharePct float64,
 	ethBalance float64,
@@ -179,8 +211,19 @@ func processArb(
 		return false, nil
 	}
 
+	// Fetch block.coinbase from latest block header for the tip transaction.
+	coinbase := common.Address{}
+	if ethClient != nil {
+		header, headerErr := ethClient.HeaderByNumber(ctx, nil) // nil = latest
+		if headerErr != nil {
+			log.Printf("WARNING: failed to fetch latest block header: %v, using zero coinbase", headerErr)
+		} else {
+			coinbase = header.Coinbase
+		}
+	}
+
 	// Build bundle
-	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1)
+	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase)
 	if err != nil {
 		return false, fmt.Errorf("build bundle: %w", err)
 	}
@@ -201,7 +244,7 @@ func processArb(
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, tipSharePct float64, ethBalance float64) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, tipSharePct float64, ethBalance float64) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -237,7 +280,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, executorAddr, tipSharePct, ethBalance)
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, tipSharePct, ethBalance)
 			if err != nil {
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
 			}
