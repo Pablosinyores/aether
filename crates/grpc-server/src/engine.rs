@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider};
+use alloy::sol_types::SolCall;
 
 use aether_common::types::{ArbHop, ArbOpportunity, PoolId, ProtocolType, SwapStep};
 use aether_detector::bellman_ford::BellmanFord;
@@ -248,6 +249,250 @@ impl AetherEngine {
             %pool_addr, %token0, %token1, ?protocol, fee_bps,
             "Pool registered (t0={}, t1={})", t0_idx, t1_idx
         );
+    }
+
+    /// Bootstrap pools from a TOML config file (e.g. `config/pools.toml`).
+    ///
+    /// Parses the file, validates each entry, and calls `register_pool()` for
+    /// each valid pool. Returns the number of pools successfully registered.
+    pub async fn bootstrap_pools(&self, config_path: &str) -> u32 {
+        info!(path = %config_path, "Bootstrapping pools from config");
+
+        let contents = match tokio::fs::read_to_string(config_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %config_path, error = %e, "Failed to read pool config");
+                return 0;
+            }
+        };
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct PoolEntry {
+            protocol: String,
+            address: String,
+            token0: String,
+            token1: String,
+            fee_bps: u32,
+            #[serde(default)]
+            tier: String,
+            #[serde(default)]
+            tick_spacing: Option<i32>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PoolsConfig {
+            #[serde(default)]
+            pools: Vec<PoolEntry>,
+        }
+
+        let config: PoolsConfig = match toml::from_str(&contents) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %config_path, error = %e, "Failed to parse pool config TOML");
+                return 0;
+            }
+        };
+
+        if config.pools.is_empty() {
+            warn!(path = %config_path, "No [[pools]] entries found in config");
+            return 0;
+        }
+
+        let mut loaded: u32 = 0;
+
+        for (i, entry) in config.pools.iter().enumerate() {
+            // Validate protocol string.
+            let protocol = match entry.protocol.as_str() {
+                "uniswap_v2" => ProtocolType::UniswapV2,
+                "uniswap_v3" => ProtocolType::UniswapV3,
+                "sushiswap" => ProtocolType::SushiSwap,
+                "curve" => ProtocolType::Curve,
+                "balancer_v2" => ProtocolType::BalancerV2,
+                "bancor_v3" => ProtocolType::BancorV3,
+                other => {
+                    warn!(index = i, protocol = %other, "Unknown protocol, skipping pool");
+                    continue;
+                }
+            };
+
+            // Validate and parse addresses.
+            let pool_addr = match entry.address.parse::<Address>() {
+                Ok(a) if a != Address::ZERO => a,
+                Ok(_) => {
+                    warn!(index = i, address = %entry.address, "Zero address, skipping pool");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(index = i, address = %entry.address, error = %e, "Invalid pool address, skipping");
+                    continue;
+                }
+            };
+
+            let token0 = match entry.token0.parse::<Address>() {
+                Ok(a) if a != Address::ZERO => a,
+                Ok(_) => {
+                    warn!(index = i, token0 = %entry.token0, "Zero token0 address, skipping pool");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(index = i, token0 = %entry.token0, error = %e, "Invalid token0 address, skipping");
+                    continue;
+                }
+            };
+
+            let token1 = match entry.token1.parse::<Address>() {
+                Ok(a) if a != Address::ZERO => a,
+                Ok(_) => {
+                    warn!(index = i, token1 = %entry.token1, "Zero token1 address, skipping pool");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(index = i, token1 = %entry.token1, error = %e, "Invalid token1 address, skipping");
+                    continue;
+                }
+            };
+
+            // Check for duplicate pool address.
+            {
+                let registry = self.pool_registry.read().await;
+                if registry.contains_key(&pool_addr) {
+                    warn!(index = i, %pool_addr, "Duplicate pool address, skipping");
+                    continue;
+                }
+            }
+
+            self.register_pool(pool_addr, token0, token1, protocol, entry.fee_bps)
+                .await;
+            loaded += 1;
+
+            info!(
+                %pool_addr, ?protocol, fee_bps = entry.fee_bps, tier = %entry.tier,
+                "Bootstrapped pool {}/{}", loaded, config.pools.len()
+            );
+        }
+
+        info!(loaded, total = config.pools.len(), "Pool bootstrap complete");
+        loaded
+    }
+
+    /// Fetch initial on-chain reserves for all registered pools via RPC.
+    ///
+    /// For V2/SushiSwap pools: calls `getReserves()`.
+    /// For V3 pools: calls `slot0()`.
+    /// Updates the price graph with real exchange rates so detection works
+    /// immediately after startup.
+    pub async fn fetch_initial_reserves(&self) {
+        let provider = match &self.rpc_provider {
+            Some(p) => p.clone(),
+            None => {
+                info!("No RPC provider configured, skipping initial reserve fetch");
+                return;
+            }
+        };
+
+        // Collect pool metadata snapshot to avoid holding the lock during RPC calls.
+        let pools: Vec<(Address, PoolMetadata)> = {
+            let registry = self.pool_registry.read().await;
+            registry.iter().map(|(a, m)| (*a, m.clone())).collect()
+        };
+
+        if pools.is_empty() {
+            return;
+        }
+
+        info!(count = pools.len(), "Fetching initial reserves via RPC");
+
+        // ABI for getReserves() and slot0()
+        alloy::sol! {
+            function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+            function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+        }
+
+        let mut fetched: u32 = 0;
+
+        for (pool_addr, meta) in &pools {
+            match meta.protocol {
+                ProtocolType::UniswapV2 | ProtocolType::SushiSwap => {
+                    let calldata = getReservesCall {}.abi_encode();
+                    let tx = alloy::rpc::types::TransactionRequest::default()
+                        .to(*pool_addr)
+                        .input(calldata.into());
+
+                    match provider.call(tx).await {
+                        Ok(output) => {
+                            if output.len() < 96 {
+                                warn!(%pool_addr, len = output.len(), "getReserves output too short");
+                                continue;
+                            }
+                            let r0 = U256::from_be_slice(&output[0..32]);
+                            let r1 = U256::from_be_slice(&output[32..64]);
+                            let r0_f = u256_to_f64(r0);
+                            let r1_f = u256_to_f64(r1);
+
+                            if r0_f > 0.0 && r1_f > 0.0 {
+                                let fee = meta.fee_factor();
+                                let mut graph = self.price_graph.write().await;
+                                graph.update_edge_from_reserves(
+                                    meta.token0_idx, meta.token1_idx,
+                                    meta.pool_id, r0_f, r1_f, fee,
+                                );
+                                graph.update_edge_from_reserves(
+                                    meta.token1_idx, meta.token0_idx,
+                                    meta.pool_id, r1_f, r0_f, fee,
+                                );
+                                fetched += 1;
+                                debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
+                            }
+                        }
+                        Err(e) => warn!(%pool_addr, error = %e, "getReserves RPC call failed"),
+                    }
+                }
+                ProtocolType::UniswapV3 => {
+                    let calldata = slot0Call {}.abi_encode();
+                    let tx = alloy::rpc::types::TransactionRequest::default()
+                        .to(*pool_addr)
+                        .input(calldata.into());
+
+                    match provider.call(tx).await {
+                        Ok(output) => {
+                            if output.len() < 64 {
+                                warn!(%pool_addr, len = output.len(), "slot0 output too short");
+                                continue;
+                            }
+                            let sqrt_price_x96 = U256::from_be_slice(&output[0..32]);
+                            const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+                            let sqrt_f64 = u256_to_f64(sqrt_price_x96);
+                            let price = (sqrt_f64 / TWO_POW_96).powi(2);
+
+                            if price > 0.0 {
+                                let fee = meta.fee_factor();
+                                let liq = U256::ZERO;
+                                let mut graph = self.price_graph.write().await;
+                                graph.add_edge(
+                                    meta.token0_idx, meta.token1_idx,
+                                    price * fee, meta.pool_id, *pool_addr,
+                                    meta.protocol, liq,
+                                );
+                                graph.add_edge(
+                                    meta.token1_idx, meta.token0_idx,
+                                    (1.0 / price) * fee, meta.pool_id, *pool_addr,
+                                    meta.protocol, liq,
+                                );
+                                fetched += 1;
+                                debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
+                            }
+                        }
+                        Err(e) => warn!(%pool_addr, error = %e, "slot0 RPC call failed"),
+                    }
+                }
+                _ => {
+                    debug!(%pool_addr, protocol = ?meta.protocol, "Reserve fetch not yet implemented for this protocol");
+                }
+            }
+        }
+
+        info!(fetched, total = pools.len(), "Initial reserve fetch complete");
     }
 
     /// Main engine loop: processes events, detects arbs, simulates, publishes.
@@ -1172,5 +1417,203 @@ mod tests {
         let arb = rx.try_recv().expect("should receive a published arb");
         assert!(!arb.id.is_empty());
         assert!(!arb.hops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_pools_then_detect_arb() {
+        // Integration test: bootstrap real mainnet pools from config/pools.toml,
+        // set profitable exchange rates on the graph, run detection, and confirm
+        // an arb opportunity is detected and published.
+
+        // Real mainnet pool addresses from config/pools.toml.
+        // Real mainnet token and pool addresses.
+        let _usdc: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let _weth: Address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().unwrap();
+        let uni_v2_pool: Address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc".parse().unwrap();
+        let sushi_pool: Address = "0x397FF1542f962076d0BFE58eA045FfA2d347ACa0".parse().unwrap();
+        let uni_v3_pool: Address = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640".parse().unwrap();
+
+        // 1. Create engine and bootstrap from the real config file.
+        let (tx, mut rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(
+            EngineConfig {
+                min_profit_threshold_wei: 0, // Accept any profit for testing.
+                gas_price_gwei: 0.0,         // Zero gas for testing.
+                ..EngineConfig::default()
+            },
+            tx,
+        );
+
+        // CARGO_MANIFEST_DIR points to crates/grpc-server/, go up two levels
+        // to reach the workspace root where config/pools.toml lives.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let config_path = format!("{manifest_dir}/../../config/pools.toml");
+        let loaded = engine.bootstrap_pools(&config_path).await;
+        assert_eq!(loaded, 3, "All 3 pools from config/pools.toml should be loaded");
+
+        // 2. Verify all real pools are registered with correct metadata.
+        {
+            let registry = engine.pool_registry.read().await;
+            assert_eq!(registry.len(), 3);
+
+            let meta_v2 = registry.get(&uni_v2_pool).expect("Uniswap V2 pool should be registered");
+            assert_eq!(meta_v2.protocol, ProtocolType::UniswapV2);
+            assert_eq!(meta_v2.fee_bps, 30);
+
+            let meta_sushi = registry.get(&sushi_pool).expect("SushiSwap pool should be registered");
+            assert_eq!(meta_sushi.protocol, ProtocolType::SushiSwap);
+            assert_eq!(meta_sushi.fee_bps, 30);
+
+            let meta_v3 = registry.get(&uni_v3_pool).expect("Uniswap V3 pool should be registered");
+            assert_eq!(meta_v3.protocol, ProtocolType::UniswapV3);
+            assert_eq!(meta_v3.fee_bps, 5);
+        }
+
+        // 3. Set profitable exchange rates to simulate a cross-DEX arb.
+        //    All pools share the same USDC/WETH pair. We set divergent prices
+        //    so buying on one DEX and selling on another is profitable.
+        //    Uni V2: USDC→WETH = 2000 (cheap WETH)
+        //    Sushi:  WETH→USDC = 2100 (expensive WETH) — the arb sells here
+        //    V3:     USDC→WETH = 2050 (mid price, creates cycle opportunity)
+        {
+            let reg = engine.pool_registry.read().await;
+            let meta_v2 = reg.get(&uni_v2_pool).unwrap().clone();
+            let meta_sushi = reg.get(&sushi_pool).unwrap().clone();
+            let meta_v3 = reg.get(&uni_v3_pool).unwrap().clone();
+            drop(reg);
+
+            let mut graph = engine.price_graph.write().await;
+
+            // Uni V2: USDC→WETH at 1/2000, WETH→USDC at 2000
+            graph.add_edge(
+                meta_v2.token0_idx, meta_v2.token1_idx,
+                0.0005, meta_v2.pool_id, uni_v2_pool,
+                ProtocolType::UniswapV2, U256::from(1_000_000u64),
+            );
+            graph.add_edge(
+                meta_v2.token1_idx, meta_v2.token0_idx,
+                2000.0, meta_v2.pool_id, uni_v2_pool,
+                ProtocolType::UniswapV2, U256::from(1_000_000u64),
+            );
+
+            // Sushi: USDC→WETH at 1/2100, WETH→USDC at 2100
+            graph.add_edge(
+                meta_sushi.token0_idx, meta_sushi.token1_idx,
+                0.000476, meta_sushi.pool_id, sushi_pool,
+                ProtocolType::SushiSwap, U256::from(1_000_000u64),
+            );
+            graph.add_edge(
+                meta_sushi.token1_idx, meta_sushi.token0_idx,
+                2100.0, meta_sushi.pool_id, sushi_pool,
+                ProtocolType::SushiSwap, U256::from(1_000_000u64),
+            );
+
+            // V3: USDC→WETH at 1/2050, WETH→USDC at 2050
+            graph.add_edge(
+                meta_v3.token0_idx, meta_v3.token1_idx,
+                0.000488, meta_v3.pool_id, uni_v3_pool,
+                ProtocolType::UniswapV3, U256::from(1_000_000u64),
+            );
+            graph.add_edge(
+                meta_v3.token1_idx, meta_v3.token0_idx,
+                2050.0, meta_v3.pool_id, uni_v3_pool,
+                ProtocolType::UniswapV3, U256::from(1_000_000u64),
+            );
+        }
+
+        // 4. Set a recent block so detection has context.
+        {
+            let mut block = engine.current_block.write().await;
+            block.number = 18_000_000;
+            block.timestamp = 1_700_000_000;
+            block.base_fee = 0;
+        }
+
+        // 5. Run detection cycle.
+        engine.run_detection_cycle().await;
+
+        // 6. Assert: arb opportunity was detected and published.
+        //    The price divergence between Uni V2 (buy WETH at 2000) and
+        //    Sushi (sell WETH at 2100) creates a profitable cycle that
+        //    Bellman-Ford should detect.
+        let arb = rx.try_recv().expect(
+            "should receive a published arb — price divergence between \
+             Uniswap V2 (2000) and SushiSwap (2100) should be detected"
+        );
+        assert!(!arb.id.is_empty(), "arb should have an ID");
+        assert!(!arb.hops.is_empty(), "arb should have at least one hop");
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_pools_invalid_config() {
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        // Non-existent file should return 0.
+        let loaded = engine.bootstrap_pools("/tmp/nonexistent_pools.toml").await;
+        assert_eq!(loaded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_pools_skips_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("pools.toml");
+        let toml_content = r#"
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x1111111111111111111111111111111111111111"
+token0 = "0x0101010101010101010101010101010101010101"
+token1 = "0x0202020202020202020202020202020202020202"
+fee_bps = 30
+
+[[pools]]
+protocol = "sushiswap"
+address = "0x1111111111111111111111111111111111111111"
+token0 = "0x0101010101010101010101010101010101010101"
+token1 = "0x0202020202020202020202020202020202020202"
+fee_bps = 30
+"#;
+        tokio::fs::write(&config_path, toml_content).await.unwrap();
+
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let loaded = engine.bootstrap_pools(config_path.to_str().unwrap()).await;
+        assert_eq!(loaded, 1, "Second pool with same address should be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_pools_skips_invalid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("pools.toml");
+        let toml_content = r#"
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x1111111111111111111111111111111111111111"
+token0 = "0x0101010101010101010101010101010101010101"
+token1 = "0x0202020202020202020202020202020202020202"
+fee_bps = 30
+
+[[pools]]
+protocol = "unknown_dex"
+address = "0x2222222222222222222222222222222222222222"
+token0 = "0x0101010101010101010101010101010101010101"
+token1 = "0x0202020202020202020202020202020202020202"
+fee_bps = 30
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x0000000000000000000000000000000000000000"
+token0 = "0x0101010101010101010101010101010101010101"
+token1 = "0x0202020202020202020202020202020202020202"
+fee_bps = 30
+"#;
+        tokio::fs::write(&config_path, toml_content).await.unwrap();
+
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let loaded = engine.bootstrap_pools(config_path.to_str().unwrap()).await;
+        assert_eq!(loaded, 1, "Only the valid pool should be loaded");
     }
 }
