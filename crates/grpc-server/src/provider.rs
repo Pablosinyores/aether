@@ -5,9 +5,14 @@ use tracing::{debug, error, info, warn};
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
+use futures::StreamExt;
+use tokio::sync::RwLock;
 
+use aether_common::types::NodeState;
+use aether_ingestion::config::load_nodes_config;
 use aether_ingestion::event_decoder;
 use aether_ingestion::event_decoder::EventSignatures;
+use aether_ingestion::node_pool::{NodeConfig, NodeConnection, NodePool, NodeType};
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
 
 /// Configuration for the RPC provider connection
@@ -16,6 +21,8 @@ use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
 pub struct ProviderConfig {
     /// RPC endpoint URL (WS preferred, HTTP fallback)
     pub rpc_url: String,
+    /// Optional path to nodes.yaml for multi-node pool configuration
+    pub nodes_config_path: Option<String>,
     /// Pool addresses to monitor for events (empty = all)
     pub monitored_pools: Vec<Address>,
     /// Reconnect delay base (exponential backoff)
@@ -31,6 +38,7 @@ impl Default for ProviderConfig {
         Self {
             rpc_url: std::env::var("ETH_RPC_URL")
                 .unwrap_or_else(|_| "http://localhost:8545".to_string()),
+            nodes_config_path: std::env::var("AETHER_NODES_CONFIG").ok(),
             monitored_pools: vec![],
             reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: 10,
@@ -39,65 +47,159 @@ impl Default for ProviderConfig {
     }
 }
 
-/// RPC provider that bridges Ethereum events to the ingestion EventChannels
+/// Infer the node transport type from the URL scheme.
+fn infer_node_type(url: &str) -> NodeType {
+    if url.starts_with("ws://") || url.starts_with("wss://") {
+        NodeType::WebSocket
+    } else if url.starts_with('/') || url.ends_with(".ipc") {
+        NodeType::Ipc
+    } else {
+        NodeType::Http
+    }
+}
+
+/// RPC provider that bridges Ethereum events to the ingestion EventChannels.
+///
+/// Supports WebSocket (native subscriptions), IPC (native subscriptions),
+/// and HTTP (polling fallback) transports. When configured with a
+/// `nodes_config_path`, manages a pool of nodes with automatic failover.
 pub struct RpcProvider {
     config: ProviderConfig,
     event_channels: Arc<EventChannels>,
+    node_pool: NodePool,
 }
 
 impl RpcProvider {
+    /// Create a new `RpcProvider`.
+    ///
+    /// If `config.nodes_config_path` is set, loads the multi-node pool from
+    /// the YAML config file. Otherwise, creates a single-node pool from
+    /// `config.rpc_url` with the transport type inferred from the URL scheme.
     pub fn new(config: ProviderConfig, event_channels: Arc<EventChannels>) -> Self {
+        let node_pool = match &config.nodes_config_path {
+            Some(path) => match load_nodes_config(path) {
+                Ok((configs, min_healthy)) => {
+                    info!(
+                        path = %path,
+                        nodes = configs.len(),
+                        min_healthy,
+                        "Loaded node pool from config"
+                    );
+                    NodePool::new(configs, min_healthy)
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "Failed to load nodes config, falling back to rpc_url"
+                    );
+                    Self::single_node_pool(&config.rpc_url)
+                }
+            },
+            None => Self::single_node_pool(&config.rpc_url),
+        };
+
         Self {
             config,
             event_channels,
+            node_pool,
         }
     }
 
-    /// Main provider loop with auto-reconnect
+    /// Build a single-node `NodePool` from a URL, inferring the transport type.
+    fn single_node_pool(url: &str) -> NodePool {
+        let node_type = infer_node_type(url);
+        let node_config = NodeConfig {
+            name: "default".to_string(),
+            url: url.to_string(),
+            node_type,
+            priority: 0,
+            max_retries: 5,
+            health_check_interval: Duration::from_secs(30),
+        };
+        NodePool::new(vec![node_config], 1)
+    }
+
+    /// Main provider loop with automatic failover across the node pool.
+    ///
+    /// Selects the best available node, connects using the appropriate
+    /// transport, and runs the event loop. On failure, marks the node as
+    /// degraded/failed and retries with the next best node.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        info!(url = %self.config.rpc_url, "RpcProvider starting");
+        info!("RpcProvider starting");
 
         let mut attempt = 0u32;
 
         loop {
-            // Check shutdown before attempting connection
             if *shutdown.borrow() {
                 info!("RpcProvider shutting down before connection attempt");
                 break;
             }
 
-            match self.connect_and_subscribe(&mut shutdown).await {
-                Ok(()) => {
-                    info!("RpcProvider connection closed gracefully");
-                    break; // Graceful shutdown
+            match self.node_pool.best_node().await {
+                Some(node) => {
+                    let (node_type, node_url) = {
+                        let n = node.read().await;
+                        (n.config.node_type.clone(), n.config.url.clone())
+                    };
+
+                    info!(url = %node_url, transport = ?node_type, "Connecting to node");
+
+                    let result = match node_type {
+                        NodeType::WebSocket => {
+                            self.connect_ws(&node_url, &node, &mut shutdown).await
+                        }
+                        NodeType::Ipc => {
+                            self.connect_ipc(&node_url, &node, &mut shutdown).await
+                        }
+                        NodeType::Http => {
+                            self.connect_http(&node_url, &node, &mut shutdown).await
+                        }
+                    };
+
+                    match result {
+                        Ok(()) => break, // Graceful shutdown
+                        Err(e) => {
+                            node.write().await.record_failure();
+                            attempt += 1;
+                            let delay = self.node_pool.backoff_delay(attempt);
+                            warn!(
+                                attempt,
+                                delay_ms = delay.as_millis() as u64,
+                                error = %e,
+                                "Connection failed, reconnecting"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                Ok(()) = shutdown.changed() => {
+                                    if *shutdown.borrow() { break; }
+                                }
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
+                None => {
+                    // All nodes unhealthy
                     attempt += 1;
                     if attempt >= self.config.max_reconnect_attempts {
-                        error!(
-                            attempt,
-                            max = self.config.max_reconnect_attempts,
-                            error = %e,
-                            "RpcProvider max reconnect attempts reached, giving up"
-                        );
+                        error!("All nodes failed, max reconnect attempts reached");
                         break;
                     }
 
-                    let delay = self.config.reconnect_delay * 2u32.saturating_pow(attempt.min(5));
-                    warn!(
-                        attempt,
-                        delay_ms = delay.as_millis() as u64,
-                        error = %e,
-                        "RpcProvider connection failed, reconnecting"
-                    );
+                    let delay = self.node_pool.backoff_delay(attempt);
+                    warn!(attempt, "All nodes unhealthy, waiting before retry");
+
+                    // Reset all nodes to Connected so they can be retried
+                    for node in self.node_pool.all_nodes() {
+                        let mut n = node.write().await;
+                        n.consecutive_failures = 0;
+                        n.transition(NodeState::Connected);
+                    }
 
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         Ok(()) = shutdown.changed() => {
-                            if *shutdown.borrow() {
-                                info!("RpcProvider shutdown during reconnect backoff");
-                                break;
-                            }
+                            if *shutdown.borrow() { break; }
                         }
                     }
                 }
@@ -107,36 +209,125 @@ impl RpcProvider {
         info!("RpcProvider exited");
     }
 
-    /// Connect to the RPC endpoint and subscribe to events.
-    /// Returns Ok(()) on graceful shutdown, Err on connection failure.
-    async fn connect_and_subscribe(
+    /// Connect via WebSocket and run native subscriptions.
+    async fn connect_ws(
         &self,
+        url: &str,
+        node: &Arc<RwLock<NodeConnection>>,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!(url = %self.config.rpc_url, "Connecting to RPC endpoint");
+        let ws_connect = alloy::providers::WsConnect::new(url);
+        let provider = ProviderBuilder::new().connect_ws(ws_connect).await?;
 
-        let url: url::Url = self.config.rpc_url.parse()?;
-        let provider = ProviderBuilder::new().connect_http(url);
-
-        // Verify connection by fetching the current block number.
         let initial_block = provider.get_block_number().await?;
-        info!(block = initial_block, "RPC provider connected (polling mode)");
+        info!(block = initial_block, "WebSocket provider connected");
+        node.write().await.record_success(0, initial_block);
+
+        self.run_subscription_loop(provider, node, shutdown).await
+    }
+
+    /// Connect via IPC (Unix domain socket) and run native subscriptions.
+    async fn connect_ipc(
+        &self,
+        path: &str,
+        node: &Arc<RwLock<NodeConnection>>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ipc_connect = alloy::providers::IpcConnect::new(path.to_string());
+        let provider = ProviderBuilder::new().connect_ipc(ipc_connect).await?;
+
+        let initial_block = provider.get_block_number().await?;
+        info!(block = initial_block, "IPC provider connected");
+        node.write().await.record_success(0, initial_block);
+
+        self.run_subscription_loop(provider, node, shutdown).await
+    }
+
+    /// Shared subscription loop for push-based transports (WS and IPC).
+    ///
+    /// Subscribes to `newHeads` and DEX event logs, dispatching events
+    /// through `EventChannels` as they arrive.
+    async fn run_subscription_loop<P>(
+        &self,
+        provider: P,
+        node: &Arc<RwLock<NodeConnection>>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        P: Provider + Clone + 'static,
+    {
+        let block_sub = provider.subscribe_blocks().await?;
+        let mut block_stream = block_sub.into_stream();
+
+        let log_filter = Filter::new().event_signature(self.event_topics());
+        let log_sub = provider.subscribe_logs(&log_filter).await?;
+        let mut log_stream = log_sub.into_stream();
+
+        info!("Subscriptions active (newHeads + logs)");
+
+        loop {
+            tokio::select! {
+                block_opt = block_stream.next() => {
+                    match block_opt {
+                        Some(block) => {
+                            let number = block.inner.number;
+                            let timestamp = block.inner.timestamp;
+                            let base_fee = block.inner.base_fee_per_gas.unwrap_or(0) as u128;
+                            let gas_limit = block.inner.gas_limit;
+                            debug!(block = number, "Block received via subscription");
+                            self.dispatch_block(number, timestamp, base_fee, gas_limit);
+                            node.write().await.record_success(0, number);
+                        }
+                        None => {
+                            return Err("Block subscription stream ended".into());
+                        }
+                    }
+                }
+                log_opt = log_stream.next() => {
+                    match log_opt {
+                        Some(log) => {
+                            self.process_single_log(&log);
+                        }
+                        None => {
+                            return Err("Log subscription stream ended".into());
+                        }
+                    }
+                }
+                Ok(()) = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Connect via HTTP and run the polling-based event loop.
+    ///
+    /// HTTP does not support native subscriptions, so this falls back to
+    /// polling `eth_getBlockByNumber` and `eth_getLogs` every second.
+    async fn connect_http(
+        &self,
+        url: &str,
+        node: &Arc<RwLock<NodeConnection>>,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!("HTTP transport detected -- falling back to polling mode (latency ~1s)");
+
+        let parsed_url: url::Url = url.parse()?;
+        let provider = ProviderBuilder::new().connect_http(parsed_url);
+
+        let initial_block = provider.get_block_number().await?;
+        info!(block = initial_block, "HTTP provider connected (polling mode)");
+        node.write().await.record_success(0, initial_block);
 
         let poll_interval = Duration::from_secs(1);
         let mut last_block = initial_block;
-
-        // Known DEX event topics for log filtering.
-        let event_topics = vec![
-            EventSignatures::sync_topic(),
-            EventSignatures::swap_v3_topic(),
-            EventSignatures::token_exchange_topic(),
-            EventSignatures::pair_created_topic(),
-        ];
+        let event_topics = self.event_topics();
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {
-                    // Get current block number.
                     let current_block = match provider.get_block_number().await {
                         Ok(n) => n,
                         Err(e) => {
@@ -146,12 +337,11 @@ impl RpcProvider {
                     };
 
                     if current_block <= last_block {
-                        continue; // No new block
+                        continue;
                     }
 
                     debug!(block = current_block, prev = last_block, "New block detected");
 
-                    // Get block header for timestamp, base_fee, gas_limit.
                     let block_opt = match provider.get_block_by_number(
                         alloy::eips::BlockNumberOrTag::Number(current_block),
                     ).await {
@@ -167,17 +357,13 @@ impl RpcProvider {
                         let base_fee = block.header.base_fee_per_gas.unwrap_or(0) as u128;
                         let gas_limit = block.header.gas_limit;
 
-                        // Dispatch block event.
-                        self.dispatch_block(
-                            current_block,
-                            timestamp,
-                            base_fee,
-                            gas_limit,
-                        );
+                        self.dispatch_block(current_block, timestamp, base_fee, gas_limit);
+                        node.write().await.record_success(0, current_block);
 
-                        // Get logs for known DEX events in this block.
+                        // Fetch logs for all blocks since last_block to avoid
+                        // dropping events when multiple blocks arrive between polls.
                         let filter = Filter::new()
-                            .from_block(current_block)
+                            .from_block(last_block + 1)
                             .to_block(current_block)
                             .event_signature(event_topics.clone());
 
@@ -223,7 +409,29 @@ impl RpcProvider {
         }
     }
 
-    /// Dispatch a new block event to the event channels
+    /// Known DEX event topic signatures for log filtering.
+    fn event_topics(&self) -> Vec<B256> {
+        vec![
+            EventSignatures::sync_topic(),
+            EventSignatures::swap_v2_topic(),
+            EventSignatures::swap_v3_topic(),
+            EventSignatures::token_exchange_topic(),
+            EventSignatures::pair_created_topic(),
+        ]
+    }
+
+    /// Decode and dispatch a single log received from a subscription stream.
+    /// Borrows directly from the log to avoid heap allocations on the hot path.
+    fn process_single_log(&self, log: &alloy::rpc::types::Log) {
+        let address = log.address();
+        let topics = log.topics();
+        let data = &log.data().data;
+        if let Some(event) = event_decoder::decode_log(topics, data, address, None) {
+            self.event_channels.dispatch_pool_update(event);
+        }
+    }
+
+    /// Dispatch a new block event to the event channels.
     pub fn dispatch_block(&self, number: u64, timestamp: u64, base_fee: u128, gas_limit: u64) {
         self.event_channels.dispatch_new_block(NewBlockEvent {
             block_number: number,
@@ -233,7 +441,7 @@ impl RpcProvider {
         });
     }
 
-    /// Process raw logs from a block and dispatch decoded pool events
+    /// Process raw logs from a block and dispatch decoded pool events.
     pub fn process_logs(&self, logs: &[(Address, Vec<B256>, Vec<u8>)]) {
         for (address, topics, data) in logs {
             if let Some(event) = event_decoder::decode_log(topics, data, *address, None) {
@@ -242,16 +450,22 @@ impl RpcProvider {
         }
     }
 
-    /// Get the configured RPC URL
+    /// Get the configured RPC URL.
     #[allow(dead_code)]
     pub fn rpc_url(&self) -> &str {
         &self.config.rpc_url
     }
 
-    /// Check if the provider is configured (has a non-empty URL)
+    /// Check if the provider is configured (has a non-empty URL).
     #[allow(dead_code)]
     pub fn is_configured(&self) -> bool {
         !self.config.rpc_url.is_empty()
+    }
+
+    /// Get a reference to the underlying node pool.
+    #[allow(dead_code)]
+    pub fn node_pool(&self) -> &NodePool {
+        &self.node_pool
     }
 }
 
@@ -262,7 +476,6 @@ mod tests {
 
     #[test]
     fn test_provider_config_default() {
-        // Use explicit URL for deterministic test
         let config = ProviderConfig {
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
@@ -271,6 +484,13 @@ mod tests {
         assert!(config.monitored_pools.is_empty());
         assert_eq!(config.reconnect_delay, Duration::from_secs(1));
         assert_eq!(config.max_reconnect_attempts, 10);
+    }
+
+    #[test]
+    fn test_provider_config_nodes_config_path_defaults_to_env() {
+        std::env::remove_var("AETHER_NODES_CONFIG");
+        let config = ProviderConfig::default();
+        assert!(config.nodes_config_path.is_none());
     }
 
     #[test]
@@ -327,7 +547,6 @@ mod tests {
         };
         let provider = RpcProvider::new(config, Arc::clone(&channels));
 
-        // Build a Sync event log
         let pool_addr = Address::repeat_byte(0xAA);
         let topics = vec![EventSignatures::sync_topic()];
 
@@ -359,11 +578,9 @@ mod tests {
         };
         let provider = RpcProvider::new(config, Arc::clone(&channels));
 
-        // Unknown event topic
         let unknown_topic = B256::repeat_byte(0xFF);
         provider.process_logs(&[(Address::ZERO, vec![unknown_topic], vec![0u8; 64])]);
 
-        // Should not receive anything
         assert!(rx.try_recv().is_err());
     }
 
@@ -385,13 +602,9 @@ mod tests {
             provider_clone.run(shutdown_rx).await;
         });
 
-        // Give it a moment to start and enter the reconnect backoff loop
         tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Send shutdown — ignore error if provider already exited
         let _ = shutdown_tx.send(true);
 
-        // Should complete within a reasonable time
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("provider should shut down within timeout")
@@ -409,7 +622,6 @@ mod tests {
         };
         let provider = RpcProvider::new(config, Arc::clone(&channels));
 
-        // Two Sync events for different pools
         let pool1 = Address::repeat_byte(0x01);
         let pool2 = Address::repeat_byte(0x02);
         let sync_topic = EventSignatures::sync_topic();
@@ -437,5 +649,126 @@ mod tests {
             }
             _ => panic!("Expected two ReserveUpdate events"),
         }
+    }
+
+    // ── Transport inference tests ──
+
+    #[test]
+    fn test_infer_node_type_websocket() {
+        assert_eq!(infer_node_type("ws://localhost:8546"), NodeType::WebSocket);
+        assert_eq!(infer_node_type("wss://eth-mainnet.g.alchemy.com/v2/key"), NodeType::WebSocket);
+    }
+
+    #[test]
+    fn test_infer_node_type_ipc() {
+        assert_eq!(infer_node_type("/tmp/reth.ipc"), NodeType::Ipc);
+        assert_eq!(infer_node_type("/var/run/geth.ipc"), NodeType::Ipc);
+        assert_eq!(infer_node_type("path/to/node.ipc"), NodeType::Ipc);
+    }
+
+    #[test]
+    fn test_infer_node_type_http() {
+        assert_eq!(infer_node_type("http://localhost:8545"), NodeType::Http);
+        assert_eq!(infer_node_type("https://mainnet.infura.io/v3/key"), NodeType::Http);
+    }
+
+    #[test]
+    fn test_infer_node_type_unknown_defaults_to_http() {
+        assert_eq!(infer_node_type("some-random-string"), NodeType::Http);
+    }
+
+    // ── Node pool construction tests ──
+
+    #[test]
+    fn test_single_node_pool_from_ws_url() {
+        let pool = RpcProvider::single_node_pool("ws://localhost:8546");
+        assert_eq!(pool.all_nodes().len(), 1);
+    }
+
+    #[test]
+    fn test_single_node_pool_from_http_url() {
+        let pool = RpcProvider::single_node_pool("http://localhost:8545");
+        assert_eq!(pool.all_nodes().len(), 1);
+    }
+
+    #[test]
+    fn test_single_node_pool_from_ipc_path() {
+        let pool = RpcProvider::single_node_pool("/tmp/reth.ipc");
+        assert_eq!(pool.all_nodes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_provider_with_nodes_config_file() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("aether_provider_test");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("nodes.yaml");
+
+        let yaml = r#"
+nodes:
+  - name: "ws-primary"
+    url: "wss://example.com"
+    type: "websocket"
+    priority: 1
+  - name: "ipc-local"
+    url: "/tmp/reth.ipc"
+    type: "ipc"
+    priority: 0
+  - name: "http-fallback"
+    url: "http://localhost:8545"
+    type: "http"
+    priority: 2
+min_healthy_nodes: 1
+"#;
+        let mut f = std::fs::File::create(&path).expect("create temp file");
+        f.write_all(yaml.as_bytes()).expect("write temp file");
+
+        let channels = Arc::new(EventChannels::new());
+        let config = ProviderConfig {
+            rpc_url: "http://localhost:8545".to_string(),
+            nodes_config_path: Some(path.to_str().expect("valid path").to_string()),
+            ..ProviderConfig::default()
+        };
+        let provider = RpcProvider::new(config, channels);
+
+        assert_eq!(provider.node_pool().all_nodes().len(), 3);
+
+        let best = provider.node_pool().best_node().await.expect("should have best node");
+        let best_read = best.read().await;
+        assert_eq!(best_read.config.name, "ipc-local");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn test_provider_falls_back_on_invalid_config_path() {
+        let channels = Arc::new(EventChannels::new());
+        let config = ProviderConfig {
+            rpc_url: "http://localhost:8545".to_string(),
+            nodes_config_path: Some("/nonexistent/path/nodes.yaml".to_string()),
+            ..ProviderConfig::default()
+        };
+        let provider = RpcProvider::new(config, channels);
+        assert_eq!(provider.node_pool().all_nodes().len(), 1);
+    }
+
+    #[test]
+    fn test_event_topics_returns_known_signatures() {
+        let channels = Arc::new(EventChannels::new());
+        let config = ProviderConfig {
+            rpc_url: "http://localhost:8545".to_string(),
+            ..ProviderConfig::default()
+        };
+        let provider = RpcProvider::new(config, channels);
+
+        let topics = provider.event_topics();
+        assert_eq!(topics.len(), 5);
+        assert_eq!(topics[0], EventSignatures::sync_topic());
+        assert_eq!(topics[1], EventSignatures::swap_v2_topic());
+        assert_eq!(topics[2], EventSignatures::swap_v3_topic());
+        assert_eq!(topics[3], EventSignatures::token_exchange_topic());
+        assert_eq!(topics[4], EventSignatures::pair_created_topic());
     }
 }

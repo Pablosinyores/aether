@@ -56,8 +56,8 @@ fn test_port(offset: u16) -> u16 {
 async fn mine_block(http_url: &str) {
     let parsed: url::Url = http_url.parse().expect("valid HTTP URL for mining");
     let provider = ProviderBuilder::new().connect_http(parsed);
-    provider
-        .raw_request::<_, ()>("evm_mine".into(), ())
+    let _: String = provider
+        .raw_request("evm_mine".into(), ())
         .await
         .expect("evm_mine should succeed");
 }
