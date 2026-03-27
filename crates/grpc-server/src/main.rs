@@ -7,11 +7,10 @@ use tracing_subscriber::EnvFilter;
 
 mod engine;
 mod pipeline;
-mod provider;
 mod service;
 
+use aether_grpc_server::provider::{ProviderConfig, RpcProvider};
 use engine::{AetherEngine, EngineConfig};
-use provider::{ProviderConfig, RpcProvider};
 use service::aether_proto::arb_service_server::ArbServiceServer;
 use service::aether_proto::control_service_server::ControlServiceServer;
 use service::aether_proto::health_service_server::HealthServiceServer;
@@ -72,8 +71,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the RpcProvider, sharing the engine's event channels so events
     // flow from the provider into the engine's event loop.
+    // Reads AETHER_NODES_CONFIG for multi-node pool config, falls back to ETH_RPC_URL.
+    let provider_config = ProviderConfig::default();
+    if provider_config.nodes_config_path.is_some() {
+        info!("AETHER_NODES_CONFIG set — provider will use multi-node pool");
+    }
     let provider = Arc::new(RpcProvider::new(
-        ProviderConfig::default(),
+        provider_config,
         Arc::clone(engine.event_channels()),
     ));
 
