@@ -28,7 +28,7 @@ func newTestComponents() (*risk.RiskManager, *BundleConstructor, *Submitter) {
 	rm := risk.NewRiskManager(risk.DefaultRiskConfig())
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 	submitter := NewSubmitter(defaultBuilderConfigs())
 	return rm, bundler, submitter
 }
@@ -52,7 +52,7 @@ func TestProcessArb_Approved(t *testing.T) {
 
 	arb := newValidArb("arb-approved-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 
 	if err != nil {
@@ -70,7 +70,7 @@ func TestProcessArb_RejectedLowProfit(t *testing.T) {
 	// Profit of 0.0001 ETH is below the 0.001 ETH minimum threshold
 	arb := newValidArb("arb-lowprofit-001", 0.0001, 5.0)
 
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 
 	if err != nil {
@@ -90,7 +90,7 @@ func TestProcessArb_RejectedHighGas(t *testing.T) {
 
 	arb := newValidArb("arb-highgas-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 
 	if err != nil {
@@ -108,7 +108,7 @@ func TestProcessArb_RejectedLowBalance(t *testing.T) {
 	arb := newValidArb("arb-lowbal-001", 0.01, 5.0)
 
 	// Pass ethBalance of 0.05, below the 0.1 ETH minimum
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.05)
 
 	if err != nil {
@@ -126,7 +126,7 @@ func TestProcessArb_RejectedTradeTooLarge(t *testing.T) {
 	// Trade of 60 ETH exceeds the 50 ETH single trade limit
 	arb := newValidArb("arb-bigtrade-001", 0.5, 60.0)
 
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 
 	if err != nil {
@@ -153,7 +153,7 @@ func TestProcessArb_SystemPaused(t *testing.T) {
 
 	arb := newValidArb("arb-paused-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 
 	if err != nil {
