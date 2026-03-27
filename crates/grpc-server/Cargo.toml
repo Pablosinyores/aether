@@ -3,6 +3,10 @@ name = "aether-grpc-server"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "aether_grpc_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aether-rust"
 path = "src/main.rs"
