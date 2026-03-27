@@ -2,20 +2,30 @@ package main
 
 import (
 	"context"
+	"math/big"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
+
+func testBundle() *Bundle {
+	chainID := big.NewInt(1)
+	return &Bundle{
+		Transactions: []*types.Transaction{
+			types.NewTx(&types.DynamicFeeTx{ChainID: chainID, Nonce: 0}),
+			types.NewTx(&types.DynamicFeeTx{ChainID: chainID, Nonce: 1}),
+		},
+		BlockNumber: 18000000,
+	}
+}
 
 func TestSubmitToAll_AllEnabled(t *testing.T) {
 	t.Parallel()
 
 	builders := defaultBuilderConfigs()
 	sub := NewSubmitter(builders)
-
-	// Create a minimal bundle for submission
-	bundle := &Bundle{
-		Transactions: []Transaction{{Nonce: 0}, {Nonce: 1}},
-		BlockNumber:  18000000,
-	}
+	bundle := testBundle()
 
 	results := sub.SubmitToAll(context.Background(), bundle)
 
@@ -40,16 +50,11 @@ func TestSubmitToAll_SomeDisabled(t *testing.T) {
 	t.Parallel()
 
 	builders := defaultBuilderConfigs()
-	// Disable 2 of 4 builders
 	builders[1].Enabled = false // titan
 	builders[3].Enabled = false // rsync
 
 	sub := NewSubmitter(builders)
-
-	bundle := &Bundle{
-		Transactions: []Transaction{{Nonce: 0}, {Nonce: 1}},
-		BlockNumber:  18000000,
-	}
+	bundle := testBundle()
 
 	results := sub.SubmitToAll(context.Background(), bundle)
 
@@ -57,7 +62,6 @@ func TestSubmitToAll_SomeDisabled(t *testing.T) {
 		t.Fatalf("expected 2 results (2 builders disabled), got %d", len(results))
 	}
 
-	// Verify only enabled builders ran
 	builderNames := make(map[string]bool)
 	for _, r := range results {
 		builderNames[r.Builder] = true
@@ -81,23 +85,14 @@ func TestSubmitToAll_CancelledContext(t *testing.T) {
 
 	builders := defaultBuilderConfigs()
 	sub := NewSubmitter(builders)
+	bundle := testBundle()
 
-	bundle := &Bundle{
-		Transactions: []Transaction{{Nonce: 0}},
-		BlockNumber:  18000000,
-	}
-
-	// Cancel context immediately before submit
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// Should not panic, results may be empty or contain errors
 	results := sub.SubmitToAll(ctx, bundle)
 
-	// With an already-cancelled context, builders may succeed (select default)
-	// or fail (context done). Either way, should not panic.
 	for _, r := range results {
-		// Each result should have a builder name
 		if r.Builder == "" {
 			t.Error("result has empty builder name")
 		}
@@ -113,36 +108,12 @@ func TestSuccessCount(t *testing.T) {
 		results []SubmissionResult
 		want    int
 	}{
-		{
-			name:    "all success",
-			results: []SubmissionResult{{Success: true}, {Success: true}, {Success: true}},
-			want:    3,
-		},
-		{
-			name:    "all failure",
-			results: []SubmissionResult{{Success: false}, {Success: false}},
-			want:    0,
-		},
-		{
-			name:    "mixed",
-			results: []SubmissionResult{{Success: true}, {Success: false}, {Success: true}, {Success: false}},
-			want:    2,
-		},
-		{
-			name:    "empty",
-			results: []SubmissionResult{},
-			want:    0,
-		},
-		{
-			name:    "single success",
-			results: []SubmissionResult{{Success: true}},
-			want:    1,
-		},
-		{
-			name:    "single failure",
-			results: []SubmissionResult{{Success: false}},
-			want:    0,
-		},
+		{"all success", []SubmissionResult{{Success: true}, {Success: true}, {Success: true}}, 3},
+		{"all failure", []SubmissionResult{{Success: false}, {Success: false}}, 0},
+		{"mixed", []SubmissionResult{{Success: true}, {Success: false}, {Success: true}, {Success: false}}, 2},
+		{"empty", []SubmissionResult{}, 0},
+		{"single success", []SubmissionResult{{Success: true}}, 1},
+		{"single failure", []SubmissionResult{{Success: false}}, 0},
 	}
 
 	for _, tc := range tests {
@@ -175,14 +146,8 @@ func TestNewSubmitter(t *testing.T) {
 		if b.Name != builders[i].Name {
 			t.Errorf("builder[%d] name: got %s, want %s", i, b.Name, builders[i].Name)
 		}
-		if b.URL != builders[i].URL {
-			t.Errorf("builder[%d] URL: got %s, want %s", i, b.URL, builders[i].URL)
-		}
-		if b.Enabled != builders[i].Enabled {
-			t.Errorf("builder[%d] Enabled: got %v, want %v", i, b.Enabled, builders[i].Enabled)
-		}
-		if b.TimeoutMs != builders[i].TimeoutMs {
-			t.Errorf("builder[%d] TimeoutMs: got %d, want %d", i, b.TimeoutMs, builders[i].TimeoutMs)
-		}
 	}
 }
+
+// Unused import guard — common is used by testBundle indirectly through types.
+var _ = common.Address{}

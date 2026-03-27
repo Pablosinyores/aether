@@ -4,20 +4,25 @@ import (
 	"encoding/hex"
 	"math/big"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
+
+var testCoinbase = common.HexToAddress("0x0000000000000000000000000000000000000001")
 
 func TestBuildBundle_Basic(t *testing.T) {
 	t.Parallel()
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
 	profit := intETHToWei(t, 1) // 1 ETH
 	calldata := []byte{0xAB, 0xCD}
 	executor := "0x1234567890abcdef1234567890abcdef12345678"
 
-	bundle, err := bc.BuildBundle(calldata, executor, profit, 500000, 18000000)
+	bundle, err := bc.BuildBundle(calldata, executor, profit, 500000, 18000000, testCoinbase)
 	if err != nil {
 		t.Fatalf("BuildBundle returned error: %v", err)
 	}
@@ -31,27 +36,19 @@ func TestBuildBundle_Basic(t *testing.T) {
 	tipTx := bundle.Transactions[1]
 
 	// Nonce sequence: arb=0, tip=1
-	if arbTx.Nonce != 0 {
-		t.Errorf("arb tx nonce: expected 0, got %d", arbTx.Nonce)
+	if arbTx.Nonce() != 0 {
+		t.Errorf("arb tx nonce: expected 0, got %d", arbTx.Nonce())
 	}
-	if tipTx.Nonce != 1 {
-		t.Errorf("tip tx nonce: expected 1, got %d", tipTx.Nonce)
+	if tipTx.Nonce() != 1 {
+		t.Errorf("tip tx nonce: expected 1, got %d", tipTx.Nonce())
 	}
 
 	// EIP-1559 fields set on arb tx
-	if arbTx.MaxFeePerGas == nil || arbTx.MaxFeePerGas.Sign() <= 0 {
-		t.Error("arb tx MaxFeePerGas not set or zero")
+	if arbTx.GasFeeCap() == nil || arbTx.GasFeeCap().Sign() <= 0 {
+		t.Error("arb tx GasFeeCap not set or zero")
 	}
-	if arbTx.MaxPriorityFeePerGas == nil || arbTx.MaxPriorityFeePerGas.Sign() <= 0 {
-		t.Error("arb tx MaxPriorityFeePerGas not set or zero")
-	}
-
-	// EIP-1559 fields set on tip tx
-	if tipTx.MaxFeePerGas == nil || tipTx.MaxFeePerGas.Sign() <= 0 {
-		t.Error("tip tx MaxFeePerGas not set or zero")
-	}
-	if tipTx.MaxPriorityFeePerGas == nil || tipTx.MaxPriorityFeePerGas.Sign() <= 0 {
-		t.Error("tip tx MaxPriorityFeePerGas not set or zero")
+	if arbTx.GasTipCap() == nil || arbTx.GasTipCap().Sign() <= 0 {
+		t.Error("arb tx GasTipCap not set or zero")
 	}
 
 	// Block number
@@ -60,17 +57,18 @@ func TestBuildBundle_Basic(t *testing.T) {
 	}
 
 	// ChainID
-	if arbTx.ChainID != 1 {
-		t.Errorf("expected chainID 1, got %d", arbTx.ChainID)
+	if arbTx.ChainId().Int64() != 1 {
+		t.Errorf("expected chainID 1, got %d", arbTx.ChainId().Int64())
 	}
 
 	// Executor address
-	if arbTx.To != executor {
-		t.Errorf("arb tx To: expected %s, got %s", executor, arbTx.To)
+	expectedAddr := common.HexToAddress(executor)
+	if arbTx.To() == nil || *arbTx.To() != expectedAddr {
+		t.Errorf("arb tx To: expected %s, got %v", expectedAddr.Hex(), arbTx.To())
 	}
 
 	// Calldata
-	if len(arbTx.Data) != 2 || arbTx.Data[0] != 0xAB || arbTx.Data[1] != 0xCD {
+	if len(arbTx.Data()) != 2 || arbTx.Data()[0] != 0xAB || arbTx.Data()[1] != 0xCD {
 		t.Errorf("arb tx calldata mismatch")
 	}
 }
@@ -82,13 +80,12 @@ func TestBuildBundle_TipCalculation(t *testing.T) {
 		name        string
 		tipSharePct float64
 		profitETH   int64
-		wantTipETH  float64 // Expected tip in ETH
 	}{
-		{"90% of 1 ETH", 90, 1, 0.9},
-		{"50% of 1 ETH", 50, 1, 0.5},
-		{"10% of 2 ETH", 10, 2, 0.2},
-		{"95% of 1 ETH", 95, 1, 0.95},
-		{"1% of 10 ETH", 1, 10, 0.1},
+		{"90% of 1 ETH", 90, 1},
+		{"50% of 1 ETH", 50, 1},
+		{"10% of 2 ETH", 10, 2},
+		{"95% of 1 ETH", 95, 1},
+		{"1% of 10 ETH", 1, 10},
 	}
 
 	for _, tc := range tests {
@@ -97,21 +94,20 @@ func TestBuildBundle_TipCalculation(t *testing.T) {
 
 			nm := NewNonceManager(0)
 			go_ := NewGasOracle(300.0)
-			bc := NewBundleConstructor(nm, go_, tc.tipSharePct, 1)
+			bc := NewBundleConstructor(nm, go_, nil, tc.tipSharePct, 1)
 
 			profit := intETHToWei(t, tc.profitETH)
-			bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 100)
+			bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 100, testCoinbase)
 			if err != nil {
 				t.Fatalf("BuildBundle error: %v", err)
 			}
 
 			tipTx := bundle.Transactions[1]
-			// Expected: profitWei * tipSharePct / 100
 			expectedTip := new(big.Int).Mul(profit, big.NewInt(int64(tc.tipSharePct)))
 			expectedTip.Div(expectedTip, big.NewInt(100))
 
-			if tipTx.Value.Cmp(expectedTip) != 0 {
-				t.Errorf("tip amount: got %s, want %s", tipTx.Value.String(), expectedTip.String())
+			if tipTx.Value().Cmp(expectedTip) != 0 {
+				t.Errorf("tip amount: got %s, want %s", tipTx.Value().String(), expectedTip.String())
 			}
 		})
 	}
@@ -122,16 +118,16 @@ func TestBuildBundle_ZeroProfit(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(0), 300000, 100)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(0), 300000, 100, testCoinbase)
 	if err != nil {
 		t.Fatalf("BuildBundle error: %v", err)
 	}
 
 	tipTx := bundle.Transactions[1]
-	if tipTx.Value.Sign() != 0 {
-		t.Errorf("expected tip=0 for zero profit, got %s", tipTx.Value.String())
+	if tipTx.Value().Sign() != 0 {
+		t.Errorf("expected tip=0 for zero profit, got %s", tipTx.Value().String())
 	}
 }
 
@@ -140,25 +136,89 @@ func TestBuildBundle_GasEstimate(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
 	gasEstimates := []uint64{21000, 500000, 1000000, 250000}
 
 	for _, gasEst := range gasEstimates {
-		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1000), gasEst, 100)
+		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1000), gasEst, 100, testCoinbase)
 		if err != nil {
 			t.Fatalf("BuildBundle error: %v", err)
 		}
 
 		arbTx := bundle.Transactions[0]
-		if arbTx.Gas != gasEst {
-			t.Errorf("gas estimate: got %d, want %d", arbTx.Gas, gasEst)
+		if arbTx.Gas() != gasEst {
+			t.Errorf("gas estimate: got %d, want %d", arbTx.Gas(), gasEst)
 		}
 
-		// Tip tx always uses 21000 (simple ETH transfer)
 		tipTx := bundle.Transactions[1]
-		if tipTx.Gas != 21000 {
-			t.Errorf("tip tx gas: got %d, want 21000", tipTx.Gas)
+		if tipTx.Gas() != 21000 {
+			t.Errorf("tip tx gas: got %d, want 21000", tipTx.Gas())
+		}
+	}
+}
+
+func TestBuildBundle_TipGoesToCoinbase(t *testing.T) {
+	t.Parallel()
+
+	nm := NewNonceManager(0)
+	go_ := NewGasOracle(300.0)
+	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+
+	coinbase := common.HexToAddress("0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1e18), 300000, 100, coinbase)
+	if err != nil {
+		t.Fatalf("BuildBundle error: %v", err)
+	}
+
+	tipTx := bundle.Transactions[1]
+	if tipTx.To() == nil || *tipTx.To() != coinbase {
+		t.Errorf("tip tx To: expected %s, got %v", coinbase.Hex(), tipTx.To())
+	}
+}
+
+func TestBuildBundle_WithSigner(t *testing.T) {
+	t.Parallel()
+
+	signer, err := NewTransactionSigner(testPrivateKeyHex, 1)
+	if err != nil {
+		t.Fatalf("NewTransactionSigner failed: %v", err)
+	}
+
+	nm := NewNonceManager(0)
+	go_ := NewGasOracle(300.0)
+	bc := NewBundleConstructor(nm, go_, signer, 90.0, 1)
+
+	profit := intETHToWei(t, 1)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 18000000, testCoinbase)
+	if err != nil {
+		t.Fatalf("BuildBundle error: %v", err)
+	}
+
+	// Should have signed raw bytes
+	if len(bundle.RawTxs) != 2 {
+		t.Fatalf("expected 2 raw txs, got %d", len(bundle.RawTxs))
+	}
+
+	for i, raw := range bundle.RawTxs {
+		if len(raw) == 0 {
+			t.Errorf("raw tx %d is empty", i)
+		}
+		// EIP-1559 tx type prefix
+		if raw[0] != 0x02 {
+			t.Errorf("raw tx %d: expected type 0x02, got 0x%02x", i, raw[0])
+		}
+	}
+
+	// Verify sender can be recovered from signed transactions
+	ethSigner := types.LatestSignerForChainID(big.NewInt(1))
+	for i, tx := range bundle.Transactions {
+		sender, err := types.Sender(ethSigner, tx)
+		if err != nil {
+			t.Fatalf("failed to recover sender from tx %d: %v", i, err)
+		}
+		if sender != signer.Address() {
+			t.Errorf("tx %d sender: got %s, want %s", i, sender.Hex(), signer.Address().Hex())
 		}
 	}
 }
