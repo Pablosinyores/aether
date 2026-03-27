@@ -19,6 +19,7 @@ pub struct NodeConfig {
 pub enum NodeType {
     WebSocket,
     Ipc,
+    Http,
 }
 
 /// State tracking for a single node connection
@@ -306,6 +307,21 @@ mod tests {
         assert_eq!(NodeType::WebSocket, NodeType::WebSocket);
         assert_eq!(NodeType::Ipc, NodeType::Ipc);
         assert_ne!(NodeType::WebSocket, NodeType::Ipc);
+    }
+
+    #[test]
+    fn test_http_node_type() {
+        let config = NodeConfig {
+            name: "http-node".to_string(),
+            url: "http://localhost:8545".to_string(),
+            node_type: NodeType::Http,
+            priority: 3,
+            max_retries: 3,
+            health_check_interval: Duration::from_secs(10),
+        };
+        assert_eq!(config.node_type, NodeType::Http);
+        assert_ne!(NodeType::Http, NodeType::WebSocket);
+        assert_ne!(NodeType::Http, NodeType::Ipc);
     }
 
     // ── NodePool tests ──

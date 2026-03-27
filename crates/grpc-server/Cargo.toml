@@ -25,6 +25,7 @@ serde = { workspace = true }
 toml = { workspace = true }
 url = "2"
 dotenvy = "0.15.7"
+futures = "0.3"
 
 [build-dependencies]
 tonic-build = { workspace = true }
