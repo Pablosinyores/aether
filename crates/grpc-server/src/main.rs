@@ -60,8 +60,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_service = ControlServiceImpl::new(Arc::clone(&state), Arc::clone(&engine));
 
     // Bootstrap pools from config file at startup.
-    let pool_count = engine.bootstrap_pools("config/pools.toml").await;
-    info!(pool_count, "Pools loaded at startup");
+    // Supports AETHER_POOLS_CONFIG env var to override the default path,
+    // so the binary works regardless of the working directory.
+    let pools_config = std::env::var("AETHER_POOLS_CONFIG")
+        .unwrap_or_else(|_| "config/pools.toml".to_string());
+    let pool_count = engine.bootstrap_pools(&pools_config).await;
+    info!(pool_count, path = %pools_config, "Pools loaded at startup");
 
     // Fetch initial on-chain reserves so the price graph has real edges.
     engine.fetch_initial_reserves().await;

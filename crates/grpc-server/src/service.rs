@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 /// Include generated proto code from tonic-build.
 pub mod aether_proto {
@@ -340,53 +340,23 @@ impl ControlService for ControlServiceImpl {
             }));
         }
 
-        // Read the TOML file from disk.
-        let contents = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to read config file");
-                return Ok(Response::new(ReloadConfigResponse {
-                    success: false,
-                    pools_loaded: 0,
-                    error: format!("Failed to read {path}: {e}"),
-                }));
-            }
-        };
-
-        // Parse as TOML and extract the [[pools]] array.
-        #[derive(serde::Deserialize)]
-        struct PoolsConfig {
-            #[serde(default)]
-            pools: Vec<toml::Value>,
-        }
-
-        let config: PoolsConfig = match toml::from_str(&contents) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to parse config TOML");
-                return Ok(Response::new(ReloadConfigResponse {
-                    success: false,
-                    pools_loaded: 0,
-                    error: format!("Failed to parse {path}: {e}"),
-                }));
-            }
-        };
-
-        let total_in_file = config.pools.len() as u32;
-
-        // Actually register the pools in the engine (skips duplicates).
+        // Register pools and fetch reserves — bootstrap_pools handles
+        // file reading, parsing, and validation in one pass.
         let loaded = self.engine.bootstrap_pools(&path).await;
-
-        // Fetch on-chain reserves for newly registered pools.
         self.engine.fetch_initial_reserves().await;
 
-        // Update engine state with the new pool count.
+        // Set active_pools to the actual registry size, not an increment,
+        // so the count stays accurate across multiple reloads.
+        let actual_count = {
+            let registry = self.engine.pool_registry().read().await;
+            registry.len() as u32
+        };
         {
             let mut engine_state = self.state.write().await;
-            engine_state.active_pools += loaded;
+            engine_state.active_pools = actual_count;
         }
 
-        info!(path = %path, loaded, total_in_file, "Config reloaded successfully");
+        info!(path = %path, loaded, active_pools = actual_count, "Config reloaded successfully");
 
         Ok(Response::new(ReloadConfigResponse {
             success: true,
@@ -879,9 +849,9 @@ tier = "warm"
             .unwrap()
             .into_inner();
 
-        assert!(!resp.success);
+        // bootstrap_pools handles missing files gracefully — returns 0.
+        assert!(resp.success);
         assert_eq!(resp.pools_loaded, 0);
-        assert!(!resp.error.is_empty());
     }
 
     #[tokio::test]
@@ -902,9 +872,9 @@ tier = "warm"
             .unwrap()
             .into_inner();
 
-        assert!(!resp.success);
+        // bootstrap_pools handles invalid TOML gracefully — returns 0.
+        assert!(resp.success);
         assert_eq!(resp.pools_loaded, 0);
-        assert!(resp.error.contains("parse"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

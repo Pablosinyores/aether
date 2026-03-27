@@ -380,6 +380,7 @@ impl AetherEngine {
     ///
     /// For V2/SushiSwap pools: calls `getReserves()`.
     /// For V3 pools: calls `slot0()`.
+    /// RPC calls are made concurrently for scalability (5,000+ pools).
     /// Updates the price graph with real exchange rates so detection works
     /// immediately after startup.
     pub async fn fetch_initial_reserves(&self) {
@@ -401,7 +402,7 @@ impl AetherEngine {
             return;
         }
 
-        info!(count = pools.len(), "Fetching initial reserves via RPC");
+        info!(count = pools.len(), "Fetching initial reserves via RPC (concurrent)");
 
         // ABI for getReserves() and slot0()
         alloy::sol! {
@@ -409,86 +410,125 @@ impl AetherEngine {
             function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
         }
 
+        // Result type for each concurrent RPC fetch.
+        enum ReserveResult {
+            V2 { pool_addr: Address, meta: PoolMetadata, r0: U256, r1: U256 },
+            V3 { pool_addr: Address, meta: PoolMetadata, sqrt_price_x96: U256 },
+            Skipped,
+        }
+
+        // Fire off all RPC calls concurrently.
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (pool_addr, meta) in pools.iter().cloned() {
+            let provider = provider.clone();
+            join_set.spawn(async move {
+                match meta.protocol {
+                    ProtocolType::UniswapV2 | ProtocolType::SushiSwap => {
+                        let calldata = getReservesCall {}.abi_encode();
+                        let tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(pool_addr)
+                            .input(calldata.into());
+
+                        match provider.call(tx).await {
+                            Ok(output) if output.len() >= 96 => {
+                                let r0 = U256::from_be_slice(&output[0..32]);
+                                let r1 = U256::from_be_slice(&output[32..64]);
+                                ReserveResult::V2 { pool_addr, meta, r0, r1 }
+                            }
+                            Ok(output) => {
+                                warn!(%pool_addr, len = output.len(), "getReserves output too short");
+                                ReserveResult::Skipped
+                            }
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "getReserves RPC call failed");
+                                ReserveResult::Skipped
+                            }
+                        }
+                    }
+                    ProtocolType::UniswapV3 => {
+                        let calldata = slot0Call {}.abi_encode();
+                        let tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(pool_addr)
+                            .input(calldata.into());
+
+                        match provider.call(tx).await {
+                            Ok(output) if output.len() >= 64 => {
+                                let sqrt_price_x96 = U256::from_be_slice(&output[0..32]);
+                                ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 }
+                            }
+                            Ok(output) => {
+                                warn!(%pool_addr, len = output.len(), "slot0 output too short");
+                                ReserveResult::Skipped
+                            }
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "slot0 RPC call failed");
+                                ReserveResult::Skipped
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!(%pool_addr, protocol = ?meta.protocol, "Reserve fetch not yet implemented for this protocol");
+                        ReserveResult::Skipped
+                    }
+                }
+            });
+        }
+
+        // Collect results and apply to the price graph.
         let mut fetched: u32 = 0;
 
-        for (pool_addr, meta) in &pools {
-            match meta.protocol {
-                ProtocolType::UniswapV2 | ProtocolType::SushiSwap => {
-                    let calldata = getReservesCall {}.abi_encode();
-                    let tx = alloy::rpc::types::TransactionRequest::default()
-                        .to(*pool_addr)
-                        .input(calldata.into());
+        while let Some(result) = join_set.join_next().await {
+            let reserve = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "Reserve fetch task panicked");
+                    continue;
+                }
+            };
 
-                    match provider.call(tx).await {
-                        Ok(output) => {
-                            if output.len() < 96 {
-                                warn!(%pool_addr, len = output.len(), "getReserves output too short");
-                                continue;
-                            }
-                            let r0 = U256::from_be_slice(&output[0..32]);
-                            let r1 = U256::from_be_slice(&output[32..64]);
-                            let r0_f = u256_to_f64(r0);
-                            let r1_f = u256_to_f64(r1);
-
-                            if r0_f > 0.0 && r1_f > 0.0 {
-                                let fee = meta.fee_factor();
-                                let mut graph = self.price_graph.write().await;
-                                graph.update_edge_from_reserves(
-                                    meta.token0_idx, meta.token1_idx,
-                                    meta.pool_id, r0_f, r1_f, fee,
-                                );
-                                graph.update_edge_from_reserves(
-                                    meta.token1_idx, meta.token0_idx,
-                                    meta.pool_id, r1_f, r0_f, fee,
-                                );
-                                fetched += 1;
-                                debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
-                            }
-                        }
-                        Err(e) => warn!(%pool_addr, error = %e, "getReserves RPC call failed"),
+            match reserve {
+                ReserveResult::V2 { pool_addr, meta, r0, r1 } => {
+                    let r0_f = u256_to_f64(r0);
+                    let r1_f = u256_to_f64(r1);
+                    if r0_f > 0.0 && r1_f > 0.0 {
+                        let fee = meta.fee_factor();
+                        let mut graph = self.price_graph.write().await;
+                        graph.update_edge_from_reserves(
+                            meta.token0_idx, meta.token1_idx,
+                            meta.pool_id, r0_f, r1_f, fee,
+                        );
+                        graph.update_edge_from_reserves(
+                            meta.token1_idx, meta.token0_idx,
+                            meta.pool_id, r1_f, r0_f, fee,
+                        );
+                        fetched += 1;
+                        debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
                     }
                 }
-                ProtocolType::UniswapV3 => {
-                    let calldata = slot0Call {}.abi_encode();
-                    let tx = alloy::rpc::types::TransactionRequest::default()
-                        .to(*pool_addr)
-                        .input(calldata.into());
-
-                    match provider.call(tx).await {
-                        Ok(output) => {
-                            if output.len() < 64 {
-                                warn!(%pool_addr, len = output.len(), "slot0 output too short");
-                                continue;
-                            }
-                            let sqrt_price_x96 = U256::from_be_slice(&output[0..32]);
-                            const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
-                            let sqrt_f64 = u256_to_f64(sqrt_price_x96);
-                            let price = (sqrt_f64 / TWO_POW_96).powi(2);
-
-                            if price > 0.0 {
-                                let fee = meta.fee_factor();
-                                let liq = U256::ZERO;
-                                let mut graph = self.price_graph.write().await;
-                                graph.add_edge(
-                                    meta.token0_idx, meta.token1_idx,
-                                    price * fee, meta.pool_id, *pool_addr,
-                                    meta.protocol, liq,
-                                );
-                                graph.add_edge(
-                                    meta.token1_idx, meta.token0_idx,
-                                    (1.0 / price) * fee, meta.pool_id, *pool_addr,
-                                    meta.protocol, liq,
-                                );
-                                fetched += 1;
-                                debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
-                            }
-                        }
-                        Err(e) => warn!(%pool_addr, error = %e, "slot0 RPC call failed"),
+                ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 } => {
+                    const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+                    let sqrt_f64 = u256_to_f64(sqrt_price_x96);
+                    let price = (sqrt_f64 / TWO_POW_96).powi(2);
+                    if price > 0.0 {
+                        let fee = meta.fee_factor();
+                        let liq = U256::ZERO;
+                        let mut graph = self.price_graph.write().await;
+                        graph.add_edge(
+                            meta.token0_idx, meta.token1_idx,
+                            price * fee, meta.pool_id, pool_addr,
+                            meta.protocol, liq,
+                        );
+                        graph.add_edge(
+                            meta.token1_idx, meta.token0_idx,
+                            (1.0 / price) * fee, meta.pool_id, pool_addr,
+                            meta.protocol, liq,
+                        );
+                        fetched += 1;
+                        debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
                     }
                 }
-                _ => {
-                    debug!(%pool_addr, protocol = ?meta.protocol, "Reserve fetch not yet implemented for this protocol");
-                }
+                ReserveResult::Skipped => {}
             }
         }
 
