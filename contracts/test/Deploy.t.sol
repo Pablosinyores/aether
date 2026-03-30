@@ -8,8 +8,12 @@ import {AetherExecutor} from "../src/AetherExecutor.sol";
 contract DeployTest is Test {
     DeployAetherExecutor deployer;
 
+    // Keep tests deterministic even if other tests mutate `AAVE_POOL` via `vm.setEnv`.
+    address constant DEFAULT_AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
+
     function setUp() public {
         deployer = new DeployAetherExecutor();
+        vm.setEnv("AAVE_POOL", vm.toString(DEFAULT_AAVE_POOL));
     }
 
     function test_deploy_defaultAavePool() public {
