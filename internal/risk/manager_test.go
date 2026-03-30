@@ -162,6 +162,24 @@ func TestPreflightCheck_TipShareTooHigh(t *testing.T) {
 	}
 }
 
+func TestPreflightCheck_TipShareTooLow(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+
+	result := rm.PreflightCheck(
+		fracETHWei(t, 1, 100),
+		ethWei(t, 10),
+		100.0,
+		49.0, // 49% — below 50% min
+		1.0,
+	)
+
+	if result.Approved {
+		t.Error("expected rejected for tip share too low, got approved")
+	}
+}
+
 func TestPreflightCheck_SystemNotRunning(t *testing.T) {
 	t.Parallel()
 
@@ -378,10 +396,10 @@ func TestBundleMissRate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		included  int
-		missed    int
-		wantRate  float64
+		name     string
+		included int
+		missed   int
+		wantRate float64
 	}{
 		{"0 submitted", 0, 0, 0.0},
 		{"all included", 10, 0, 0.0},

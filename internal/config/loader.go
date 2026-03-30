@@ -46,6 +46,7 @@ type RiskFileConfig struct {
 		MaxSingleTradeETH float64 `yaml:"max_single_trade_eth"`
 		MaxDailyVolumeETH float64 `yaml:"max_daily_volume_eth"`
 		MinProfitETH      float64 `yaml:"min_profit_eth"`
+		MinTipSharePct    float64 `yaml:"min_tip_share_pct"`
 		MaxTipSharePct    float64 `yaml:"max_tip_share_pct"`
 	} `yaml:"position_limits"`
 	System struct {
@@ -116,8 +117,14 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 	if pl.MinProfitETH <= 0 {
 		return fmt.Errorf("position_limits.min_profit_eth must be > 0, got %v", pl.MinProfitETH)
 	}
+	if pl.MinTipSharePct <= 0 || pl.MinTipSharePct > 100 {
+		return fmt.Errorf("position_limits.min_tip_share_pct must be in (0, 100], got %v", pl.MinTipSharePct)
+	}
 	if pl.MaxTipSharePct <= 0 || pl.MaxTipSharePct > 100 {
 		return fmt.Errorf("position_limits.max_tip_share_pct must be in (0, 100], got %v", pl.MaxTipSharePct)
+	}
+	if pl.MinTipSharePct >= pl.MaxTipSharePct {
+		return fmt.Errorf("position_limits.min_tip_share_pct must be < position_limits.max_tip_share_pct, got min=%v max=%v", pl.MinTipSharePct, pl.MaxTipSharePct)
 	}
 
 	return nil
