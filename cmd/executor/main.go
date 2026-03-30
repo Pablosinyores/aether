@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -251,6 +252,7 @@ func processArb(
 
 	// Submit to all builders
 	results := submitter.SubmitToAll(ctx, bundle)
+	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
@@ -259,6 +261,65 @@ func processArb(
 	rm.RecordBundleResult(successes > 0)
 
 	return successes > 0, nil
+}
+
+// recordSubmissionReverts classifies and records revert-like submission
+// failures so only bug reverts count toward the circuit breaker.
+func recordSubmissionReverts(rm *risk.RiskManager, results []SubmissionResult) {
+	for _, res := range results {
+		if res.Success || res.Error == nil {
+			continue
+		}
+
+		errMsg := res.Error.Error()
+		if !looksLikeRevert(errMsg) {
+			continue
+		}
+
+		rm.RecordRevert(risk.ClassifyRevert(errMsg))
+	}
+}
+
+func looksLikeRevert(errMsg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errMsg))
+
+	if lower == "" {
+		return true
+	}
+
+	revertSignals := []string{
+		"revert",
+		"reverted",
+		"nonce too low",
+		"already known",
+		"replacement transaction underpriced",
+		"transaction underpriced",
+		"bundle collision",
+		"already included",
+		"already executed",
+		"arbitrage already executed",
+		"arb already taken",
+		"insufficient output amount",
+		"insufficient_output_amount",
+		"insufficient liquidity",
+		"price impact",
+		"k invariant",
+		"invariant",
+		"slippage",
+		"excessive_input_amount",
+		"minreturn",
+		"mev already captured",
+		"frontrun",
+		"sandwich",
+	}
+
+	for _, signal := range revertSignals {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // consumeArbStream connects to the Rust engine's StreamArbs RPC and

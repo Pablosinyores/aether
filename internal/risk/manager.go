@@ -10,37 +10,53 @@ import (
 	"github.com/aether-arb/aether/internal/config"
 )
 
+// RevertType classifies a transaction revert.
+type RevertType string
+
+const (
+	// RevertCompetitive is an expected revert: another searcher/bot won the same MEV
+	// opportunity. Flash loan reverts are always atomic and cost no gas — these are
+	// normal in competitive environments and should NOT count toward the circuit breaker.
+	RevertCompetitive RevertType = "competitive"
+
+	// RevertBug is an unexpected revert caused by a logic error, bad simulation,
+	// stale data, or misconfiguration. These DO count toward the circuit breaker.
+	RevertBug RevertType = "bug"
+)
+
 // RiskConfig holds all risk management parameters.
 type RiskConfig struct {
-	MaxGasGwei              float64
-	ConsecutiveRevertsPause int
-	RevertWindowMinutes     int
-	DailyLossHaltETH        float64
-	MinETHBalance           float64
-	MaxNodeLatencyMs        int64
-	BundleMissRateAlertPct  float64
-	BundleMissRateWindowMin int
-	MaxSingleTradeETH       float64
-	MaxDailyVolumeETH       float64
-	MinProfitETH            float64
-	MaxTipSharePct          float64
+	MaxGasGwei                float64
+	ConsecutiveRevertsPause   int
+	RevertWindowMinutes       int
+	CompetitiveRevertAlertPct float64
+	DailyLossHaltETH          float64
+	MinETHBalance             float64
+	MaxNodeLatencyMs          int64
+	BundleMissRateAlertPct    float64
+	BundleMissRateWindowMin   int
+	MaxSingleTradeETH         float64
+	MaxDailyVolumeETH         float64
+	MinProfitETH              float64
+	MaxTipSharePct            float64
 }
 
 // DefaultRiskConfig returns the default risk parameters.
 func DefaultRiskConfig() RiskConfig {
 	return RiskConfig{
-		MaxGasGwei:              300,
-		ConsecutiveRevertsPause: 3,
-		RevertWindowMinutes:     10,
-		DailyLossHaltETH:        0.5,
-		MinETHBalance:           0.1,
-		MaxNodeLatencyMs:        500,
-		BundleMissRateAlertPct:  80,
-		BundleMissRateWindowMin: 60,
-		MaxSingleTradeETH:       50.0,
-		MaxDailyVolumeETH:       500.0,
-		MinProfitETH:            0.001,
-		MaxTipSharePct:          95.0,
+		MaxGasGwei:                300,
+		ConsecutiveRevertsPause:   10,
+		RevertWindowMinutes:       10,
+		CompetitiveRevertAlertPct: 90,
+		DailyLossHaltETH:          0.5,
+		MinETHBalance:             0.1,
+		MaxNodeLatencyMs:          500,
+		BundleMissRateAlertPct:    80,
+		BundleMissRateWindowMin:   60,
+		MaxSingleTradeETH:         50.0,
+		MaxDailyVolumeETH:         500.0,
+		MinProfitETH:              0.001,
+		MaxTipSharePct:            95.0,
 	}
 }
 
@@ -54,18 +70,19 @@ func LoadRiskConfig(path string) (RiskConfig, error) {
 	}
 
 	return RiskConfig{
-		MaxGasGwei:              fc.CircuitBreakers.MaxGasGwei,
-		ConsecutiveRevertsPause: fc.CircuitBreakers.ConsecutiveRevertsPause,
-		RevertWindowMinutes:     fc.CircuitBreakers.RevertWindowMinutes,
-		DailyLossHaltETH:        fc.CircuitBreakers.DailyLossHaltETH,
-		MinETHBalance:           fc.CircuitBreakers.MinETHBalance,
-		MaxNodeLatencyMs:        fc.CircuitBreakers.MaxNodeLatencyMs,
-		BundleMissRateAlertPct:  fc.CircuitBreakers.BundleMissRateAlertPct,
-		BundleMissRateWindowMin: fc.CircuitBreakers.BundleMissRateWindowMinutes,
-		MaxSingleTradeETH:       fc.PositionLimits.MaxSingleTradeETH,
-		MaxDailyVolumeETH:       fc.PositionLimits.MaxDailyVolumeETH,
-		MinProfitETH:            fc.PositionLimits.MinProfitETH,
-		MaxTipSharePct:          fc.PositionLimits.MaxTipSharePct,
+		MaxGasGwei:                fc.CircuitBreakers.MaxGasGwei,
+		ConsecutiveRevertsPause:   fc.CircuitBreakers.ConsecutiveRevertsPause,
+		RevertWindowMinutes:       fc.CircuitBreakers.RevertWindowMinutes,
+		CompetitiveRevertAlertPct: fc.CircuitBreakers.CompetitiveRevertAlertPct,
+		DailyLossHaltETH:          fc.CircuitBreakers.DailyLossHaltETH,
+		MinETHBalance:             fc.CircuitBreakers.MinETHBalance,
+		MaxNodeLatencyMs:          fc.CircuitBreakers.MaxNodeLatencyMs,
+		BundleMissRateAlertPct:    fc.CircuitBreakers.BundleMissRateAlertPct,
+		BundleMissRateWindowMin:   fc.CircuitBreakers.BundleMissRateWindowMinutes,
+		MaxSingleTradeETH:         fc.PositionLimits.MaxSingleTradeETH,
+		MaxDailyVolumeETH:         fc.PositionLimits.MaxDailyVolumeETH,
+		MinProfitETH:              fc.PositionLimits.MinProfitETH,
+		MaxTipSharePct:            fc.PositionLimits.MaxTipSharePct,
 	}, nil
 }
 
@@ -77,26 +94,28 @@ type PreflightResult struct {
 
 // RiskManager implements circuit breakers and position limits.
 type RiskManager struct {
-	mu               sync.RWMutex
-	config           RiskConfig
-	state            *SystemStateMachine
-	recentReverts    []time.Time
-	dailyVolume      *big.Int // Wei
-	dailyPnL         *big.Int // Wei (can be negative)
-	dailyResetTime   time.Time
-	bundlesSubmitted int
-	bundlesIncluded  int
+	mu                  sync.RWMutex
+	config              RiskConfig
+	state               *SystemStateMachine
+	recentBugReverts    []time.Time // Only these count toward circuit breaker
+	recentCompReverts   []time.Time // Tracked separately for metrics / stale-data alert
+	dailyVolume         *big.Int    // Wei
+	dailyPnL            *big.Int    // Wei (can be negative)
+	dailyResetTime      time.Time
+	bundlesSubmitted    int
+	bundlesIncluded     int
 }
 
 // NewRiskManager creates a new risk manager.
 func NewRiskManager(config RiskConfig) *RiskManager {
 	return &RiskManager{
-		config:         config,
-		state:          NewSystemStateMachine(),
-		recentReverts:  make([]time.Time, 0),
-		dailyVolume:    big.NewInt(0),
-		dailyPnL:       big.NewInt(0),
-		dailyResetTime: time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour),
+		config:            config,
+		state:             NewSystemStateMachine(),
+		recentBugReverts:  make([]time.Time, 0),
+		recentCompReverts: make([]time.Time, 0),
+		dailyVolume:       big.NewInt(0),
+		dailyPnL:          big.NewInt(0),
+		dailyResetTime:    time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour),
 	}
 }
 
@@ -153,28 +172,50 @@ func (rm *RiskManager) PreflightCheck(
 }
 
 // RecordRevert records a transaction revert for circuit breaker tracking.
-func (rm *RiskManager) RecordRevert() {
+//
+// Only RevertBug reverts count toward the consecutive reverts circuit breaker.
+// RevertCompetitive reverts are tracked separately; a high competitive-revert
+// rate emits an alert indicating the bot may be acting on stale data.
+func (rm *RiskManager) RecordRevert(revertType RevertType) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	now := time.Now()
-	rm.recentReverts = append(rm.recentReverts, now)
-
-	// Clean old reverts outside window
 	cutoff := now.Add(-time.Duration(rm.config.RevertWindowMinutes) * time.Minute)
-	cleaned := make([]time.Time, 0)
-	for _, t := range rm.recentReverts {
-		if t.After(cutoff) {
-			cleaned = append(cleaned, t)
-		}
-	}
-	rm.recentReverts = cleaned
 
-	// Check consecutive reverts threshold
-	if len(rm.recentReverts) >= rm.config.ConsecutiveRevertsPause {
-		log.Printf("CIRCUIT BREAKER: %d reverts in %d minutes, pausing",
-			len(rm.recentReverts), rm.config.RevertWindowMinutes)
+	// Helper to prune entries outside the rolling window.
+	prune := func(ts []time.Time) []time.Time {
+		out := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				out = append(out, t)
+			}
+		}
+		return out
+	}
+
+	switch revertType {
+	case RevertCompetitive:
+		rm.recentCompReverts = append(prune(rm.recentCompReverts), now)
+	default: // RevertBug (and any unknown type) — conservative: count it
+		rm.recentBugReverts = append(prune(rm.recentBugReverts), now)
+	}
+
+	// --- Bug-revert circuit breaker ---
+	if len(rm.recentBugReverts) >= rm.config.ConsecutiveRevertsPause {
+		log.Printf("CIRCUIT BREAKER: %d bug reverts in %d minutes, pausing",
+			len(rm.recentBugReverts), rm.config.RevertWindowMinutes)
 		rm.state.Transition(StatePaused)
+	}
+
+	// --- Competitive-revert stale-data alert ---
+	totalReverts := len(rm.recentBugReverts) + len(rm.recentCompReverts)
+	if totalReverts > 0 {
+		compPct := float64(len(rm.recentCompReverts)) / float64(totalReverts) * 100
+		if compPct >= rm.config.CompetitiveRevertAlertPct {
+			log.Printf("ALERT: competitive revert rate %.0f%% (>= %.0f%%) in last %d min — possible stale data",
+				compPct, rm.config.CompetitiveRevertAlertPct, rm.config.RevertWindowMinutes)
+		}
 	}
 }
 
