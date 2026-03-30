@@ -430,6 +430,72 @@ func TestBundleMissRate(t *testing.T) {
 	}
 }
 
+func TestCalculateTipShare_UsesBundleMissRate(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// No history => neutral band => keep start tip at 90%.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 90.0 {
+		t.Fatalf("tip share with no history = %.1f, want 90.0", got)
+	}
+
+	// 0% inclusion (100% miss) => increase by 5%.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share after high miss rate = %.1f, want 95.0", got)
+	}
+
+	// Keep recording misses; must stay capped at max tip share.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should remain capped at 95.0, got %.1f", got)
+	}
+}
+
+func TestCalculateTipShare_DecreasesOnHighInclusion(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// 90% inclusion => decrease from 90% to 85%.
+	for i := 0; i < 9; i++ {
+		rm.RecordBundleResult(true)
+	}
+	rm.RecordBundleResult(false)
+
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 85.0 {
+		t.Fatalf("tip share after high inclusion = %.1f, want 85.0", got)
+	}
+}
+
+func TestCalculateTipShare_RespectsConfiguredBounds(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.MinTipSharePct = 60.0
+	cfg.MaxTipSharePct = 80.0
+	rm := NewRiskManager(cfg)
+	profitWei := ethWei(t, 1)
+
+	// Start value clamps into configured bounds.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 80.0 {
+		t.Fatalf("initial clamped tip share = %.1f, want 80.0", got)
+	}
+
+	// 100% inclusion would reduce tip, but never below configured min.
+	for i := 0; i < 20; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	if got := rm.CalculateTipShare(profitWei, 30.0); got < 60.0 {
+		t.Fatalf("tip share should not go below configured min 60.0, got %.1f", got)
+	}
+}
+
 func TestWeiToETH(t *testing.T) {
 	t.Parallel()
 
