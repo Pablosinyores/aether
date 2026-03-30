@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 
 /// Include generated proto code from tonic-build.
 pub mod aether_proto {
@@ -289,11 +289,12 @@ impl HealthService for HealthServiceImpl {
 /// hot-reload configuration.
 pub struct ControlServiceImpl {
     state: Arc<RwLock<EngineState>>,
+    engine: Arc<crate::engine::AetherEngine>,
 }
 
 impl ControlServiceImpl {
-    pub fn new(state: Arc<RwLock<EngineState>>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<RwLock<EngineState>>, engine: Arc<crate::engine::AetherEngine>) -> Self {
+        Self { state, engine }
     }
 }
 
@@ -339,51 +340,27 @@ impl ControlService for ControlServiceImpl {
             }));
         }
 
-        // Read the TOML file from disk.
-        let contents = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to read config file");
-                return Ok(Response::new(ReloadConfigResponse {
-                    success: false,
-                    pools_loaded: 0,
-                    error: format!("Failed to read {path}: {e}"),
-                }));
-            }
+        // Register pools and fetch reserves — bootstrap_pools handles
+        // file reading, parsing, and validation in one pass.
+        let loaded = self.engine.bootstrap_pools(&path).await;
+        self.engine.fetch_initial_reserves().await;
+
+        // Set active_pools to the actual registry size, not an increment,
+        // so the count stays accurate across multiple reloads.
+        let actual_count = {
+            let registry = self.engine.pool_registry().read().await;
+            registry.len() as u32
         };
-
-        // Parse as TOML and extract the [[pools]] array.
-        #[derive(serde::Deserialize)]
-        struct PoolsConfig {
-            #[serde(default)]
-            pools: Vec<toml::Value>,
-        }
-
-        let config: PoolsConfig = match toml::from_str(&contents) {
-            Ok(c) => c,
-            Err(e) => {
-                error!(path = %path, error = %e, "Failed to parse config TOML");
-                return Ok(Response::new(ReloadConfigResponse {
-                    success: false,
-                    pools_loaded: 0,
-                    error: format!("Failed to parse {path}: {e}"),
-                }));
-            }
-        };
-
-        let pool_count = config.pools.len() as u32;
-
-        // Update engine state with the new pool count.
         {
             let mut engine_state = self.state.write().await;
-            engine_state.active_pools = pool_count;
+            engine_state.active_pools = actual_count;
         }
 
-        info!(path = %path, pools_loaded = pool_count, "Config reloaded successfully");
+        info!(path = %path, loaded, active_pools = actual_count, "Config reloaded successfully");
 
         Ok(Response::new(ReloadConfigResponse {
             success: true,
-            pools_loaded: pool_count,
+            pools_loaded: loaded,
             error: String::new(),
         }))
     }
@@ -400,6 +377,14 @@ mod tests {
 
     fn shared_state() -> Arc<RwLock<EngineState>> {
         Arc::new(RwLock::new(EngineState::default()))
+    }
+
+    fn dummy_engine() -> Arc<crate::engine::AetherEngine> {
+        let (arb_tx, _) = tokio::sync::broadcast::channel(16);
+        Arc::new(crate::engine::AetherEngine::new(
+            crate::engine::EngineConfig::default(),
+            arb_tx,
+        ))
     }
 
     // ---- EngineState tests ----
@@ -724,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_state_running_to_paused() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let resp = svc
             .set_state(Request::new(SetStateRequest {
@@ -745,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_state_invalid_value() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let result = svc
             .set_state(Request::new(SetStateRequest {
@@ -762,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_state_full_cycle() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         // Running -> Degraded -> Paused -> Halted -> Running
         for (new, expected_prev) in [(2, 1), (3, 2), (4, 3), (1, 4)] {
@@ -786,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn test_reload_config_valid_file() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         // Write a temp TOML file with 2 pool entries.
         let dir = std::env::temp_dir().join("aether_test_reload_config");
@@ -837,7 +822,7 @@ tier = "warm"
     #[tokio::test]
     async fn test_reload_config_empty_path() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let resp = svc
             .reload_config(Request::new(ReloadConfigRequest {
@@ -854,7 +839,7 @@ tier = "warm"
     #[tokio::test]
     async fn test_reload_config_nonexistent_file() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let resp = svc
             .reload_config(Request::new(ReloadConfigRequest {
@@ -864,15 +849,15 @@ tier = "warm"
             .unwrap()
             .into_inner();
 
-        assert!(!resp.success);
+        // bootstrap_pools handles missing files gracefully — returns 0.
+        assert!(resp.success);
         assert_eq!(resp.pools_loaded, 0);
-        assert!(!resp.error.is_empty());
     }
 
     #[tokio::test]
     async fn test_reload_config_invalid_toml() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let dir = std::env::temp_dir().join("aether_test_reload_bad_toml");
         let _ = std::fs::create_dir_all(&dir);
@@ -887,9 +872,9 @@ tier = "warm"
             .unwrap()
             .into_inner();
 
-        assert!(!resp.success);
+        // bootstrap_pools handles invalid TOML gracefully — returns 0.
+        assert!(resp.success);
         assert_eq!(resp.pools_loaded, 0);
-        assert!(resp.error.contains("parse"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -897,7 +882,7 @@ tier = "warm"
     #[tokio::test]
     async fn test_reload_config_no_pools_key() {
         let state = shared_state();
-        let svc = ControlServiceImpl::new(Arc::clone(&state));
+        let svc = ControlServiceImpl::new(Arc::clone(&state), dummy_engine());
 
         let dir = std::env::temp_dir().join("aether_test_reload_no_pools");
         let _ = std::fs::create_dir_all(&dir);

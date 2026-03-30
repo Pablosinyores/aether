@@ -19,6 +19,10 @@ use service::{ArbServiceImpl, ControlServiceImpl, EngineState, HealthServiceImpl
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file into the process environment so std::env::var() picks
+    // up ETH_RPC_URL, ALCHEMY_API_KEY, etc. Silently ignored if .env is missing.
+    let _ = dotenvy::dotenv();
+
     // Initialize structured logging with tracing.
     // Respects RUST_LOG env var; defaults to `info` level.
     tracing_subscriber::fmt()
@@ -37,7 +41,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shared state.
     let arb_service = ArbServiceImpl::new(Arc::clone(&state));
     let health_service = HealthServiceImpl::new(Arc::clone(&state));
-    let control_service = ControlServiceImpl::new(Arc::clone(&state));
 
     // Create the AetherEngine with a broadcast sender connected to the
     // ArbService's stream.
@@ -52,6 +55,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("ETH_RPC_URL not set — engine will use empty-state simulation");
     }
     let engine = Arc::new(AetherEngine::new(engine_config, arb_tx));
+
+    // ControlService needs a handle to the engine for hot-reload support.
+    let control_service = ControlServiceImpl::new(Arc::clone(&state), Arc::clone(&engine));
+
+    // Bootstrap pools from config file at startup.
+    // Supports AETHER_POOLS_CONFIG env var to override the default path,
+    // so the binary works regardless of the working directory.
+    let pools_config = std::env::var("AETHER_POOLS_CONFIG")
+        .unwrap_or_else(|_| "config/pools.toml".to_string());
+    let pool_count = engine.bootstrap_pools(&pools_config).await;
+    info!(pool_count, path = %pools_config, "Pools loaded at startup");
+
+    // Fetch initial on-chain reserves so the price graph has real edges.
+    engine.fetch_initial_reserves().await;
 
     // Create the RpcProvider, sharing the engine's event channels so events
     // flow from the provider into the engine's event loop.
