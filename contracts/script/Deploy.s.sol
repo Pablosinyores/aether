@@ -8,10 +8,7 @@ contract DeployAetherExecutor is Script {
     // Mainnet Aave V3 Pool
     address constant DEFAULT_AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
 
-    function run() external returns (AetherExecutor) {
-        // Allow override via env var, fall back to mainnet default
-        address aavePool = vm.envOr("AAVE_POOL", DEFAULT_AAVE_POOL);
-
+    function runWithAavePool(address aavePool) public returns (AetherExecutor) {
         vm.startBroadcast();
         AetherExecutor executor = new AetherExecutor(aavePool);
         vm.stopBroadcast();
@@ -21,5 +18,11 @@ contract DeployAetherExecutor is Script {
         console.log("Aave Pool:", executor.aavePool());
 
         return executor;
+    }
+
+    function run() external returns (AetherExecutor) {
+        // Allow override via env var, fall back to mainnet default
+        address aavePool = vm.envOr("AAVE_POOL", DEFAULT_AAVE_POOL);
+        return runWithAavePool(aavePool);
     }
 }
