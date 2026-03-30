@@ -99,6 +99,9 @@ func TestLoadRiskConfig_ValidFile(t *testing.T) {
 	if cfg.PositionLimits.MinProfitETH != 0.001 {
 		t.Errorf("MinProfitETH = %v, want 0.001", cfg.PositionLimits.MinProfitETH)
 	}
+	if cfg.PositionLimits.MinTipSharePct != 50 {
+		t.Errorf("MinTipSharePct = %v, want 50", cfg.PositionLimits.MinTipSharePct)
+	}
 	if cfg.PositionLimits.MaxTipSharePct != 95 {
 		t.Errorf("MaxTipSharePct = %v, want 95", cfg.PositionLimits.MaxTipSharePct)
 	}
@@ -199,6 +202,31 @@ func TestValidateRiskConfig_ZeroMaxTipShare(t *testing.T) {
 	err := ValidateRiskConfig(cfg)
 	if err == nil {
 		t.Fatal("expected validation error for MaxTipSharePct=0, got nil")
+	}
+}
+
+func TestValidateRiskConfig_ZeroMinTipShare(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.PositionLimits.MinTipSharePct = 0
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for MinTipSharePct=0, got nil")
+	}
+}
+
+func TestValidateRiskConfig_MinTipShareNotLessThanMax(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.PositionLimits.MinTipSharePct = 95
+	cfg.PositionLimits.MaxTipSharePct = 95
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error when MinTipSharePct >= MaxTipSharePct, got nil")
 	}
 }
 
@@ -503,6 +531,7 @@ func validRiskFileConfig() RiskFileConfig {
 	cfg.PositionLimits.MaxSingleTradeETH = 50.0
 	cfg.PositionLimits.MaxDailyVolumeETH = 500.0
 	cfg.PositionLimits.MinProfitETH = 0.001
+	cfg.PositionLimits.MinTipSharePct = 50
 	cfg.PositionLimits.MaxTipSharePct = 95
 	return cfg
 }

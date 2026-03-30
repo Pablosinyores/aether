@@ -39,6 +39,7 @@ type RiskConfig struct {
 	MaxSingleTradeETH         float64
 	MaxDailyVolumeETH         float64
 	MinProfitETH              float64
+	MinTipSharePct            float64
 	MaxTipSharePct            float64
 }
 
@@ -57,6 +58,7 @@ func DefaultRiskConfig() RiskConfig {
 		MaxSingleTradeETH:         50.0,
 		MaxDailyVolumeETH:         500.0,
 		MinProfitETH:              0.001,
+		MinTipSharePct:            50.0,
 		MaxTipSharePct:            95.0,
 	}
 }
@@ -83,6 +85,7 @@ func LoadRiskConfig(path string) (RiskConfig, error) {
 		MaxSingleTradeETH:         fc.PositionLimits.MaxSingleTradeETH,
 		MaxDailyVolumeETH:         fc.PositionLimits.MaxDailyVolumeETH,
 		MinProfitETH:              fc.PositionLimits.MinProfitETH,
+		MinTipSharePct:            fc.PositionLimits.MinTipSharePct,
 		MaxTipSharePct:            fc.PositionLimits.MaxTipSharePct,
 	}, nil
 }
@@ -169,6 +172,11 @@ func (rm *RiskManager) PreflightCheck(
 	profitETH := WeiToETH(profitWei)
 	if profitETH < rm.config.MinProfitETH {
 		return PreflightResult{false, fmt.Sprintf("profit too low: %.6f < %.6f ETH", profitETH, rm.config.MinProfitETH)}
+	}
+
+	// Position limit: max tip share
+	if tipSharePct < rm.config.MinTipSharePct {
+		return PreflightResult{false, fmt.Sprintf("tip share too low: %.1f%% < %.1f%%", tipSharePct, rm.config.MinTipSharePct)}
 	}
 
 	// Position limit: max tip share
