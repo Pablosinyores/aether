@@ -101,6 +101,8 @@ type RiskManager struct {
 	mu                  sync.RWMutex
 	config              RiskConfig
 	state               *SystemStateMachine
+	tipStrategy         TipStrategy
+	lastTipSharePct     float64
 	recentBugReverts    []time.Time // Only these count toward circuit breaker
 	recentCompReverts   []time.Time // Tracked separately for metrics / stale-data alert
 	dailyVolume         *big.Int    // Wei
@@ -119,15 +121,47 @@ type RiskManager struct {
 
 // NewRiskManager creates a new risk manager.
 func NewRiskManager(config RiskConfig) *RiskManager {
+	initialTipShare := clampTip(90.0, config.MinTipSharePct, config.MaxTipSharePct)
+
 	return &RiskManager{
 		config:            config,
 		state:             NewSystemStateMachine(),
+		tipStrategy:       NewAdaptiveTipStrategy(initialTipShare, config.MinTipSharePct, config.MaxTipSharePct, 5.0),
+		lastTipSharePct:   initialTipShare,
 		recentBugReverts:  make([]time.Time, 0),
 		recentCompReverts: make([]time.Time, 0),
 		dailyVolume:       big.NewInt(0),
 		dailyPnL:          big.NewInt(0),
 		dailyResetTime:    time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour),
 	}
+}
+
+// CalculateTipShare computes the adaptive tip share using recent inclusion
+// performance and logs changes for post-trade analysis.
+func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) float64 {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	inclusionRate := 50.0 // neutral default when no history exists yet
+	missRate := 0.0
+	if rm.bundlesSubmitted > 0 {
+		missRate = float64(rm.bundlesSubmitted-rm.bundlesIncluded) / float64(rm.bundlesSubmitted) * 100
+		inclusionRate = 100 - missRate
+	}
+
+	tipShare := rm.lastTipSharePct
+	if rm.tipStrategy != nil {
+		tipShare = rm.tipStrategy.CalculateTip(profitWei, inclusionRate, gasGwei)
+	}
+
+	tipShare = clampTip(tipShare, rm.config.MinTipSharePct, rm.config.MaxTipSharePct)
+	if tipShare != rm.lastTipSharePct {
+		log.Printf("TIP STRATEGY: tip share adjusted %.1f%% -> %.1f%% (inclusion %.1f%%, miss %.1f%%, gas %.1f gwei)",
+			rm.lastTipSharePct, tipShare, inclusionRate, missRate, gasGwei)
+	}
+
+	rm.lastTipSharePct = tipShare
+	return tipShare
 }
 
 // PreflightCheck validates an arb opportunity against all risk limits.
