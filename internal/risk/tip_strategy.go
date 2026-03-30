@@ -56,6 +56,10 @@ func NewAdaptiveTipStrategy(startTipPct, minTipPct, maxTipPct, stepPct float64) 
 // - inclusion > 80%  => decrease tip by step
 // - otherwise        => keep current tip
 func (s *AdaptiveTipStrategy) CalculateTip(profitWei *big.Int, inclusionRate float64, gasGwei float64) float64 {
+	// This baseline strategy adapts only on recent inclusion performance.
+	// profitWei and gasGwei are part of the interface so future strategies
+	// can incorporate margin/gas sensitivity without API changes. Logging of
+	// effective tip changes is emitted by RiskManager.CalculateTipShare.
 	_ = profitWei
 	_ = gasGwei
 

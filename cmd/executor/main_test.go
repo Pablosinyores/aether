@@ -54,7 +54,7 @@ func TestProcessArb_Approved(t *testing.T) {
 	arb := newValidArb("arb-approved-001", 0.01, 5.0)
 
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -72,7 +72,7 @@ func TestProcessArb_RejectedLowProfit(t *testing.T) {
 	arb := newValidArb("arb-lowprofit-001", 0.0001, 5.0)
 
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -92,7 +92,7 @@ func TestProcessArb_RejectedHighGas(t *testing.T) {
 	arb := newValidArb("arb-highgas-001", 0.01, 5.0)
 
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -110,7 +110,7 @@ func TestProcessArb_RejectedLowBalance(t *testing.T) {
 
 	// Pass ethBalance of 0.05, below the 0.1 ETH minimum
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.05)
+		"0x0000000000000000000000000000000000000000", 0.05)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -128,7 +128,7 @@ func TestProcessArb_RejectedTradeTooLarge(t *testing.T) {
 	arb := newValidArb("arb-bigtrade-001", 0.5, 60.0)
 
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
@@ -156,7 +156,7 @@ func TestProcessArb_SystemPaused(t *testing.T) {
 	arb := newValidArb("arb-paused-001", 0.01, 5.0)
 
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)

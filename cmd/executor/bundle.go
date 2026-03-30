@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -22,6 +23,7 @@ type Bundle struct {
 
 // BundleConstructor builds bundles from validated arbs
 type BundleConstructor struct {
+	mu           sync.RWMutex
 	nonceManager *NonceManager
 	gasOracle    *GasOracle
 	signer       *TransactionSigner
@@ -39,6 +41,20 @@ func NewBundleConstructor(nm *NonceManager, go_ *GasOracle, signer *TransactionS
 		tipSharePct:  tipPct,
 		chainID:      chainID,
 	}
+}
+
+// SetTipSharePct updates the tip share used for newly built bundles.
+func (bc *BundleConstructor) SetTipSharePct(tipPct float64) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	bc.tipSharePct = tipPct
+}
+
+// TipSharePct returns the current tip share percentage.
+func (bc *BundleConstructor) TipSharePct() float64 {
+	bc.mu.RLock()
+	defer bc.mu.RUnlock()
+	return bc.tipSharePct
 }
 
 // BuildBundle constructs a [arb_tx, tip_tx] bundle from an arb opportunity.
@@ -68,8 +84,9 @@ func (bc *BundleConstructor) BuildBundle(
 		Data:      arbCalldata,
 	})
 
-	// Tip transaction (send % of profit to block proposer)
-	tipAmount := new(big.Int).Mul(profitWei, big.NewInt(int64(bc.tipSharePct)))
+	// Tip transaction (send % of profit to builder coinbase)
+	tipSharePct := bc.TipSharePct()
+	tipAmount := new(big.Int).Mul(profitWei, big.NewInt(int64(tipSharePct)))
 	tipAmount.Div(tipAmount, big.NewInt(100))
 
 	tipTx := types.NewTx(&types.DynamicFeeTx{

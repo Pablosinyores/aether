@@ -193,7 +193,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.EthBalance)
 		}()
 	}
 
@@ -220,7 +220,6 @@ func processArb(
 	submitter *Submitter,
 	ethClient *ethclient.Client,
 	executorAddr string,
-	tipSharePct float64,
 	ethBalance float64,
 ) (submitted bool, err error) {
 	// Parse net_profit_wei from proto bytes to big.Int
@@ -232,6 +231,7 @@ func processArb(
 	// Get current gas price from the bundler's gas oracle
 	gasFees := bundler.gasOracle.CurrentFees()
 	gasGwei := gasFees.GasPriceGwei
+	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
 
 	// Preflight risk check
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
@@ -239,6 +239,7 @@ func processArb(
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
+	bundler.SetTipSharePct(tipSharePct)
 
 	// Fetch block.coinbase from latest block header for the tip transaction.
 	coinbase := common.Address{}
@@ -318,7 +319,7 @@ func looksLikeRevert(errMsg string) bool {
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, tipSharePct float64, ethBalance float64) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, ethBalance float64) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -354,7 +355,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, tipSharePct, ethBalance)
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, ethBalance)
 			if err != nil {
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
 			}
