@@ -23,6 +23,7 @@ use aether_state::token_index::TokenIndex;
 
 // Import the proto ValidatedArb type from service module
 use crate::pipeline;
+use crate::metrics::EngineMetrics;
 use crate::service::aether_proto::ValidatedArb as ProtoValidatedArb;
 
 /// Configuration for the AetherEngine.
@@ -104,6 +105,8 @@ pub struct AetherEngine {
     /// When `Some`, `run_detection_cycle` uses `RpcForkedState` instead of
     /// the empty `ForkedState`.
     rpc_provider: Option<DynProvider<Ethereum>>,
+    /// Prometheus metrics for engine operations.
+    metrics: Arc<EngineMetrics>,
 }
 
 /// Lightweight snapshot of the current block's key fields.
@@ -137,6 +140,15 @@ struct CycleCandidate {
 
 impl AetherEngine {
     pub fn new(config: EngineConfig, arb_tx: broadcast::Sender<ProtoValidatedArb>) -> Self {
+        let metrics = Arc::new(EngineMetrics::new());
+        Self::new_with_metrics(config, arb_tx, metrics)
+    }
+
+    pub fn new_with_metrics(
+        config: EngineConfig,
+        arb_tx: broadcast::Sender<ProtoValidatedArb>,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let event_channels = Arc::new(EventChannels::new());
         let detector = BellmanFord::new(config.max_hops, config.detection_time_budget_us);
         let simulator = EvmSimulator::with_defaults();
@@ -169,6 +181,7 @@ impl AetherEngine {
             token_index: Arc::new(RwLock::new(TokenIndex::new())),
             pool_registry: Arc::new(RwLock::new(HashMap::new())),
             rpc_provider,
+            metrics,
         }
     }
 
@@ -568,6 +581,7 @@ impl AetherEngine {
     /// Handle a new block: update block info, run detection on dirty edges.
     async fn handle_new_block(&self, event: NewBlockEvent) {
         debug!(block = event.block_number, "Processing new block");
+        self.metrics.inc_blocks_processed();
 
         // Update current block info.
         {
@@ -704,7 +718,9 @@ impl AetherEngine {
                 self.detector.detect_from_affected(&graph, &affected)
             };
             let detect_us = t_detect.elapsed().as_micros();
+            self.metrics.set_detection_latency_us(detect_us);
             info!(detect_us, "Bellman-Ford detection complete");
+            self.metrics.inc_cycles_detected(cycles.len() as u64);
 
             if cycles.is_empty() {
                 drop(graph);
@@ -928,6 +944,7 @@ impl AetherEngine {
             };
             let sim_us = t_sim.elapsed().as_micros();
             sim_count += 1;
+            self.metrics.inc_simulations_run(1);
 
             if !sim_result.success {
                 debug!(sim_us, reason = ?sim_result.revert_reason, "Simulation failed, skipping");
@@ -948,6 +965,7 @@ impl AetherEngine {
                 debug!(error = %e, "No arb subscribers connected");
             } else {
                 sim_success += 1;
+                self.metrics.inc_arbs_published(1);
                 info!(
                     id = %opp.id,
                     net_profit_wei = net_profit,

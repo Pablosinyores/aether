@@ -6,11 +6,13 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod engine;
+mod metrics;
 mod pipeline;
 mod service;
 
 use aether_grpc_server::provider::{ProviderConfig, RpcProvider};
 use engine::{AetherEngine, EngineConfig};
+use metrics::{start_metrics_server, EngineMetrics};
 use service::aether_proto::arb_service_server::ArbServiceServer;
 use service::aether_proto::control_service_server::ControlServiceServer;
 use service::aether_proto::health_service_server::HealthServiceServer;
@@ -36,6 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // current block number, and active pool count.
     let state = Arc::new(RwLock::new(EngineState::default()));
 
+    let metrics = Arc::new(EngineMetrics::new());
+    start_metrics_server(Arc::clone(&metrics));
+
     // Construct gRPC service implementations, each holding an Arc to the
     // shared state.
     let arb_service = ArbServiceImpl::new(Arc::clone(&state));
@@ -53,7 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("ETH_RPC_URL not set — engine will use empty-state simulation");
     }
-    let engine = Arc::new(AetherEngine::new(engine_config, arb_tx));
+    let engine = Arc::new(AetherEngine::new_with_metrics(
+        engine_config,
+        arb_tx,
+        Arc::clone(&metrics),
+    ));
 
     // ControlService needs a handle to the engine for hot-reload support.
     let control_service = ControlServiceImpl::new(Arc::clone(&state), Arc::clone(&engine));
