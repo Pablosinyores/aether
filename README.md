@@ -117,8 +117,8 @@ aether/
 
 ## Prerequisites
 
-- **Rust** (latest stable, via [rustup](https://rustup.rs/))
-- **Go** 1.25+
+- **Rust** 1.94.1 (via [rustup](https://rustup.rs/))
+- **Go** 1.26.1
 - **Foundry** ([forge, cast, anvil](https://getfoundry.sh/))
 - **Protobuf compiler** (`protoc`)
 - **Docker & Docker Compose** (for local infrastructure)
