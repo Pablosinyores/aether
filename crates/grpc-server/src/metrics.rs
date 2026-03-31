@@ -188,3 +188,37 @@ fn metrics_addr() -> SocketAddr {
         .parse()
         .unwrap_or_else(|_| "0.0.0.0:9092".parse().expect("default metrics addr"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_render_contains_required_names() {
+        let metrics = EngineMetrics::new();
+
+        metrics.set_detection_latency_us(123);
+        metrics.inc_cycles_detected(2);
+        metrics.inc_simulations_run(3);
+        metrics.inc_arbs_published(4);
+        metrics.inc_blocks_processed();
+
+        let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
+
+        for name in [
+            "detection_latency_us",
+            "cycles_detected",
+            "simulations_run",
+            "arbs_published",
+            "blocks_processed",
+        ] {
+            assert!(output.contains(name), "missing metric {name}");
+        }
+
+        assert!(output.contains("detection_latency_us 123"));
+        assert!(output.contains("cycles_detected 2"));
+        assert!(output.contains("simulations_run 3"));
+        assert!(output.contains("arbs_published 4"));
+        assert!(output.contains("blocks_processed 1"));
+    }
+}
