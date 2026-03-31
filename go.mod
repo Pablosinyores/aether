@@ -1,6 +1,6 @@
 module github.com/aether-arb/aether
 
-go 1.25.0
+go 1.26.1
 
 require (
 	google.golang.org/grpc v1.79.1
