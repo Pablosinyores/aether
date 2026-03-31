@@ -3,8 +3,8 @@
   hosts: all
   become: true
   vars:
-    rust_version: "1.83"
-    go_version: "1.23"
+    rust_version: "1.94.1"
+    go_version: "1.26.1"
 
   tasks:
     # --- System Setup ---
