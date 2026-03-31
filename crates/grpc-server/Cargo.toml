@@ -30,6 +30,7 @@ toml = { workspace = true }
 url = "2"
 dotenvy = "0.15.7"
 futures = "0.3"
+prometheus = "0.13.4"
 
 [build-dependencies]
 tonic-build = { workspace = true }
