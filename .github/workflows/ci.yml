@@ -11,6 +11,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  toolchain:
+    name: toolchain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check toolchain versions
+        run: bash scripts/check_toolchain_versions.sh
+
   rust:
     name: rust
     runs-on: ubuntu-latest
