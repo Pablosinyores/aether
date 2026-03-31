@@ -176,6 +176,8 @@ func main() {
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
 
+	startMetricsServer()
+
 	log.Printf("Executor service started, gRPC target: %s", cfg.GRPCAddress)
 	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
 
@@ -236,6 +238,7 @@ func processArb(
 	// Preflight risk check
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {
+		recordRiskRejection()
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
@@ -257,6 +260,7 @@ func processArb(
 	}
 
 	// Submit to all builders
+	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
@@ -264,9 +268,13 @@ func processArb(
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
 
 	// Record result for miss rate tracking
-	rm.RecordBundleResult(successes > 0)
+	included := successes > 0
+	if included {
+		recordBundleIncluded(profitWei, gasGwei, arb.TotalGas)
+	}
+	rm.RecordBundleResult(included)
 
-	return successes > 0, nil
+	return included, nil
 }
 
 // recordSubmissionReverts classifies and records a single revert per arb
