@@ -8,6 +8,7 @@ services:
     container_name: aether-rust
     ports:
       - "50051:50051"
+      - "9092:9092"
     volumes:
       - ../../config:/app/config:ro
       - reth-ipc:/tmp
@@ -17,6 +18,7 @@ services:
       - GRPC_ADDRESS=0.0.0.0:50051
       - ETH_RPC_URL=${ETH_RPC_URL:-}
       - AETHER_NODES_CONFIG=/app/config/nodes.yaml
+      - RUST_METRICS_PORT=9092
     env_file:
       - path: ../../.env
         required: false
