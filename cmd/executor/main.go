@@ -117,16 +117,29 @@ func main() {
 		log.Println("WARNING: ETH_RPC_URL not set — coinbase will use zero address")
 	}
 
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Initialize components
 	nonceManager := NewNonceManager(0)
+	if txSigner != nil {
+		nonceManager.SetSyncSource(txSigner.Address(), ethClient)
+		if ethClient != nil {
+			if err := nonceManager.SyncFromChain(ctx); err != nil {
+				log.Printf("WARNING: failed to sync nonce for %s: %v", txSigner.Address().Hex(), err)
+			}
+		} else {
+			log.Printf("WARNING: ETH_RPC_URL not set — nonce manager will not sync on-chain nonce for %s", txSigner.Address().Hex())
+		}
+	} else {
+		log.Printf("WARNING: SEARCHER_KEY not set — nonce manager will use initial nonce 0")
+	}
+
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
 	submitter := NewSubmitter(cfg.BuilderConfigs)
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
-
-	// Setup graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
