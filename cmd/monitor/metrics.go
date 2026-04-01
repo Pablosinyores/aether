@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -90,27 +91,36 @@ func (m *Metrics) handleHealth(w http.ResponseWriter, r *http.Request) {
 func main() {
 	fmt.Println("aether-monitor: metrics, dashboard, and alerting service")
 
+	metricsPort := os.Getenv("METRICS_PORT")
+	if metricsPort == "" {
+		metricsPort = "9090"
+	}
+	dashboardPort := os.Getenv("DASHBOARD_PORT")
+	if dashboardPort == "" {
+		dashboardPort = "8080"
+	}
+
 	metrics := NewMetrics()
 	dashboard := NewDashboard(metrics)
 	alerter := NewAlerter([]AlertChannel{ChannelPagerDuty, ChannelTelegram, ChannelDiscord})
 
 	// Start metrics server
 	go func() {
-		if err := metrics.ServeMetrics(":9090"); err != nil {
+		if err := metrics.ServeMetrics(":" + metricsPort); err != nil {
 			log.Fatalf("Metrics server failed: %v", err)
 		}
 	}()
 
 	// Start dashboard
 	go func() {
-		if err := dashboard.ServeDashboard(":8080"); err != nil {
+		if err := dashboard.ServeDashboard(":" + dashboardPort); err != nil {
 			log.Fatalf("Dashboard server failed: %v", err)
 		}
 	}()
 
 	log.Println("Monitor service started")
-	log.Printf("Metrics: http://localhost:9090/metrics")
-	log.Printf("Dashboard: http://localhost:8080/")
+	log.Printf("Metrics: http://localhost:%s/metrics", metricsPort)
+	log.Printf("Dashboard: http://localhost:%s/", dashboardPort)
 
 	// Send startup alert
 	alerter.Send(SeverityInfo, "System Started", "Aether monitor service started")
