@@ -56,11 +56,11 @@ check "${ansible_playbook}" "rust_version:[[:space:]]+\"${rust_version_re}\"" "A
 check "${readme}" "Rust[^0-9]*${rust_version_re}" "README Rust version"
 check "${readme}" "Go[^0-9]*${go_version_re}" "README Go version"
 
-# CI workflow must not override rust-toolchain.toml with @stable
+# CI workflow must not override rust-toolchain.toml with a pinned action tag
 ci_yml="${root_dir}/.github/workflows/ci.yml"
 if [[ -f "${ci_yml}" ]]; then
-  if grep -qE 'rust-toolchain@stable' "${ci_yml}"; then
-    echo "Mismatch: CI uses @stable, bypassing rust-toolchain.toml"
+  if grep -qE 'rust-toolchain@(stable|nightly|[0-9]+\.)' "${ci_yml}"; then
+    echo "Mismatch: CI overrides rust-toolchain.toml via action tag"
     fail=1
   fi
 fi
