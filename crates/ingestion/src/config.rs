@@ -34,15 +34,24 @@ fn default_priority() -> u32 {
 /// Expand `${VAR}` patterns in a string using environment variables.
 /// Unknown vars are left as-is with a warning.
 pub fn expand_env_vars(input: &str) -> String {
+    expand_env_vars_with(input, |key| std::env::var(key).ok())
+}
+
+/// Expand `${VAR}` patterns using a custom resolver function.
+///
+/// This is the core implementation. The resolver is called for each
+/// `${VAR}` occurrence; if it returns `None`, the placeholder is
+/// preserved unchanged.
+fn expand_env_vars_with(input: &str, resolver: impl Fn(&str) -> Option<String>) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let var_name: String = chars.by_ref().take_while(|&ch| ch != '}').collect();
-            match std::env::var(&var_name) {
-                Ok(val) => result.push_str(&val),
-                Err(_) => {
+            match resolver(&var_name) {
+                Some(val) => result.push_str(&val),
+                None => {
                     warn!(var = %var_name, "Environment variable not set, leaving placeholder");
                     result.push_str(&format!("${{{}}}", var_name));
                 }
@@ -73,7 +82,7 @@ pub fn load_nodes_config(
 ) -> Result<(Vec<NodeConfig>, usize), Box<dyn std::error::Error + Send + Sync>> {
     let contents = std::fs::read_to_string(path)?;
     let expanded = expand_env_vars(&contents);
-    let file_config: NodesFileConfig = serde_yaml::from_str(&expanded)?;
+    let file_config: NodesFileConfig = serde_yml::from_str(&expanded)?;
 
     let configs: Vec<NodeConfig> = file_config
         .nodes
@@ -95,35 +104,37 @@ pub fn load_nodes_config(
 mod tests {
     use super::*;
 
+    fn test_resolver(key: &str) -> Option<String> {
+        match key {
+            "AETHER_TEST_KEY_XYZ" => Some("hello".to_string()),
+            "AETHER_A" => Some("1".to_string()),
+            "AETHER_B" => Some("2".to_string()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn test_expand_env_vars_with_known_var() {
-        std::env::set_var("AETHER_TEST_KEY_XYZ", "hello");
-        let result = expand_env_vars("prefix/${AETHER_TEST_KEY_XYZ}/suffix");
+        let result = expand_env_vars_with("prefix/${AETHER_TEST_KEY_XYZ}/suffix", test_resolver);
         assert_eq!(result, "prefix/hello/suffix");
-        std::env::remove_var("AETHER_TEST_KEY_XYZ");
     }
 
     #[test]
     fn test_expand_env_vars_unknown_var() {
-        std::env::remove_var("AETHER_NONEXISTENT_VAR_123");
-        let result = expand_env_vars("${AETHER_NONEXISTENT_VAR_123}");
+        let result = expand_env_vars_with("${AETHER_NONEXISTENT_VAR_123}", test_resolver);
         assert_eq!(result, "${AETHER_NONEXISTENT_VAR_123}");
     }
 
     #[test]
     fn test_expand_env_vars_no_vars() {
-        let result = expand_env_vars("no_vars_here");
+        let result = expand_env_vars_with("no_vars_here", test_resolver);
         assert_eq!(result, "no_vars_here");
     }
 
     #[test]
     fn test_expand_env_vars_multiple() {
-        std::env::set_var("AETHER_A", "1");
-        std::env::set_var("AETHER_B", "2");
-        let result = expand_env_vars("${AETHER_A}-${AETHER_B}");
+        let result = expand_env_vars_with("${AETHER_A}-${AETHER_B}", test_resolver);
         assert_eq!(result, "1-2");
-        std::env::remove_var("AETHER_A");
-        std::env::remove_var("AETHER_B");
     }
 
     #[test]

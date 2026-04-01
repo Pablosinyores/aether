@@ -17,7 +17,6 @@ use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
 
 /// Configuration for the RPC provider connection
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ProviderConfig {
     /// RPC endpoint URL (WS preferred, HTTP fallback)
     pub rpc_url: String,
@@ -259,7 +258,12 @@ impl RpcProvider {
         let block_sub = provider.subscribe_blocks().await?;
         let mut block_stream = block_sub.into_stream();
 
-        let log_filter = Filter::new().event_signature(self.event_topics());
+        // When monitored_pools is non-empty, scope the filter to those addresses only.
+        // When empty, receive events from all contracts (pool discovery mode).
+        let mut log_filter = Filter::new().event_signature(self.event_topics());
+        if !self.config.monitored_pools.is_empty() {
+            log_filter = log_filter.address(self.config.monitored_pools.clone());
+        }
         let log_sub = provider.subscribe_logs(&log_filter).await?;
         let mut log_stream = log_sub.into_stream();
 
@@ -362,10 +366,14 @@ impl RpcProvider {
 
                         // Fetch logs for all blocks since last_block to avoid
                         // dropping events when multiple blocks arrive between polls.
-                        let filter = Filter::new()
+                        // When monitored_pools is non-empty, scope to those addresses only.
+                        let mut filter = Filter::new()
                             .from_block(last_block + 1)
                             .to_block(current_block)
                             .event_signature(event_topics.clone());
+                        if !self.config.monitored_pools.is_empty() {
+                            filter = filter.address(self.config.monitored_pools.clone());
+                        }
 
                         match provider.get_logs(&filter).await {
                             Ok(logs) => {
