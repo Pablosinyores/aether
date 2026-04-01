@@ -10,9 +10,15 @@ services:
       - "50051:50051"
     volumes:
       - ../../config:/app/config:ro
+      - reth-ipc:/tmp
     environment:
       - RUST_LOG=info
       - AETHER_CONFIG_DIR=/app/config
+      - GRPC_ADDRESS=[::1]:50051
+      - ETH_RPC_URL=${ETH_RPC_URL:-}
+      - AETHER_NODES_CONFIG=/app/config/nodes.yaml
+    env_file:
+      - ../../.env
     restart: unless-stopped
     depends_on:
       - redis
@@ -70,8 +76,49 @@ services:
     networks:
       - aether-net
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aether-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - aether-net
+
+  # Loki: deferred — logs available via `docker logs`, Loki planned for production deployment
+
+  # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
+  # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
+  reth:
+    image: ghcr.io/paradigmxyz/reth:latest
+    container_name: aether-reth
+    profiles:
+      - node
+    ports:
+      - "30303:30303"
+    volumes:
+      - reth-data:/root/.local/share/reth
+      - reth-ipc:/tmp
+    command: >
+      node
+      --ipcpath /tmp/reth.ipc
+    networks:
+      - aether-net
+
+
 volumes:
   postgres-data:
+  grafana-data:
+  reth-data:
+  reth-ipc:
 
 networks:
   aether-net:
