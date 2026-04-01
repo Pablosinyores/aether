@@ -94,10 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_clone.run(provider_shutdown_rx).await;
     });
 
-    // In production this would be a Unix Domain Socket for sub-microsecond
-    // transport to the Go executor on the same machine. For development and
-    // testing we bind to a TCP address.
-    let addr = "[::1]:50051".parse()?;
+    // Read the listen address from the environment so the systemd unit and
+    // the binary always agree.  Default to localhost TCP for development.
+    let addr_str =
+        std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
+    let addr = tokio::net::lookup_host(&addr_str)
+        .await?
+        .next()
+        .ok_or_else(|| format!("could not resolve GRPC_ADDRESS: {addr_str}"))?;
     info!(%addr, "gRPC server listening");
 
     // Run the gRPC server. When it exits (e.g. ctrl-c), signal engine shutdown.
