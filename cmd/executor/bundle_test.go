@@ -16,13 +16,13 @@ func TestBuildBundle_Basic(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
 	profit := intETHToWei(t, 1) // 1 ETH
 	calldata := []byte{0xAB, 0xCD}
 	executor := "0x1234567890abcdef1234567890abcdef12345678"
 
-	bundle, err := bc.BuildBundle(calldata, executor, profit, 500000, 18000000, testCoinbase)
+	bundle, err := bc.BuildBundle(calldata, executor, profit, 500000, 18000000, testCoinbase, 90.0)
 	if err != nil {
 		t.Fatalf("BuildBundle returned error: %v", err)
 	}
@@ -94,10 +94,10 @@ func TestBuildBundle_TipCalculation(t *testing.T) {
 
 			nm := NewNonceManager(0)
 			go_ := NewGasOracle(300.0)
-			bc := NewBundleConstructor(nm, go_, nil, tc.tipSharePct, 1)
+			bc := NewBundleConstructor(nm, go_, nil, 1)
 
 			profit := intETHToWei(t, tc.profitETH)
-			bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 100, testCoinbase)
+			bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 100, testCoinbase, tc.tipSharePct)
 			if err != nil {
 				t.Fatalf("BuildBundle error: %v", err)
 			}
@@ -118,9 +118,9 @@ func TestBuildBundle_ZeroProfit(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(0), 300000, 100, testCoinbase)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(0), 300000, 100, testCoinbase, 90.0)
 	if err != nil {
 		t.Fatalf("BuildBundle error: %v", err)
 	}
@@ -136,12 +136,12 @@ func TestBuildBundle_GasEstimate(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
 	gasEstimates := []uint64{21000, 500000, 1000000, 250000}
 
 	for _, gasEst := range gasEstimates {
-		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1000), gasEst, 100, testCoinbase)
+		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1000), gasEst, 100, testCoinbase, 90.0)
 		if err != nil {
 			t.Fatalf("BuildBundle error: %v", err)
 		}
@@ -163,10 +163,10 @@ func TestBuildBundle_TipGoesToCoinbase(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
 	coinbase := common.HexToAddress("0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1e18), 300000, 100, coinbase)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1e18), 300000, 100, coinbase, 90.0)
 	if err != nil {
 		t.Fatalf("BuildBundle error: %v", err)
 	}
@@ -187,10 +187,10 @@ func TestBuildBundle_WithSigner(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, signer, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, signer, 1)
 
 	profit := intETHToWei(t, 1)
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 18000000, testCoinbase)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 18000000, testCoinbase, 90.0)
 	if err != nil {
 		t.Fatalf("BuildBundle error: %v", err)
 	}

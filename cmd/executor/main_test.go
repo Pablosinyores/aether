@@ -29,7 +29,7 @@ func newTestComponents() (*risk.RiskManager, *BundleConstructor, *Submitter) {
 	rm := risk.NewRiskManager(risk.DefaultRiskConfig())
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 1)
 	submitter := NewSubmitter(defaultBuilderConfigs())
 	return rm, bundler, submitter
 }

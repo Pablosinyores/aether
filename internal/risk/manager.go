@@ -108,8 +108,10 @@ type RiskManager struct {
 	dailyVolume         *big.Int    // Wei
 	dailyPnL            *big.Int    // Wei (can be negative)
 	dailyResetTime      time.Time
-	bundlesSubmitted    int
-	bundlesIncluded     int
+	bundleResults       []bool // Sliding window ring buffer
+	bundleResultIdx     int    // Next write position; always increments (never resets)
+	bundleResultCount   int    // Entries filled (capped at window size)
+	lastAdjustedAtIdx   int    // Gate: tip share adjusted when bundleResultIdx > this
 
 	// Prometheus-style counters (read via atomic; no external dependency).
 	BugRevertTotal  atomic.Int64
@@ -123,6 +125,8 @@ type RiskManager struct {
 func NewRiskManager(config RiskConfig) *RiskManager {
 	initialTipShare := clampTip(90.0, config.MinTipSharePct, config.MaxTipSharePct)
 
+	const bundleWindowSize = 100
+
 	return &RiskManager{
 		config:            config,
 		state:             NewSystemStateMachine(),
@@ -133,6 +137,7 @@ func NewRiskManager(config RiskConfig) *RiskManager {
 		dailyVolume:       big.NewInt(0),
 		dailyPnL:          big.NewInt(0),
 		dailyResetTime:    time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour),
+		bundleResults:     make([]bool, bundleWindowSize),
 	}
 }
 
@@ -142,12 +147,23 @@ func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) fl
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	inclusionRate := 50.0 // neutral default when no history exists yet
-	missRate := 0.0
-	if rm.bundlesSubmitted > 0 {
-		missRate = float64(rm.bundlesSubmitted-rm.bundlesIncluded) / float64(rm.bundlesSubmitted) * 100
-		inclusionRate = 100 - missRate
+	// Only adjust when new bundle feedback has arrived since the last adjustment.
+	// Use bundleResultIdx (always increments) as the gate — bundleResultCount is
+	// capped at the window size and would cause the gate to freeze after 100 results.
+	if rm.bundleResultIdx == 0 || rm.bundleResultIdx <= rm.lastAdjustedAtIdx {
+		return rm.lastTipSharePct
 	}
+
+	// Compute inclusion rate from sliding window.
+	count := rm.bundleResultCount
+	included := 0
+	for i := 0; i < count; i++ {
+		if rm.bundleResults[i] {
+			included++
+		}
+	}
+	inclusionRate := float64(included) / float64(count) * 100
+	missRate := 100 - inclusionRate
 
 	tipShare := rm.lastTipSharePct
 	if rm.tipStrategy != nil {
@@ -160,6 +176,7 @@ func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) fl
 			rm.lastTipSharePct, tipShare, inclusionRate, missRate, gasGwei)
 	}
 
+	rm.lastAdjustedAtIdx = rm.bundleResultIdx
 	rm.lastTipSharePct = tipShare
 	return tipShare
 }
@@ -208,7 +225,7 @@ func (rm *RiskManager) PreflightCheck(
 		return PreflightResult{false, fmt.Sprintf("profit too low: %.6f < %.6f ETH", profitETH, rm.config.MinProfitETH)}
 	}
 
-	// Position limit: max tip share
+	// Position limit: min tip share
 	if tipSharePct < rm.config.MinTipSharePct {
 		return PreflightResult{false, fmt.Sprintf("tip share too low: %.1f%% < %.1f%%", tipSharePct, rm.config.MinTipSharePct)}
 	}
@@ -295,27 +312,35 @@ func (rm *RiskManager) RecordTrade(volumeWei *big.Int, pnlWei *big.Int) {
 	}
 }
 
-// RecordBundleResult records bundle inclusion/miss for rate tracking.
+// RecordBundleResult records bundle inclusion/miss in a sliding window.
 func (rm *RiskManager) RecordBundleResult(included bool) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	rm.bundlesSubmitted++
-	if included {
-		rm.bundlesIncluded++
+	windowSize := cap(rm.bundleResults)
+	rm.bundleResults[rm.bundleResultIdx%windowSize] = included
+	rm.bundleResultIdx++
+	if rm.bundleResultCount < windowSize {
+		rm.bundleResultCount++
 	}
 }
 
-// BundleMissRate returns the current bundle miss rate as a percentage.
+// BundleMissRate returns the current bundle miss rate as a percentage
+// based on the sliding window of recent results.
 func (rm *RiskManager) BundleMissRate() float64 {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	if rm.bundlesSubmitted == 0 {
+	if rm.bundleResultCount == 0 {
 		return 0.0
 	}
-	missRate := float64(rm.bundlesSubmitted-rm.bundlesIncluded) / float64(rm.bundlesSubmitted) * 100
-	return missRate
+	included := 0
+	for i := 0; i < rm.bundleResultCount; i++ {
+		if rm.bundleResults[i] {
+			included++
+		}
+	}
+	return float64(rm.bundleResultCount-included) / float64(rm.bundleResultCount) * 100
 }
 
 // State returns the current system state.
