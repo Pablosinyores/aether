@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math/big"
 	"time"
 
@@ -122,6 +123,8 @@ func (bc *BundleConstructor) BuildBundle(
 // GenerateBundleID creates a unique bundle identifier
 func GenerateBundleID() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("crypto/rand failure: %v", err)
+	}
 	return hex.EncodeToString(b)
 }

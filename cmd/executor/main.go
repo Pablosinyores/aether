@@ -24,7 +24,6 @@ import (
 type Config struct {
 	GRPCAddress    string
 	BuilderConfigs []BuilderConfig
-	SearcherKey    string // Hex-encoded private key (loaded from env/KMS in production)
 	ChainID        int64
 	MaxGasGwei     float64
 	TipSharePct    float64
@@ -92,6 +91,7 @@ func main() {
 	// Load searcher private key for transaction signing.
 	var txSigner *TransactionSigner
 	searcherKey := os.Getenv("SEARCHER_KEY")
+	os.Unsetenv("SEARCHER_KEY")
 	if searcherKey != "" {
 		var err error
 		txSigner, err = NewTransactionSigner(searcherKey, cfg.ChainID)
@@ -106,8 +106,10 @@ func main() {
 	// Connect to Ethereum node for block header queries (coinbase).
 	var ethClient *ethclient.Client
 	if rpcURL := os.Getenv("ETH_RPC_URL"); rpcURL != "" {
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dialCancel()
 		var err error
-		ethClient, err = ethclient.Dial(rpcURL)
+		ethClient, err = ethclient.DialContext(dialCtx, rpcURL)
 		if err != nil {
 			log.Printf("WARNING: failed to connect to ETH_RPC_URL: %v", err)
 		} else {

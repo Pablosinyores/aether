@@ -29,13 +29,17 @@ func NewTransactionSigner(hexKey string, chainID int64) (*TransactionSigner, err
 		return nil, errors.New("private key is empty")
 	}
 
+	if chainID <= 0 {
+		return nil, errors.New("chain ID must be positive")
+	}
+
 	// Strip 0x prefix if present.
 	cleaned := strings.TrimPrefix(hexKey, "0x")
 
 	privateKey, err := crypto.HexToECDSA(cleaned)
 	if err != nil {
 		// Never include the key material in the error message.
-		return nil, fmt.Errorf("failed to parse private key: %w", err)
+		return nil, fmt.Errorf("failed to parse private key: invalid format")
 	}
 
 	publicKey, ok := privateKey.Public().(*ecdsa.PublicKey)
