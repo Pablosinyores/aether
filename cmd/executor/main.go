@@ -154,7 +154,7 @@ func main() {
 		}
 	}
 	submitter := NewSubmitter(cfg.BuilderConfigs)
-	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
+	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
 	sigCh := make(chan os.Signal, 1)
@@ -239,8 +239,6 @@ func processArb(
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
-	bundler.SetTipSharePct(tipSharePct)
-
 	// Fetch block.coinbase from latest block header for the tip transaction.
 	coinbase := common.Address{}
 	if ethClient != nil {
@@ -252,8 +250,8 @@ func processArb(
 		}
 	}
 
-	// Build bundle
-	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase)
+	// Build bundle — tipSharePct passed directly to avoid TOCTOU races.
+	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase, tipSharePct)
 	if err != nil {
 		return false, fmt.Errorf("build bundle: %w", err)
 	}

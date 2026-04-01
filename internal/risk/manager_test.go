@@ -380,15 +380,17 @@ func TestRecordBundleResult(t *testing.T) {
 	rm.RecordBundleResult(false)
 
 	rm.mu.RLock()
-	submitted := rm.bundlesSubmitted
-	included := rm.bundlesIncluded
+	count := rm.bundleResultCount
 	rm.mu.RUnlock()
 
-	if submitted != 3 {
-		t.Errorf("bundlesSubmitted: got %d, want 3", submitted)
+	if count != 3 {
+		t.Errorf("bundleResultCount: got %d, want 3", count)
 	}
-	if included != 2 {
-		t.Errorf("bundlesIncluded: got %d, want 2", included)
+
+	// Miss rate should be ~33.3% (1 miss out of 3)
+	missRate := rm.BundleMissRate()
+	if missRate < 33.0 || missRate > 34.0 {
+		t.Errorf("BundleMissRate: got %.1f%%, want ~33.3%%", missRate)
 	}
 }
 
@@ -436,7 +438,7 @@ func TestCalculateTipShare_UsesBundleMissRate(t *testing.T) {
 	rm := NewRiskManager(DefaultRiskConfig())
 	profitWei := ethWei(t, 1)
 
-	// No history => neutral band => keep start tip at 90%.
+	// No history => returns last tip (90%) without adjusting.
 	if got := rm.CalculateTipShare(profitWei, 30.0); got != 90.0 {
 		t.Fatalf("tip share with no history = %.1f, want 90.0", got)
 	}
@@ -447,7 +449,12 @@ func TestCalculateTipShare_UsesBundleMissRate(t *testing.T) {
 		t.Fatalf("tip share after high miss rate = %.1f, want 95.0", got)
 	}
 
-	// Keep recording misses; must stay capped at max tip share.
+	// No new feedback => gated, returns last tip (95%).
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should stay at 95.0 without new feedback, got %.1f", got)
+	}
+
+	// New miss feedback => tries to increase but capped at 95%.
 	rm.RecordBundleResult(false)
 	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
 		t.Fatalf("tip share should remain capped at 95.0, got %.1f", got)
@@ -466,6 +473,7 @@ func TestCalculateTipShare_DecreasesOnHighInclusion(t *testing.T) {
 	}
 	rm.RecordBundleResult(false)
 
+	// First call after feedback triggers adjustment.
 	if got := rm.CalculateTipShare(profitWei, 30.0); got != 85.0 {
 		t.Fatalf("tip share after high inclusion = %.1f, want 85.0", got)
 	}
@@ -480,17 +488,20 @@ func TestCalculateTipShare_RespectsConfiguredBounds(t *testing.T) {
 	rm := NewRiskManager(cfg)
 	profitWei := ethWei(t, 1)
 
-	// Start value clamps into configured bounds.
+	// No feedback yet => returns initial clamped tip.
 	if got := rm.CalculateTipShare(profitWei, 30.0); got != 80.0 {
 		t.Fatalf("initial clamped tip share = %.1f, want 80.0", got)
 	}
 
 	// 100% inclusion would reduce tip, but never below configured min.
+	// Each RecordBundleResult + CalculateTipShare = one adjustment step.
 	for i := 0; i < 20; i++ {
 		rm.RecordBundleResult(true)
 		_ = rm.CalculateTipShare(profitWei, 30.0)
 	}
 
+	// One more feedback to trigger final check.
+	rm.RecordBundleResult(true)
 	if got := rm.CalculateTipShare(profitWei, 30.0); got < 60.0 {
 		t.Fatalf("tip share should not go below configured min 60.0, got %.1f", got)
 	}

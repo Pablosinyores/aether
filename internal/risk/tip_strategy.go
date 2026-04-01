@@ -2,7 +2,6 @@ package risk
 
 import (
 	"math/big"
-	"sync"
 )
 
 // TipStrategy computes the tip share percentage to use for bundle submission.
@@ -12,8 +11,8 @@ type TipStrategy interface {
 
 // AdaptiveTipStrategy adjusts tip share in +/- step increments based on
 // observed inclusion rate while respecting configured floor/ceiling bounds.
+// NOTE: CalculateTip must only be called while the caller holds RiskManager.mu.
 type AdaptiveTipStrategy struct {
-	mu                     sync.Mutex
 	currentTipPct          float64
 	minTipPct              float64
 	maxTipPct              float64
@@ -62,9 +61,6 @@ func (s *AdaptiveTipStrategy) CalculateTip(profitWei *big.Int, inclusionRate flo
 	// effective tip changes is emitted by RiskManager.CalculateTipShare.
 	_ = profitWei
 	_ = gasGwei
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if inclusionRate < 0 || inclusionRate > 100 {
 		return s.currentTipPct
