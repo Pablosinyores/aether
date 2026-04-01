@@ -56,6 +56,27 @@ check "${ansible_playbook}" "rust_version:[[:space:]]+\"${rust_version_re}\"" "A
 check "${readme}" "Rust[^0-9]*${rust_version_re}" "README Rust version"
 check "${readme}" "Go[^0-9]*${go_version_re}" "README Go version"
 
+# CI workflow must not override rust-toolchain.toml with @stable
+ci_yml="${root_dir}/.github/workflows/ci.yml"
+if [[ -f "${ci_yml}" ]]; then
+  if grep -qE 'rust-toolchain@stable' "${ci_yml}"; then
+    echo "Mismatch: CI uses @stable, bypassing rust-toolchain.toml"
+    fail=1
+  fi
+fi
+
+# gRPC address alignment: systemd services should match
+go_service="${root_dir}/deploy/systemd/aether-go.service"
+rust_service="${root_dir}/deploy/systemd/aether-rust.service"
+if [[ -f "${go_service}" && -f "${rust_service}" ]]; then
+  go_grpc=$(grep 'GRPC_ADDRESS=' "${go_service}" | sed 's/.*GRPC_ADDRESS=//' | head -1)
+  rust_grpc=$(grep 'GRPC_ADDRESS=' "${rust_service}" | sed 's/.*GRPC_ADDRESS=//' | head -1)
+  if [[ -n "${go_grpc}" && -n "${rust_grpc}" && "${go_grpc}" != "${rust_grpc}" ]]; then
+    echo "Mismatch: gRPC address differs between aether-go.service (${go_grpc}) and aether-rust.service (${rust_grpc})"
+    fail=1
+  fi
+fi
+
 if [[ ${fail} -ne 0 ]]; then
   echo "Toolchain version drift detected"
   exit 1

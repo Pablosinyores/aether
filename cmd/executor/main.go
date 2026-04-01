@@ -65,6 +65,12 @@ func loadConfig() Config {
 		log.Printf("Config: loaded %d builders from %s", len(builders), buildersPath)
 	}
 
+	// Override gRPC address from environment if set.
+	if addr := os.Getenv("GRPC_ADDRESS"); addr != "" {
+		cfg.GRPCAddress = addr
+		log.Printf("Config: GRPC_ADDRESS=%s (from env)", addr)
+	}
+
 	return cfg
 }
 
