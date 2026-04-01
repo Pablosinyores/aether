@@ -19,6 +19,7 @@ StartLimitIntervalSec=60
 # Environment
 Environment=RUST_LOG=info
 Environment=AETHER_CONFIG_DIR=/opt/aether/config
+Environment=GRPC_ADDRESS=[::1]:50051
 EnvironmentFile=-/opt/aether/.env
 
 # Performance tuning — CPU pinning and scheduling

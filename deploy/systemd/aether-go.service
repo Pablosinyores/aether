@@ -19,7 +19,7 @@ StartLimitIntervalSec=60
 # Environment
 Environment=GOMAXPROCS=2
 Environment=GOGC=200
-Environment=GRPC_ADDRESS=unix:///opt/aether/run/aether.sock
+Environment=GRPC_ADDRESS=[::1]:50051
 Environment=METRICS_PORT=9090
 Environment=DASHBOARD_PORT=8080
 EnvironmentFile=-/opt/aether/.env
