@@ -326,7 +326,7 @@ func TestSubmitter_CustomSubmitFn_IsUsed(t *testing.T) {
 	t.Parallel()
 
 	builders := []BuilderConfig{{Name: "mock", Enabled: true, TimeoutMs: 1000}}
-	s := NewSubmitter(builders)
+	s, _ := NewSubmitter(builders, "")
 	s.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
 		return SubmissionResult{
 			Builder:    builder.Name,

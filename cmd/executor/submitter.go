@@ -238,7 +238,7 @@ func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, 
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
 		return SubmissionResult{
 			Builder: builder.Name,
@@ -398,7 +398,7 @@ func (s *Submitter) GetBundleStats(ctx context.Context, bundleHash string, block
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
 	if err != nil {
 		return nil, fmt.Errorf("read stats response: %w", err)
 	}

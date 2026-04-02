@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -406,11 +407,11 @@ func TestSubmitToBuilder_Timeout(t *testing.T) {
 func TestMetrics_PerBuilderTracking(t *testing.T) {
 	t.Parallel()
 
-	callCount := 0
+	var callCount atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
+		n := callCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		if callCount%2 == 0 {
+		if n%2 == 0 {
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"rejected"}}`))
 		} else {
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"bundleHash":"0xok"}}`))
