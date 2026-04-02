@@ -3,6 +3,7 @@ WORKDIR /app
 COPY go.mod go.sum* ./
 RUN go mod download 2>/dev/null || true
 COPY cmd/ cmd/
+COPY internal/ internal/
 RUN CGO_ENABLED=0 go build -o /aether-executor ./cmd/executor/
 RUN CGO_ENABLED=0 go build -o /aether-monitor ./cmd/monitor/
 
