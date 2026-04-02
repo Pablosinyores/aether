@@ -14,7 +14,7 @@ services:
     environment:
       - RUST_LOG=info
       - AETHER_CONFIG_DIR=/app/config
-      - GRPC_ADDRESS=[::1]:50051
+      - GRPC_ADDRESS=0.0.0.0:50051
       - ETH_RPC_URL=${ETH_RPC_URL:-}
       - AETHER_NODES_CONFIG=/app/config/nodes.yaml
     env_file:
