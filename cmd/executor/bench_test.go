@@ -85,7 +85,7 @@ func BenchmarkProcessArb(b *testing.B) {
 }
 
 func BenchmarkSubmitToAll(b *testing.B) {
-	submitter := NewSubmitter(defaultBuilderConfigs())
+	submitter, _ := NewSubmitter(defaultBuilderConfigs(), "")
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
 	bundler := NewBundleConstructor(nm, go_, nil, 1)
