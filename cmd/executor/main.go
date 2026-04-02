@@ -263,63 +263,48 @@ func processArb(
 	return successes > 0, nil
 }
 
-// recordSubmissionReverts classifies and records revert-like submission
-// failures so only bug reverts count toward the circuit breaker.
+// recordSubmissionReverts classifies and records a single revert per arb
+// attempt. When multiple builders reject the same arb, we take the worst-case
+// classification (bug > competitive) so the circuit breaker is not silently
+// bypassed, but we never inflate the count beyond one per submission.
 func recordSubmissionReverts(rm *risk.RiskManager, results []SubmissionResult) {
+	worstType := risk.RevertCompetitive
+	foundRevert := false
 	for _, res := range results {
 		if res.Success || res.Error == nil {
 			continue
 		}
-
 		errMsg := res.Error.Error()
 		if !looksLikeRevert(errMsg) {
 			continue
 		}
-
-		rm.RecordRevert(risk.ClassifyRevert(errMsg))
+		foundRevert = true
+		if risk.ClassifyRevert(errMsg) == risk.RevertBug {
+			worstType = risk.RevertBug
+		}
+	}
+	if foundRevert {
+		rm.RecordRevert(worstType)
 	}
 }
 
+// looksLikeRevert returns true when the error message looks like an EVM revert
+// rather than an infrastructure failure (timeout, TLS error, etc.).
+//
+// Competitive patterns are delegated to ClassifyRevert to avoid duplicating the
+// pattern list. Only "revert"/"reverted" keywords are checked here to catch bug
+// reverts that ClassifyRevert doesn't recognise as competitive.
 func looksLikeRevert(errMsg string) bool {
 	lower := strings.ToLower(strings.TrimSpace(errMsg))
-
 	if lower == "" {
 		return true
 	}
-
-	revertSignals := []string{
-		"revert",
-		"reverted",
-		"nonce too low",
-		"already known",
-		"replacement transaction underpriced",
-		"transaction underpriced",
-		"bundle collision",
-		"already included",
-		"already executed",
-		"arbitrage already executed",
-		"arb already taken",
-		"insufficient output amount",
-		"insufficient_output_amount",
-		"insufficient liquidity",
-		"price impact",
-		"k invariant",
-		"invariant",
-		"slippage",
-		"excessive_input_amount",
-		"minreturn",
-		"mev already captured",
-		"frontrun",
-		"sandwich",
+	// If ClassifyRevert recognises it as competitive, it is a revert.
+	if risk.ClassifyRevert(errMsg) == risk.RevertCompetitive {
+		return true
 	}
-
-	for _, signal := range revertSignals {
-		if strings.Contains(lower, signal) {
-			return true
-		}
-	}
-
-	return false
+	// Catch remaining bug reverts by keyword.
+	return strings.Contains(lower, "revert") || strings.Contains(lower, "reverted")
 }
 
 // consumeArbStream connects to the Rust engine's StreamArbs RPC and
