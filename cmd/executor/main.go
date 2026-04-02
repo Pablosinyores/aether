@@ -60,6 +60,8 @@ func loadConfig() Config {
 			builders = append(builders, BuilderConfig{
 				Name:      b.Name,
 				URL:       b.URL,
+				AuthType:  b.AuthType,
+				AuthKey:   b.AuthKey,
 				Enabled:   b.Enabled,
 				TimeoutMs: b.TimeoutMs,
 			})
@@ -95,20 +97,28 @@ func main() {
 
 	cfg := loadConfig()
 
-	// Load searcher private key for transaction signing.
-	var txSigner *TransactionSigner
+	// Load searcher private key for transaction signing and bundle submission.
 	searcherKey := os.Getenv("SEARCHER_KEY")
-	os.Unsetenv("SEARCHER_KEY")
+
+	// Create submitter BEFORE clearing the key — it needs the key for FlashbotsSigner.
+	submitter, err := NewSubmitter(cfg.BuilderConfigs, searcherKey)
+	if err != nil {
+		log.Fatalf("Failed to create submitter: %v", err)
+	}
+
+	var txSigner *TransactionSigner
 	if searcherKey != "" {
-		var err error
-		txSigner, err = NewTransactionSigner(searcherKey, cfg.ChainID)
-		if err != nil {
-			log.Fatalf("Failed to load SEARCHER_KEY: %v", err)
+		var signerErr error
+		txSigner, signerErr = NewTransactionSigner(searcherKey, cfg.ChainID)
+		if signerErr != nil {
+			log.Fatalf("Failed to load SEARCHER_KEY: %v", signerErr)
 		}
 		log.Printf("Searcher address: %s", txSigner.Address().Hex())
 	} else {
 		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
 	}
+
+	os.Unsetenv("SEARCHER_KEY")
 
 	// Connect to Ethereum node for block header queries (coinbase).
 	var ethClient *ethclient.Client
@@ -153,7 +163,6 @@ func main() {
 			log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
 		}
 	}
-	submitter := NewSubmitter(cfg.BuilderConfigs)
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 

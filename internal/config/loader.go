@@ -138,6 +138,8 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 type BuilderEntry struct {
 	Name      string `yaml:"name"`
 	URL       string `yaml:"url"`
+	AuthType  string `yaml:"auth_type"`
+	AuthKey   string `yaml:"auth_key"`
 	Enabled   bool   `yaml:"enabled"`
 	TimeoutMs int    `yaml:"timeout_ms"`
 }
@@ -152,6 +154,8 @@ type BuildersFileConfig struct {
 }
 
 // LoadBuildersConfig reads and parses a builders YAML config file.
+// Environment variables in ${VAR} format are expanded before parsing,
+// allowing secrets like API keys to be injected at runtime.
 func LoadBuildersConfig(path string) (BuildersFileConfig, error) {
 	var cfg BuildersFileConfig
 
@@ -159,6 +163,8 @@ func LoadBuildersConfig(path string) (BuildersFileConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read builders config %s: %w", path, err)
 	}
+
+	data = expandEnvVars(data)
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse builders config %s: %w", path, err)
@@ -185,6 +191,16 @@ func ValidateBuildersConfig(cfg BuildersFileConfig) error {
 		}
 		if b.TimeoutMs <= 0 {
 			return fmt.Errorf("builders[%d].timeout_ms must be > 0, got %d", i, b.TimeoutMs)
+		}
+		switch b.AuthType {
+		case "flashbots", "none", "":
+			// valid
+		case "api_key":
+			if b.AuthKey == "" {
+				return fmt.Errorf("builders[%d].auth_key must not be empty when auth_type is api_key", i)
+			}
+		default:
+			return fmt.Errorf("builders[%d].auth_type must be flashbots, api_key, or none, got %q", i, b.AuthType)
 		}
 	}
 	return nil
