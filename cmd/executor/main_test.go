@@ -175,7 +175,7 @@ func TestProcessArb_CompetitiveReverts_DoNotPause(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
 	builders := []BuilderConfig{
 		{Name: "b1", Enabled: true, TimeoutMs: 1000},
@@ -194,7 +194,7 @@ func TestProcessArb_CompetitiveReverts_DoNotPause(t *testing.T) {
 	arb := newValidArb("arb-competitive-001", 0.01, 5.0)
 
 	for i := 0; i < 2; i++ {
-		submitted, err := processArb(context.Background(), arb, rm, bundler, submitter,
+		submitted, err := processArb(context.Background(), arb, rm, bundler, submitter, nil,
 			"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 		if err != nil {
 			t.Fatalf("processArb: %v", err)
@@ -218,7 +218,7 @@ func TestProcessArb_BugReverts_PauseSystem(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
 	builders := []BuilderConfig{
 		{Name: "b1", Enabled: true, TimeoutMs: 1000},
@@ -235,17 +235,21 @@ func TestProcessArb_BugReverts_PauseSystem(t *testing.T) {
 
 	arb := newValidArb("arb-bug-001", 0.01, 5.0)
 
-	submitted, err := processArb(context.Background(), arb, rm, bundler, submitter,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
-	if err != nil {
-		t.Fatalf("processArb: %v", err)
-	}
-	if submitted {
-		t.Fatal("expected submitted=false when all builders reject")
+	// With dedup, each arb attempt counts as 1 revert regardless of builder
+	// count, so we need 2 arb attempts to reach the threshold of 2.
+	for i := 0; i < 2; i++ {
+		submitted, err := processArb(context.Background(), arb, rm, bundler, submitter, nil,
+			"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		if err != nil {
+			t.Fatalf("processArb[%d]: %v", i, err)
+		}
+		if submitted {
+			t.Fatal("expected submitted=false when all builders reject")
+		}
 	}
 
 	if rm.State() != risk.StatePaused {
-		t.Fatalf("expected Paused after bug reverts, got %s", rm.State())
+		t.Fatalf("expected Paused after 2 bug revert arbs, got %s", rm.State())
 	}
 }
 
@@ -258,7 +262,7 @@ func TestProcessArb_NonRevertErrors_NotCounted(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
 
 	builders := []BuilderConfig{{Name: "b1", Enabled: true, TimeoutMs: 1000}}
 	submitter := NewSubmitter(builders)
@@ -272,7 +276,7 @@ func TestProcessArb_NonRevertErrors_NotCounted(t *testing.T) {
 
 	arb := newValidArb("arb-timeout-001", 0.01, 5.0)
 
-	submitted, err := processArb(context.Background(), arb, rm, bundler, submitter,
+	submitted, err := processArb(context.Background(), arb, rm, bundler, submitter, nil,
 		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
 	if err != nil {
 		t.Fatalf("processArb: %v", err)

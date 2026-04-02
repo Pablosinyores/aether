@@ -16,6 +16,8 @@ type Metrics struct {
 	OpportunitiesDetected atomic.Int64
 	BundlesSubmitted      atomic.Int64
 	BundlesIncluded       atomic.Int64
+	RevertsBug            atomic.Int64
+	RevertsCompetitive    atomic.Int64
 
 	// Gauges
 	GasPriceGwei atomic.Int64 // Stored as gwei * 100 for precision
@@ -57,6 +59,11 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP aether_bundles_included_total Total bundles included on-chain\n")
 	fmt.Fprintf(w, "# TYPE aether_bundles_included_total counter\n")
 	fmt.Fprintf(w, "aether_bundles_included_total %d\n\n", m.BundlesIncluded.Load())
+
+	fmt.Fprintf(w, "# HELP aether_reverts_total Total reverts by type\n")
+	fmt.Fprintf(w, "# TYPE aether_reverts_total counter\n")
+	fmt.Fprintf(w, "aether_reverts_total{type=\"bug\"} %d\n", m.RevertsBug.Load())
+	fmt.Fprintf(w, "aether_reverts_total{type=\"competitive\"} %d\n\n", m.RevertsCompetitive.Load())
 
 	fmt.Fprintf(w, "# HELP aether_gas_price_gwei Current gas price in gwei\n")
 	fmt.Fprintf(w, "# TYPE aether_gas_price_gwei gauge\n")

@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aether-arb/aether/internal/config"
@@ -104,6 +105,13 @@ type RiskManager struct {
 	dailyResetTime      time.Time
 	bundlesSubmitted    int
 	bundlesIncluded     int
+
+	// Prometheus-style counters (read via atomic; no external dependency).
+	BugRevertTotal  atomic.Int64
+	CompRevertTotal atomic.Int64
+
+	// Rate-limit: last time the competitive-rate alert was emitted.
+	lastCompAlertTime time.Time
 }
 
 // NewRiskManager creates a new risk manager.
@@ -194,11 +202,17 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 		return out
 	}
 
+	// Prune both slices on every call so stale entries never linger.
+	rm.recentBugReverts = prune(rm.recentBugReverts)
+	rm.recentCompReverts = prune(rm.recentCompReverts)
+
 	switch revertType {
 	case RevertCompetitive:
-		rm.recentCompReverts = append(prune(rm.recentCompReverts), now)
+		rm.recentCompReverts = append(rm.recentCompReverts, now)
+		rm.CompRevertTotal.Add(1)
 	default: // RevertBug (and any unknown type) — conservative: count it
-		rm.recentBugReverts = append(prune(rm.recentBugReverts), now)
+		rm.recentBugReverts = append(rm.recentBugReverts, now)
+		rm.BugRevertTotal.Add(1)
 	}
 
 	// --- Bug-revert circuit breaker ---
@@ -208,13 +222,15 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 		rm.state.Transition(StatePaused)
 	}
 
-	// --- Competitive-revert stale-data alert ---
+	// --- Competitive-revert stale-data alert (rate-limited: once per window) ---
+	window := time.Duration(rm.config.RevertWindowMinutes) * time.Minute
 	totalReverts := len(rm.recentBugReverts) + len(rm.recentCompReverts)
-	if totalReverts > 0 {
+	if totalReverts > 0 && now.Sub(rm.lastCompAlertTime) >= window {
 		compPct := float64(len(rm.recentCompReverts)) / float64(totalReverts) * 100
 		if compPct >= rm.config.CompetitiveRevertAlertPct {
 			log.Printf("ALERT: competitive revert rate %.0f%% (>= %.0f%%) in last %d min — possible stale data",
 				compPct, rm.config.CompetitiveRevertAlertPct, rm.config.RevertWindowMinutes)
+			rm.lastCompAlertTime = now
 		}
 	}
 }
