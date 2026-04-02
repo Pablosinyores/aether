@@ -20,43 +20,39 @@ type Bundle struct {
 	Timestamp    time.Time
 }
 
-// BundleConstructor builds bundles from validated arbs
+// BundleConstructor builds bundles from validated arbs.
 type BundleConstructor struct {
 	nonceManager *NonceManager
 	gasOracle    *GasOracle
 	signer       *TransactionSigner
-	tipSharePct  float64
 	chainID      int64
 }
 
 // NewBundleConstructor creates a new bundle constructor.
 // The signer is used to sign transactions; if nil, transactions are left unsigned.
-func NewBundleConstructor(nm *NonceManager, go_ *GasOracle, signer *TransactionSigner, tipPct float64, chainID int64) *BundleConstructor {
+func NewBundleConstructor(nm *NonceManager, go_ *GasOracle, signer *TransactionSigner, chainID int64) *BundleConstructor {
 	return &BundleConstructor{
 		nonceManager: nm,
 		gasOracle:    go_,
 		signer:       signer,
-		tipSharePct:  tipPct,
 		chainID:      chainID,
 	}
 }
 
-// BuildBundle constructs a [arb_tx, tip_tx] bundle from an arb opportunity.
-// The coinbase parameter is the block proposer's address for the tip payment.
+// BuildBundle constructs a single-transaction bundle containing only the arb tx.
+// The coinbase tip is now handled inline by the Solidity contract, so no
+// separate tip transaction is needed.
 func (bc *BundleConstructor) BuildBundle(
 	arbCalldata []byte,
 	executorAddr string,
-	profitWei *big.Int,
 	gasEstimate uint64,
 	targetBlock uint64,
-	coinbase common.Address,
 ) (*Bundle, error) {
 	gasFees := bc.gasOracle.CurrentFees()
 	nonce := bc.nonceManager.Next()
 	chainID := big.NewInt(bc.chainID)
 	executor := common.HexToAddress(executorAddr)
 
-	// Arb transaction (calls AetherExecutor.executeArb)
 	arbTx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   chainID,
 		Nonce:     nonce,
@@ -68,45 +64,21 @@ func (bc *BundleConstructor) BuildBundle(
 		Data:      arbCalldata,
 	})
 
-	// Tip transaction (send % of profit to block proposer)
-	tipAmount := new(big.Int).Mul(profitWei, big.NewInt(int64(bc.tipSharePct)))
-	tipAmount.Div(tipAmount, big.NewInt(100))
-
-	tipTx := types.NewTx(&types.DynamicFeeTx{
-		ChainID:   chainID,
-		Nonce:     nonce + 1,
-		GasTipCap: gasFees.MaxPriorityFee,
-		GasFeeCap: gasFees.MaxFeePerGas,
-		Gas:       21000, // Simple ETH transfer
-		To:        &coinbase,
-		Value:     tipAmount,
-	})
-
-	txs := []*types.Transaction{arbTx, tipTx}
-
-	// Sign transactions if signer is available.
+	// Sign transaction if signer is available.
 	if bc.signer != nil {
-		signedTxs := make([]*types.Transaction, len(txs))
-		rawTxs := make([][]byte, len(txs))
+		signed, err := bc.signer.SignTx(arbTx)
+		if err != nil {
+			return nil, fmt.Errorf("sign arb tx: %w", err)
+		}
 
-		for i, tx := range txs {
-			signed, err := bc.signer.SignTx(tx)
-			if err != nil {
-				return nil, fmt.Errorf("failed to sign tx %d: %w", i, err)
-			}
-
-			raw, err := signed.MarshalBinary()
-			if err != nil {
-				return nil, fmt.Errorf("failed to RLP-encode tx %d: %w", i, err)
-			}
-
-			signedTxs[i] = signed
-			rawTxs[i] = raw
+		raw, err := signed.MarshalBinary()
+		if err != nil {
+			return nil, fmt.Errorf("RLP-encode arb tx: %w", err)
 		}
 
 		return &Bundle{
-			Transactions: signedTxs,
-			RawTxs:       rawTxs,
+			Transactions: []*types.Transaction{signed},
+			RawTxs:       [][]byte{raw},
 			BlockNumber:  targetBlock,
 			Timestamp:    time.Now(),
 		}, nil
@@ -114,7 +86,7 @@ func (bc *BundleConstructor) BuildBundle(
 
 	// No signer — return unsigned (for testing).
 	return &Bundle{
-		Transactions: txs,
+		Transactions: []*types.Transaction{arbTx},
 		BlockNumber:  targetBlock,
 		Timestamp:    time.Now(),
 	}, nil

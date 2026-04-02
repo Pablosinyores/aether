@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/aether-arb/aether/internal/config"
@@ -20,13 +19,12 @@ import (
 	"github.com/aether-arb/aether/internal/risk"
 )
 
-// Config holds executor service configuration
+// Config holds executor service configuration.
 type Config struct {
 	GRPCAddress    string
 	BuilderConfigs []BuilderConfig
 	ChainID        int64
 	MaxGasGwei     float64
-	TipSharePct    float64
 	ExecutorAddr   string  // On-chain AetherExecutor contract address
 	EthBalance     float64 // Current ETH balance of searcher wallet (simulated)
 }
@@ -37,7 +35,6 @@ func defaultConfig() Config {
 		BuilderConfigs: defaultBuilderConfigs(),
 		ChainID:        1,
 		MaxGasGwei:     300.0,
-		TipSharePct:    90.0,
 		ExecutorAddr:   "0x0000000000000000000000000000000000000000",
 		EthBalance:     0.5,
 	}
@@ -109,7 +106,7 @@ func main() {
 		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
 	}
 
-	// Connect to Ethereum node for block header queries (coinbase).
+	// Connect to Ethereum node for nonce sync.
 	var ethClient *ethclient.Client
 	if rpcURL := os.Getenv("ETH_RPC_URL"); rpcURL != "" {
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -119,10 +116,10 @@ func main() {
 		if err != nil {
 			log.Printf("WARNING: failed to connect to ETH_RPC_URL: %v", err)
 		} else {
-			log.Printf("Connected to Ethereum node for coinbase lookups")
+			log.Printf("Connected to Ethereum node for nonce sync")
 		}
 	} else {
-		log.Println("WARNING: ETH_RPC_URL not set — coinbase will use zero address")
+		log.Println("WARNING: ETH_RPC_URL not set — nonce manager will not sync on-chain nonce")
 	}
 
 	// Setup graceful shutdown
@@ -146,7 +143,7 @@ func main() {
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
 	submitter := NewSubmitter(cfg.BuilderConfigs)
-	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
+	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
 	sigCh := make(chan os.Signal, 1)
@@ -185,7 +182,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, cfg.ExecutorAddr, cfg.EthBalance)
 		}()
 	}
 
@@ -203,59 +200,39 @@ func main() {
 }
 
 // processArb handles a single validated arb through the full pipeline:
-// parse -> preflight -> bundle -> submit -> record result
+// parse -> preflight -> bundle -> submit -> record result.
 func processArb(
 	ctx context.Context,
 	arb *pb.ValidatedArb,
 	rm *risk.RiskManager,
 	bundler *BundleConstructor,
 	submitter *Submitter,
-	ethClient *ethclient.Client,
 	executorAddr string,
-	tipSharePct float64,
 	ethBalance float64,
 ) (submitted bool, err error) {
-	// Parse net_profit_wei from proto bytes to big.Int
 	profitWei := new(big.Int).SetBytes(arb.NetProfitWei)
-
-	// Parse flashloan_amount as trade value
 	tradeValueWei := new(big.Int).SetBytes(arb.FlashloanAmount)
 
-	// Get current gas price from the bundler's gas oracle
 	gasFees := bundler.gasOracle.CurrentFees()
 	gasGwei := gasFees.GasPriceGwei
+	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
 
-	// Preflight risk check
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
 
-	// Fetch block.coinbase from latest block header for the tip transaction.
-	coinbase := common.Address{}
-	if ethClient != nil {
-		header, headerErr := ethClient.HeaderByNumber(ctx, nil) // nil = latest
-		if headerErr != nil {
-			log.Printf("WARNING: failed to fetch latest block header: %v, using zero coinbase", headerErr)
-		} else {
-			coinbase = header.Coinbase
-		}
-	}
-
-	// Build bundle
-	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase)
+	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, arb.TotalGas, arb.BlockNumber+1)
 	if err != nil {
 		return false, fmt.Errorf("build bundle: %w", err)
 	}
 
-	// Submit to all builders
 	results := submitter.SubmitToAll(ctx, bundle)
 	successes := SuccessCount(results)
 
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
 
-	// Record result for miss rate tracking
 	rm.RecordBundleResult(successes > 0)
 
 	return successes > 0, nil
@@ -265,7 +242,7 @@ func processArb(
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, tipSharePct float64, ethBalance float64) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, ethBalance float64) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -301,7 +278,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, tipSharePct, ethBalance)
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter, executorAddr, ethBalance)
 			if err != nil {
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
 			}

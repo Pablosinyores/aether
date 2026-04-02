@@ -335,7 +335,12 @@ async fn run_historical_arb_inner(
     )
     .ok_or("Failed to build final route with executor address")?;
 
-    let calldata = build_execute_arb_calldata(&final_steps, flashloan_token, optimal_input);
+    let calldata = build_execute_arb_calldata(
+        &final_steps,
+        flashloan_token,
+        optimal_input,
+        U256::from(9000u64),
+    );
     latencies.push(("build calldata", t7.elapsed().as_millis()));
 
     // ── Phase 8: Simulate via revm ───────────────────────────────────

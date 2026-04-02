@@ -406,7 +406,12 @@ async fn run_flash_loan_test(anvil_url: &str) -> Result<(), String> {
         },
     ];
 
-    let execute_arb_calldata = build_execute_arb_calldata(&steps, WETH, flashloan_amount);
+    let execute_arb_calldata = build_execute_arb_calldata(
+        &steps,
+        WETH,
+        flashloan_amount,
+        U256::from(9000u64),
+    );
 
     phase_times.push((
         "Phase 7 (build calldata)",

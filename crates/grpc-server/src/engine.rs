@@ -41,6 +41,9 @@ pub struct EngineConfig {
     /// Executor contract address used as the simulation target.
     /// Defaults to `Address::ZERO` (empty call) when unset.
     pub executor_address: Address,
+    /// Tip to block.coinbase in basis points (e.g. 9000 = 90%).
+    /// Encoded into executeArb calldata for inline coinbase tip payment.
+    pub tip_bps: u64,
 }
 
 impl Default for EngineConfig {
@@ -52,6 +55,7 @@ impl Default for EngineConfig {
             gas_price_gwei: 30.0,
             rpc_url: None,
             executor_address: Address::ZERO,
+            tip_bps: 9000,
         }
     }
 }
@@ -872,6 +876,7 @@ impl AetherEngine {
                 &steps,
                 candidate.flashloan_token,
                 input_amount,
+                U256::from(self.config.tip_bps)
             );
 
             // Create ArbOpportunity.
@@ -1005,6 +1010,7 @@ mod tests {
         assert_eq!(config.detection_time_budget_us, 3_000);
         assert_eq!(config.min_profit_threshold_wei, 1_000_000_000_000_000);
         assert!((config.gas_price_gwei - 30.0).abs() < f64::EPSILON);
+        assert_eq!(config.tip_bps, 9000);
     }
 
     #[test]

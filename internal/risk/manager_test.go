@@ -352,6 +352,74 @@ func TestBundleMissRate(t *testing.T) {
 	}
 }
 
+func TestCalculateTipShare_NoHistory(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+
+	// With no bundle history, should return the 90% base.
+	got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+	if got != 90.0 {
+		t.Errorf("CalculateTipShare with no history: got %.1f%%, want 90.0%%", got)
+	}
+}
+
+func TestCalculateTipShare_Adaptive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		included int
+		missed   int
+		wantMin  float64
+		wantMax  float64
+	}{
+		{"all included — tip decreases", 10, 0, 70.0, 78.0},
+		{"all missed — tip increases toward max", 0, 10, 93.0, 95.0},
+		{"50% inclusion — base tip", 5, 5, 89.0, 91.0},
+		{"75% inclusion — below base", 15, 5, 77.0, 85.0},
+		{"25% inclusion — above base", 5, 15, 93.0, 95.0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rm := NewRiskManager(DefaultRiskConfig())
+			for i := 0; i < tc.included; i++ {
+				rm.RecordBundleResult(true)
+			}
+			for i := 0; i < tc.missed; i++ {
+				rm.RecordBundleResult(false)
+			}
+
+			got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+			if got < tc.wantMin || got > tc.wantMax {
+				t.Errorf("CalculateTipShare: got %.1f%%, want in [%.1f%%, %.1f%%]",
+					got, tc.wantMin, tc.wantMax)
+			}
+		})
+	}
+}
+
+func TestCalculateTipShare_ClampedToMax(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.MaxTipSharePct = 92.0
+	rm := NewRiskManager(cfg)
+
+	// All misses should push tip up, but it must not exceed MaxTipSharePct.
+	for i := 0; i < 20; i++ {
+		rm.RecordBundleResult(false)
+	}
+
+	got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+	if got > cfg.MaxTipSharePct {
+		t.Errorf("CalculateTipShare exceeded max: got %.1f%%, max %.1f%%", got, cfg.MaxTipSharePct)
+	}
+}
+
 func TestWeiToETH(t *testing.T) {
 	t.Parallel()
 

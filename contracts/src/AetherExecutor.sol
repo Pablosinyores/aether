@@ -35,6 +35,7 @@ contract AetherExecutor {
         address indexed flashloanToken,
         uint256 flashloanAmount,
         uint256 profit,
+        uint256 tipAmount,
         uint256 gasUsed
     );
 
@@ -43,6 +44,7 @@ contract AetherExecutor {
     error InsufficientProfit();
     error SwapFailed(uint256 stepIndex);
     error InsufficientOutput(uint256 stepIndex, uint256 expected, uint256 actual);
+    error TipBpsTooHigh();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -58,15 +60,19 @@ contract AetherExecutor {
     /// @param steps Array of swap steps to execute
     /// @param flashloanToken Token to borrow
     /// @param flashloanAmount Amount to borrow
+    /// @param tipBps Tip to block.coinbase in basis points (e.g. 9000 = 90%)
     function executeArb(
         SwapStep[] calldata steps,
         address flashloanToken,
-        uint256 flashloanAmount
+        uint256 flashloanAmount,
+        uint256 tipBps
     ) external onlyOwner {
+        if (tipBps > 10_000) revert TipBpsTooHigh();
+
         uint256 gasStart = gasleft();
 
-        // Encode steps for callback
-        bytes memory params = abi.encode(steps, gasStart);
+        // Encode steps, gas snapshot, and tip config for callback
+        bytes memory params = abi.encode(steps, gasStart, tipBps);
 
         // Initiate flash loan - Aave V3 IPool.flashLoanSimple
         // function flashLoanSimple(address receiverAddress, address asset, uint256 amount, bytes calldata params, uint16 referralCode)
@@ -95,29 +101,51 @@ contract AetherExecutor {
         if (msg.sender != aavePool) revert NotAavePool();
         require(initiator == address(this), "Invalid initiator");
 
-        (SwapStep[] memory steps, uint256 gasStart) = abi.decode(params, (SwapStep[], uint256));
+        (SwapStep[] memory steps, uint256 gasStart, uint256 tipBps) =
+            abi.decode(params, (SwapStep[], uint256, uint256));
 
         // Execute all swap steps
         for (uint256 i = 0; i < steps.length; i++) {
             _executeSwap(steps[i], i);
         }
 
-        // Repay flash loan (amount + premium)
+        // Repay flash loan and distribute profit
+        (uint256 profit, uint256 tipAmount) = _repayAndDistribute(asset, amount, premium, tipBps);
+
+        uint256 gasUsed = gasStart - gasleft();
+        emit ArbExecuted(asset, amount, profit, tipAmount, gasUsed);
+
+        return true;
+    }
+
+    /// @dev Repay flash loan, split profit between coinbase tip and owner
+    /// @return profit Total profit before tip/owner split
+    /// @return tipAmount Amount sent to block.coinbase
+    function _repayAndDistribute(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        uint256 tipBps
+    ) internal returns (uint256 profit, uint256 tipAmount) {
         uint256 totalDebt = amount + premium;
         IERC20(asset).forceApprove(aavePool, totalDebt);
 
-        // Calculate and transfer profit
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance <= totalDebt) revert InsufficientProfit();
-        uint256 profit = balance - totalDebt;
+        profit = balance - totalDebt;
 
-        // Transfer profit to owner
-        IERC20(asset).safeTransfer(owner, profit);
+        // tipBps validated in executeArb (<=10000), so multiplication is safe
+        tipAmount = (profit * tipBps) / 10_000;
+        // Safe: tipAmount <= profit because tipBps <= 10000
+        uint256 ownerProfit;
+        unchecked { ownerProfit = profit - tipAmount; }
 
-        uint256 gasUsed = gasStart - gasleft();
-        emit ArbExecuted(asset, amount, profit, gasUsed);
-
-        return true;
+        if (tipAmount > 0) {
+            IERC20(asset).safeTransfer(block.coinbase, tipAmount);
+        }
+        if (ownerProfit > 0) {
+            IERC20(asset).safeTransfer(owner, ownerProfit);
+        }
     }
 
     /// @dev Execute a single swap step based on protocol

@@ -219,6 +219,52 @@ func (rm *RiskManager) BundleMissRate() float64 {
 	return missRate
 }
 
+// CalculateTipShare returns an adaptive tip share percentage based on recent
+// bundle inclusion rate. The base tip is 90%. When inclusion drops below 50%,
+// the tip increases toward MaxTipSharePct to incentivize builders. When
+// inclusion is above 50%, the tip decreases toward a 70% floor to retain more
+// profit. The result is always clamped to [70, MaxTipSharePct].
+//
+// profitWei and gasGwei are accepted for future use (e.g. adjusting tip based
+// on profit margin or gas conditions) but are currently unused.
+func (rm *RiskManager) CalculateTipShare(_ *big.Int, _ float64) float64 {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	const (
+		baseTipPct = 90.0
+		minTipPct  = 70.0
+	)
+	maxTipPct := rm.config.MaxTipSharePct
+
+	// No history yet — use the base tip.
+	if rm.bundlesSubmitted == 0 {
+		return baseTipPct
+	}
+
+	inclusionRate := float64(rm.bundlesIncluded) / float64(rm.bundlesSubmitted)
+
+	// Linear adjustment: below 50% inclusion we increase tip, above we decrease.
+	// At 50% inclusion the adjustment is zero (returns baseTipPct).
+	// At 0% inclusion: +maxAdjust  (tip goes up toward maxTipPct)
+	// At 100% inclusion: -maxAdjust (tip goes down toward minTipPct)
+	const midpoint = 0.5
+	maxAdjust := (maxTipPct - minTipPct) / 2.0
+	adjustment := (midpoint - inclusionRate) * 2.0 * maxAdjust
+
+	tip := baseTipPct + adjustment
+
+	// Clamp to [minTipPct, maxTipPct]
+	if tip < minTipPct {
+		tip = minTipPct
+	}
+	if tip > maxTipPct {
+		tip = maxTipPct
+	}
+
+	return tip
+}
+
 // State returns the current system state.
 func (rm *RiskManager) State() SystemState {
 	return rm.state.Current()

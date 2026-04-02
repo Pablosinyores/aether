@@ -5,42 +5,34 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
-
-var testCoinbase = common.HexToAddress("0x0000000000000000000000000000000000000001")
 
 func TestBuildBundle_Basic(t *testing.T) {
 	t.Parallel()
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
-	profit := intETHToWei(t, 1) // 1 ETH
 	calldata := []byte{0xAB, 0xCD}
 	executor := "0x1234567890abcdef1234567890abcdef12345678"
 
-	bundle, err := bc.BuildBundle(calldata, executor, profit, 500000, 18000000, testCoinbase)
+	bundle, err := bc.BuildBundle(calldata, executor, 500000, 18000000)
 	if err != nil {
 		t.Fatalf("BuildBundle returned error: %v", err)
 	}
 
-	// Must have exactly 2 transactions: arb + tip
-	if len(bundle.Transactions) != 2 {
-		t.Fatalf("expected 2 transactions, got %d", len(bundle.Transactions))
+	// Must have exactly 1 transaction (arb only, tip is in-contract).
+	if len(bundle.Transactions) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(bundle.Transactions))
 	}
 
 	arbTx := bundle.Transactions[0]
-	tipTx := bundle.Transactions[1]
 
-	// Nonce sequence: arb=0, tip=1
+	// Nonce
 	if arbTx.Nonce() != 0 {
 		t.Errorf("arb tx nonce: expected 0, got %d", arbTx.Nonce())
-	}
-	if tipTx.Nonce() != 1 {
-		t.Errorf("tip tx nonce: expected 1, got %d", tipTx.Nonce())
 	}
 
 	// EIP-1559 fields set on arb tx
@@ -62,9 +54,9 @@ func TestBuildBundle_Basic(t *testing.T) {
 	}
 
 	// Executor address
-	expectedAddr := common.HexToAddress(executor)
-	if arbTx.To() == nil || *arbTx.To() != expectedAddr {
-		t.Errorf("arb tx To: expected %s, got %v", expectedAddr.Hex(), arbTx.To())
+	expectedAddr := "0x1234567890abcdef1234567890abcdef12345678"
+	if arbTx.To() == nil || arbTx.To().Hex() != "0x1234567890AbcdEF1234567890aBcdef12345678" {
+		t.Errorf("arb tx To: expected %s, got %v", expectedAddr, arbTx.To())
 	}
 
 	// Calldata
@@ -73,107 +65,32 @@ func TestBuildBundle_Basic(t *testing.T) {
 	}
 }
 
-func TestBuildBundle_TipCalculation(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		tipSharePct float64
-		profitETH   int64
-	}{
-		{"90% of 1 ETH", 90, 1},
-		{"50% of 1 ETH", 50, 1},
-		{"10% of 2 ETH", 10, 2},
-		{"95% of 1 ETH", 95, 1},
-		{"1% of 10 ETH", 1, 10},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			nm := NewNonceManager(0)
-			go_ := NewGasOracle(300.0)
-			bc := NewBundleConstructor(nm, go_, nil, tc.tipSharePct, 1)
-
-			profit := intETHToWei(t, tc.profitETH)
-			bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 100, testCoinbase)
-			if err != nil {
-				t.Fatalf("BuildBundle error: %v", err)
-			}
-
-			tipTx := bundle.Transactions[1]
-			expectedTip := new(big.Int).Mul(profit, big.NewInt(int64(tc.tipSharePct)))
-			expectedTip.Div(expectedTip, big.NewInt(100))
-
-			if tipTx.Value().Cmp(expectedTip) != 0 {
-				t.Errorf("tip amount: got %s, want %s", tipTx.Value().String(), expectedTip.String())
-			}
-		})
-	}
-}
-
-func TestBuildBundle_ZeroProfit(t *testing.T) {
-	t.Parallel()
-
-	nm := NewNonceManager(0)
-	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
-
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(0), 300000, 100, testCoinbase)
-	if err != nil {
-		t.Fatalf("BuildBundle error: %v", err)
-	}
-
-	tipTx := bundle.Transactions[1]
-	if tipTx.Value().Sign() != 0 {
-		t.Errorf("expected tip=0 for zero profit, got %s", tipTx.Value().String())
-	}
-}
-
 func TestBuildBundle_GasEstimate(t *testing.T) {
 	t.Parallel()
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, nil, 1)
 
 	gasEstimates := []uint64{21000, 500000, 1000000, 250000}
 
 	for _, gasEst := range gasEstimates {
-		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1000), gasEst, 100, testCoinbase)
+		// Reset nonce for each iteration so test is independent.
+		nm.Reset(0)
+
+		bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", gasEst, 100)
 		if err != nil {
 			t.Fatalf("BuildBundle error: %v", err)
+		}
+
+		if len(bundle.Transactions) != 1 {
+			t.Fatalf("expected 1 transaction, got %d", len(bundle.Transactions))
 		}
 
 		arbTx := bundle.Transactions[0]
 		if arbTx.Gas() != gasEst {
 			t.Errorf("gas estimate: got %d, want %d", arbTx.Gas(), gasEst)
 		}
-
-		tipTx := bundle.Transactions[1]
-		if tipTx.Gas() != 21000 {
-			t.Errorf("tip tx gas: got %d, want 21000", tipTx.Gas())
-		}
-	}
-}
-
-func TestBuildBundle_TipGoesToCoinbase(t *testing.T) {
-	t.Parallel()
-
-	nm := NewNonceManager(0)
-	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, nil, 90.0, 1)
-
-	coinbase := common.HexToAddress("0xDEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF")
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", big.NewInt(1e18), 300000, 100, coinbase)
-	if err != nil {
-		t.Fatalf("BuildBundle error: %v", err)
-	}
-
-	tipTx := bundle.Transactions[1]
-	if tipTx.To() == nil || *tipTx.To() != coinbase {
-		t.Errorf("tip tx To: expected %s, got %v", coinbase.Hex(), tipTx.To())
 	}
 }
 
@@ -187,39 +104,35 @@ func TestBuildBundle_WithSigner(t *testing.T) {
 
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bc := NewBundleConstructor(nm, go_, signer, 90.0, 1)
+	bc := NewBundleConstructor(nm, go_, signer, 1)
 
-	profit := intETHToWei(t, 1)
-	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", profit, 300000, 18000000, testCoinbase)
+	bundle, err := bc.BuildBundle([]byte{0x01}, "0xExecutor", 300000, 18000000)
 	if err != nil {
 		t.Fatalf("BuildBundle error: %v", err)
 	}
 
-	// Should have signed raw bytes
-	if len(bundle.RawTxs) != 2 {
-		t.Fatalf("expected 2 raw txs, got %d", len(bundle.RawTxs))
+	// Should have 1 signed raw tx.
+	if len(bundle.RawTxs) != 1 {
+		t.Fatalf("expected 1 raw tx, got %d", len(bundle.RawTxs))
 	}
 
-	for i, raw := range bundle.RawTxs {
-		if len(raw) == 0 {
-			t.Errorf("raw tx %d is empty", i)
-		}
-		// EIP-1559 tx type prefix
-		if raw[0] != 0x02 {
-			t.Errorf("raw tx %d: expected type 0x02, got 0x%02x", i, raw[0])
-		}
+	raw := bundle.RawTxs[0]
+	if len(raw) == 0 {
+		t.Error("raw tx is empty")
+	}
+	// EIP-1559 tx type prefix
+	if raw[0] != 0x02 {
+		t.Errorf("raw tx: expected type 0x02, got 0x%02x", raw[0])
 	}
 
-	// Verify sender can be recovered from signed transactions
+	// Verify sender can be recovered from the signed transaction.
 	ethSigner := types.LatestSignerForChainID(big.NewInt(1))
-	for i, tx := range bundle.Transactions {
-		sender, err := types.Sender(ethSigner, tx)
-		if err != nil {
-			t.Fatalf("failed to recover sender from tx %d: %v", i, err)
-		}
-		if sender != signer.Address() {
-			t.Errorf("tx %d sender: got %s, want %s", i, sender.Hex(), signer.Address().Hex())
-		}
+	sender, recoverErr := types.Sender(ethSigner, bundle.Transactions[0])
+	if recoverErr != nil {
+		t.Fatalf("failed to recover sender: %v", recoverErr)
+	}
+	if sender != signer.Address() {
+		t.Errorf("sender: got %s, want %s", sender.Hex(), signer.Address().Hex())
 	}
 }
 
@@ -242,7 +155,7 @@ func TestGenerateBundleID_Format(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		id := GenerateBundleID()
 
-		// 16 bytes → 32 hex characters
+		// 16 bytes -> 32 hex characters
 		if len(id) != 32 {
 			t.Errorf("expected ID length 32, got %d: %s", len(id), id)
 		}
