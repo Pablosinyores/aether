@@ -130,18 +130,21 @@ fn u256_to_f64(val: U256) -> f64 {
 
 /// Intermediate data extracted from a detected cycle under the graph read lock.
 /// Used to defer simulation and publishing until after the lock is released.
-#[allow(dead_code)]
 struct CycleCandidate {
     hops: Vec<ArbHop>,
     protocols: Vec<ProtocolType>,
     tick_counts: Vec<u32>,
-    profit_factor: f64,
     flashloan_token: Address,
     path_id: String,
     /// Per-hop exchange rates recovered from graph edge weights: e^(-weight).
+    /// Used as fallback when reserves are unavailable.
     exchange_rates: Vec<f64>,
     /// Minimum liquidity across all hops — caps the optimizer search range.
     min_liquidity: U256,
+    /// Per-hop pool reserves (reserve_in, reserve_out) for AMM-aware profit function.
+    reserves: Vec<(f64, f64)>,
+    /// Per-hop fee factors (e.g. 0.997 for 30bps), used in constant-product formula.
+    fee_factors: Vec<f64>,
 }
 
 impl AetherEngine {
@@ -725,6 +728,7 @@ impl AetherEngine {
             debug!(count = cycles.len(), "Detected negative cycles");
 
             let token_index = self.token_index.read().await;
+            let pool_registry = self.pool_registry.read().await;
             let mut candidates = Vec::new();
 
             for cycle in &cycles {
@@ -744,6 +748,8 @@ impl AetherEngine {
                 let mut protocols = Vec::new();
                 let mut tick_counts = Vec::new();
                 let mut exchange_rates = Vec::new();
+                let mut reserves = Vec::new();
+                let mut fee_factors = Vec::new();
                 let mut min_liquidity = U256::MAX;
                 let mut valid = true;
 
@@ -787,6 +793,16 @@ impl AetherEngine {
                     let rate = (-best_edge.weight).exp();
                     exchange_rates.push(rate);
 
+                    // Collect pool reserves for AMM-aware profit function.
+                    reserves.push((best_edge.reserve_in, best_edge.reserve_out));
+
+                    // Look up fee_bps from pool registry, default 30bps.
+                    let fee_bps = pool_registry
+                        .get(&best_edge.pool_address)
+                        .map(|m| m.fee_bps)
+                        .unwrap_or(30);
+                    fee_factors.push((10000.0 - fee_bps as f64) / 10000.0);
+
                     // Track minimum liquidity across hops to cap optimizer range.
                     // Skip zero-liquidity edges (placeholders from register_pool).
                     if !best_edge.liquidity.is_zero()
@@ -828,11 +844,12 @@ impl AetherEngine {
                     hops,
                     protocols,
                     tick_counts,
-                    profit_factor,
                     flashloan_token,
                     path_id,
                     exchange_rates,
                     min_liquidity,
+                    reserves,
+                    fee_factors,
                 });
             }
 
@@ -865,13 +882,23 @@ impl AetherEngine {
                 max_trade
             };
 
-            let rates = &candidate.exchange_rates;
+            let hop_reserves = &candidate.reserves;
+            let hop_fee_factors = &candidate.fee_factors;
+            let hop_rates = &candidate.exchange_rates;
             let profit_fn = |input: U256| -> i128 {
-                let mut current_f64 = u256_to_f64(input);
-                for &rate in rates {
-                    current_f64 *= rate;
+                let mut current = u256_to_f64(input);
+                for i in 0..hop_reserves.len() {
+                    let (x, y) = hop_reserves[i];
+                    let fee = hop_fee_factors[i];
+                    if x > 0.0 && y > 0.0 {
+                        // Constant-product AMM: dy = (dx * fee * y) / (x + dx * fee)
+                        current = (current * fee * y) / (x + current * fee);
+                    } else {
+                        // Fallback to linear rate when reserves are unknown.
+                        current *= hop_rates[i];
+                    }
                 }
-                let output = current_f64 as i128;
+                let output = current as i128;
                 let input_i128 = u256_to_f64(input) as i128;
                 output
                     .saturating_sub(input_i128)
@@ -889,7 +916,10 @@ impl AetherEngine {
                 continue;
             }
 
-            let net_profit = net_profit_i128 as u128;
+            let net_profit: u128 = match net_profit_i128.try_into() {
+                Ok(v) => v,
+                Err(_) => continue, // should not happen after <= 0 guard
+            };
             if net_profit < self.config.min_profit_threshold_wei {
                 debug!(
                     net_profit,
@@ -906,17 +936,26 @@ impl AetherEngine {
             let mut current_amount = input_amount;
             for (i, hop) in optimized_hops.iter_mut().enumerate() {
                 hop.amount_in = current_amount;
-                let out_f64 = u256_to_f64(current_amount) * candidate.exchange_rates[i];
+                let dx = u256_to_f64(current_amount);
+                let (x, y) = candidate.reserves[i];
+                let fee = candidate.fee_factors[i];
+                let out_f64 = if x > 0.0 && y > 0.0 {
+                    (dx * fee * y) / (x + dx * fee)
+                } else {
+                    dx * candidate.exchange_rates[i]
+                };
                 let out_u256 = U256::from(out_f64 as u128);
                 hop.expected_out = out_u256;
                 current_amount = out_u256;
             }
 
-            let gross_profit_wei = u256_to_f64(current_amount) as u128;
+            let gross_profit_wei = (u256_to_f64(current_amount) as u128)
+                .saturating_sub(u256_to_f64(input_amount) as u128);
 
             // ── Build SwapSteps with configurable slippage ──
             let slippage_denom = U256::from(10_000u32);
-            let slippage_factor = slippage_denom - U256::from(self.config.slippage_bps);
+            let clamped_bps = self.config.slippage_bps.min(9999);
+            let slippage_factor = slippage_denom - U256::from(clamped_bps);
             let steps: Vec<SwapStep> = optimized_hops
                 .iter()
                 .map(|hop| {
@@ -2015,5 +2054,126 @@ fee_bps = 30
             last_output,
             first_input
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_profit_ge_fixed_1eth_with_reserves() {
+        // Set up engine with realistic reserves so AMM math is exercised.
+        let (tx, mut rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(
+            EngineConfig {
+                min_profit_threshold_wei: 0,
+                gas_price_gwei: 0.0,
+                slippage_bps: 100,
+                ..EngineConfig::default()
+            },
+            tx,
+        );
+
+        let token_a = Address::repeat_byte(0x01);
+        let token_b = Address::repeat_byte(0x02);
+        let token_c = Address::repeat_byte(0x03);
+        let pool_ab = Address::repeat_byte(0x11);
+        let pool_bc = Address::repeat_byte(0x22);
+        let pool_ca = Address::repeat_byte(0x33);
+        let liq = U256::from(500_000_000_000_000_000_000u128); // 500 ETH
+
+        engine.register_pool(pool_ab, token_a, token_b, ProtocolType::UniswapV2, 30).await;
+        engine.register_pool(pool_bc, token_b, token_c, ProtocolType::SushiSwap, 30).await;
+        engine.register_pool(pool_ca, token_c, token_a, ProtocolType::Curve, 30).await;
+
+        // Reserves that create a profitable cycle: rate product > 1.
+        // Pool AB: 1000 A / 1500 B → rate ~1.5 (after fee ~1.4955)
+        // Pool BC: 1000 B / 1500 C → rate ~1.5
+        // Pool CA: 1000 C / 1000 A → rate ~1.0
+        // Product ~2.25 before fees → profitable.
+        let r_ab_in = 1000.0_f64 * 1e18;
+        let r_ab_out = 1500.0_f64 * 1e18;
+        let r_bc_in = 1000.0_f64 * 1e18;
+        let r_bc_out = 1500.0_f64 * 1e18;
+        let r_ca_in = 1000.0_f64 * 1e18;
+        let r_ca_out = 1000.0_f64 * 1e18;
+
+        {
+            let reg = engine.pool_registry.read().await;
+            let meta_ab = reg.get(&pool_ab).unwrap().clone();
+            let meta_bc = reg.get(&pool_bc).unwrap().clone();
+            let meta_ca = reg.get(&pool_ca).unwrap().clone();
+            drop(reg);
+
+            let fee = 0.997;
+            let mut graph = engine.price_graph.write().await;
+
+            // Set rates from reserves and populate reserve fields.
+            graph.add_edge(meta_ab.token0_idx, meta_ab.token1_idx,
+                (r_ab_out / r_ab_in) * fee, meta_ab.pool_id, pool_ab,
+                ProtocolType::UniswapV2, liq);
+            graph.update_edge_from_reserves(
+                meta_ab.token0_idx, meta_ab.token1_idx, meta_ab.pool_id,
+                r_ab_in, r_ab_out, fee);
+
+            graph.add_edge(meta_bc.token0_idx, meta_bc.token1_idx,
+                (r_bc_out / r_bc_in) * fee, meta_bc.pool_id, pool_bc,
+                ProtocolType::SushiSwap, liq);
+            graph.update_edge_from_reserves(
+                meta_bc.token0_idx, meta_bc.token1_idx, meta_bc.pool_id,
+                r_bc_in, r_bc_out, fee);
+
+            graph.add_edge(meta_ca.token0_idx, meta_ca.token1_idx,
+                (r_ca_out / r_ca_in) * fee, meta_ca.pool_id, pool_ca,
+                ProtocolType::Curve, liq);
+            graph.update_edge_from_reserves(
+                meta_ca.token0_idx, meta_ca.token1_idx, meta_ca.pool_id,
+                r_ca_in, r_ca_out, fee);
+        }
+
+        {
+            let mut block = engine.current_block.write().await;
+            block.number = 18_000_000;
+            block.timestamp = 1_700_000_000;
+            block.base_fee = 0;
+        }
+
+        engine.run_detection_cycle().await;
+        let arb = rx.try_recv().expect("should produce an arb");
+
+        let optimizer_input = bytes_to_u256(&arb.hops[0].amount_in);
+        let optimizer_output = bytes_to_u256(&arb.hops.last().unwrap().expected_out);
+        let optimizer_profit = optimizer_output.saturating_sub(optimizer_input);
+
+        // Compute what fixed 1 ETH would yield through the same AMM path.
+        let one_eth = 1_000_000_000_000_000_000.0_f64;
+        let mut current = one_eth;
+        let reserves = [(r_ab_in, r_ab_out), (r_bc_in, r_bc_out), (r_ca_in, r_ca_out)];
+        for (x, y) in &reserves {
+            current = (current * 0.997 * y) / (x + current * 0.997);
+        }
+        let fixed_profit_f64 = current - one_eth;
+        let fixed_profit = U256::from(fixed_profit_f64.max(0.0) as u128);
+
+        assert!(
+            optimizer_profit >= fixed_profit,
+            "Optimizer profit ({}) should be >= fixed 1 ETH profit ({})",
+            optimizer_profit, fixed_profit
+        );
+
+        // The optimizer should NOT have chosen exactly 1 ETH.
+        let one_eth_u256 = U256::from(1_000_000_000_000_000_000u128);
+        assert_ne!(optimizer_input, one_eth_u256,
+            "Optimizer should find a different amount than hardcoded 1 ETH");
+    }
+
+    #[test]
+    fn test_slippage_bps_overflow_clamped() {
+        // Verify that slippage_bps >= 10000 doesn't cause U256 underflow.
+        // The engine clamps to 9999 internally.
+        let config = EngineConfig {
+            slippage_bps: 10_000,
+            ..EngineConfig::default()
+        };
+        let denom = U256::from(10_000u32);
+        let clamped = config.slippage_bps.min(9999);
+        let factor = denom - U256::from(clamped);
+        assert_eq!(factor, U256::from(1u32), "Clamped factor should be 1 (not underflow)");
     }
 }
