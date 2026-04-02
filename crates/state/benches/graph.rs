@@ -219,6 +219,88 @@ fn bench_update_edge_from_reserves(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark edge lookup via `update_edge_from_reserves` on a graph with 500+
+/// edges. This is the hot-path operation that benefits from the `edge_index`
+/// HashMap -- previously O(E) per update, now O(1).
+fn bench_edge_index_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("price_graph_edge_index_lookup");
+
+    for &n in &[500, 1000, 2000] {
+        let num_vertices = n / 2;
+        let mut g = PriceGraph::new(num_vertices);
+        let mut pool_ids = Vec::with_capacity(n);
+        let protocols = [
+            ProtocolType::UniswapV2,
+            ProtocolType::UniswapV3,
+            ProtocolType::SushiSwap,
+        ];
+
+        // Build a graph with `n` edges across multiple protocols.
+        for i in 0..n {
+            let from = i % num_vertices;
+            let to = (i + 1) % num_vertices;
+            let proto = protocols[i % protocols.len()];
+            let pid = PoolId {
+                address: Address::from_slice(&[
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    (i >> 8) as u8,
+                    (i & 0xff) as u8,
+                    proto as u8,
+                    0,
+                ]),
+                protocol: proto,
+            };
+            pool_ids.push((from, to, pid));
+            g.add_edge(
+                from,
+                to,
+                1.05,
+                pid,
+                pid.address,
+                proto,
+                U256::from(1_000_000u64),
+            );
+        }
+        g.clear_dirty();
+
+        group.bench_with_input(
+            BenchmarkId::new("update_reserves", n),
+            &pool_ids,
+            |b, pool_ids| {
+                b.iter(|| {
+                    for &(from, to, pid) in pool_ids.iter() {
+                        g.update_edge_from_reserves(from, to, pid, 1000.0, 2050.0, 0.997);
+                    }
+                    black_box(&g);
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("add_edge_update", n),
+            &pool_ids,
+            |b, pool_ids| {
+                b.iter(|| {
+                    for &(from, to, pid) in pool_ids.iter() {
+                        g.add_edge(
+                            from,
+                            to,
+                            1.06,
+                            pid,
+                            pid.address,
+                            pid.protocol,
+                            U256::from(2_000_000u64),
+                        );
+                    }
+                    black_box(&g);
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add_edge,
@@ -226,5 +308,6 @@ criterion_group!(
     bench_affected_vertices,
     bench_clear_dirty,
     bench_update_edge_from_reserves,
+    bench_edge_index_lookup,
 );
 criterion_main!(benches);

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use alloy::primitives::{Address, U256};
 use aether_common::types::{PoolId, ProtocolType};
 
@@ -33,6 +35,8 @@ pub struct PriceGraph {
     edges: Vec<Vec<PriceEdge>>,
     /// All edges in a flat list (used by Bellman-Ford which iterates all edges).
     all_edges: Vec<PriceEdge>,
+    /// O(1) lookup: `(from, to, pool_id)` -> index in `all_edges`.
+    edge_index: HashMap<(usize, usize, PoolId), usize>,
     /// Dirty flags per edge index -- only dirty edges need recomputation in
     /// partial Bellman-Ford scans.
     dirty: Vec<bool>,
@@ -45,6 +49,7 @@ impl PriceGraph {
             num_vertices,
             edges: vec![Vec::new(); num_vertices],
             all_edges: Vec::new(),
+            edge_index: HashMap::new(),
             dirty: Vec::new(),
         }
     }
@@ -86,12 +91,8 @@ impl PriceGraph {
         {
             existing.weight = weight;
             existing.liquidity = liquidity;
-            // Mirror the update in the flat edge list.
-            if let Some(idx) = self
-                .all_edges
-                .iter()
-                .position(|e| e.from == from && e.to == to && e.pool_id == pool_id)
-            {
+            // Mirror the update in the flat edge list via O(1) index lookup.
+            if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
                 self.all_edges[idx].weight = weight;
                 self.all_edges[idx].liquidity = liquidity;
                 if idx < self.dirty.len() {
@@ -100,7 +101,9 @@ impl PriceGraph {
             }
         } else {
             self.edges[from].push(edge.clone());
+            let idx = self.all_edges.len();
             self.all_edges.push(edge);
+            self.edge_index.insert((from, to, pool_id), idx);
             self.dirty.push(true);
         }
     }
@@ -132,11 +135,8 @@ impl PriceGraph {
             .find(|e| e.to == to && e.pool_id == pool_id)
         {
             existing.weight = -rate.ln();
-            if let Some(idx) = self
-                .all_edges
-                .iter()
-                .position(|e| e.from == from && e.to == to && e.pool_id == pool_id)
-            {
+            // Mirror the update in the flat edge list via O(1) index lookup.
+            if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
                 self.all_edges[idx].weight = existing.weight;
                 if idx < self.dirty.len() {
                     self.dirty[idx] = true;
@@ -218,6 +218,12 @@ impl PriceGraph {
             adj.retain(|e| &e.pool_id != pool_id);
         }
         self.all_edges.retain(|e| &e.pool_id != pool_id);
+        // Rebuild edge_index from scratch since indices shifted after retain.
+        self.edge_index.clear();
+        for (idx, edge) in self.all_edges.iter().enumerate() {
+            self.edge_index
+                .insert((edge.from, edge.to, edge.pool_id), idx);
+        }
         // Rebuild dirty flags to match the new all_edges length.
         self.dirty = vec![false; self.all_edges.len()];
     }
@@ -687,6 +693,92 @@ mod tests {
             total_weight < 0.0,
             "triangular arb with all rates > 1 should have negative cycle weight: {total_weight}"
         );
+    }
+
+    #[test]
+    fn test_edge_index_consistency() {
+        let mut g = PriceGraph::new(10);
+        let protocols = [
+            ProtocolType::UniswapV2,
+            ProtocolType::SushiSwap,
+            ProtocolType::Curve,
+        ];
+
+        // Add many edges across different pools and vertices.
+        for i in 0..8 {
+            for (k, &proto) in protocols.iter().enumerate() {
+                let j = (i + k + 1) % 10;
+                let pid = make_pool_id(((i * 3 + k) % 255) as u8, proto);
+                g.add_edge(
+                    i,
+                    j,
+                    1.05 + (k as f64) * 0.01,
+                    pid,
+                    Address::repeat_byte(((i * 3 + k) % 255) as u8),
+                    proto,
+                    U256::from(1_000u64),
+                );
+            }
+        }
+
+        // Verify every edge in all_edges is correctly indexed.
+        for (idx, edge) in g.all_edges().iter().enumerate() {
+            let key = (edge.from, edge.to, edge.pool_id);
+            assert_eq!(
+                g.edge_index.get(&key).copied(),
+                Some(idx),
+                "edge_index mismatch at all_edges[{idx}]"
+            );
+        }
+
+        // After removing a pool, the index must still be consistent.
+        let removed_pool = make_pool_id(0, ProtocolType::UniswapV2);
+        g.remove_pool_edges(&removed_pool);
+
+        for (idx, edge) in g.all_edges().iter().enumerate() {
+            let key = (edge.from, edge.to, edge.pool_id);
+            assert_eq!(
+                g.edge_index.get(&key).copied(),
+                Some(idx),
+                "edge_index mismatch after remove at all_edges[{idx}]"
+            );
+        }
+        // Removed pool should not appear in the index.
+        assert!(!g
+            .edge_index
+            .keys()
+            .any(|(_, _, pid)| pid == &removed_pool));
+    }
+
+    #[test]
+    fn test_edge_index_update_preserves_index() {
+        let mut g = PriceGraph::new(3);
+        let pool_id = make_pool_id(1, ProtocolType::UniswapV2);
+        g.add_edge(
+            0,
+            1,
+            2.0,
+            pool_id,
+            Address::repeat_byte(1),
+            ProtocolType::UniswapV2,
+            U256::from(1_000u64),
+        );
+
+        let idx_before = g.edge_index[&(0, 1, pool_id)];
+
+        // Update the same edge -- index should not change.
+        g.add_edge(
+            0,
+            1,
+            3.0,
+            pool_id,
+            Address::repeat_byte(1),
+            ProtocolType::UniswapV2,
+            U256::from(2_000u64),
+        );
+
+        assert_eq!(g.edge_index[&(0, 1, pool_id)], idx_before);
+        assert_eq!(g.num_edges(), 1);
     }
 
     #[test]
