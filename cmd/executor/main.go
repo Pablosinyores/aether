@@ -146,6 +146,13 @@ func main() {
 	}
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
+	if ethClient != nil {
+		gasOracle.SetClient(ethClient)
+		// Fetch real gas prices before first arb evaluation.
+		if _, err := gasOracle.FetchOnce(ctx); err != nil {
+			log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
+		}
+	}
 	submitter := NewSubmitter(cfg.BuilderConfigs)
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
