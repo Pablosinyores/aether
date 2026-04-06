@@ -49,7 +49,7 @@ impl PriceGraph {
             num_vertices,
             edges: vec![Vec::new(); num_vertices],
             all_edges: Vec::new(),
-            edge_index: HashMap::new(),
+            edge_index: HashMap::with_capacity(num_vertices * 2),
             dirty: Vec::new(),
         }
     }
@@ -95,6 +95,11 @@ impl PriceGraph {
             if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
                 self.all_edges[idx].weight = weight;
                 self.all_edges[idx].liquidity = liquidity;
+                debug_assert!(
+                    idx < self.dirty.len(),
+                    "edge index {idx} exceeds dirty bitvec len {}",
+                    self.dirty.len()
+                );
                 if idx < self.dirty.len() {
                     self.dirty[idx] = true;
                 }
@@ -138,6 +143,11 @@ impl PriceGraph {
             // Mirror the update in the flat edge list via O(1) index lookup.
             if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
                 self.all_edges[idx].weight = existing.weight;
+                debug_assert!(
+                    idx < self.dirty.len(),
+                    "edge index {idx} exceeds dirty bitvec len {}",
+                    self.dirty.len()
+                );
                 if idx < self.dirty.len() {
                     self.dirty[idx] = true;
                 }
