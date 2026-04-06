@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, RwLock};
+use arc_swap::ArcSwap;
+use tokio::sync::{broadcast, Mutex};
 use tracing::{debug, info, warn};
 
 use alloy::network::Ethereum;
@@ -20,6 +21,7 @@ use aether_simulator::calldata::build_execute_arb_calldata;
 use aether_simulator::fork::{ForkedState, RpcForkedState};
 use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
+use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
 
 // Import the proto ValidatedArb type from service module
@@ -95,20 +97,24 @@ pub struct AetherEngine {
     config: EngineConfig,
     /// Event channels for receiving pool updates and new blocks.
     event_channels: Arc<EventChannels>,
-    /// Shared price graph (wrapped in RwLock for concurrent access).
-    price_graph: Arc<RwLock<PriceGraph>>,
+    /// Writer-side mutable graph. Mutations go here, then publish to snapshot_manager.
+    working_graph: Mutex<PriceGraph>,
+    /// Reader-side lock-free snapshots for detection and external readers.
+    snapshot_manager: Arc<SnapshotManager>,
     /// Bellman-Ford detector.
     detector: BellmanFord,
     /// EVM simulator for validating arb profitability.
     simulator: EvmSimulator,
     /// Broadcast sender for validated arbs (connected to gRPC stream).
     arb_tx: broadcast::Sender<ProtoValidatedArb>,
-    /// Current block info.
-    current_block: Arc<RwLock<BlockInfo>>,
+    /// Current block info (lock-free via ArcSwap).
+    current_block: Arc<ArcSwap<BlockInfo>>,
     /// Bidirectional token address ↔ graph vertex index mapping.
-    token_index: Arc<RwLock<TokenIndex>>,
+    /// Writers clone-modify-swap; readers load() zero-copy.
+    token_index: Arc<ArcSwap<TokenIndex>>,
     /// Pool address → metadata mapping for event handling.
-    pool_registry: Arc<RwLock<HashMap<Address, PoolMetadata>>>,
+    /// Writers clone-modify-swap; readers load() zero-copy.
+    pool_registry: Arc<ArcSwap<HashMap<Address, PoolMetadata>>>,
     /// Optional type-erased alloy provider for RPC-backed simulation.
     /// When `Some`, `run_detection_cycle` uses `RpcForkedState` instead of
     /// the empty `ForkedState`.
@@ -185,18 +191,21 @@ impl AetherEngine {
         });
 
         // Start with a reasonable initial graph size (can grow dynamically).
-        let price_graph = Arc::new(RwLock::new(PriceGraph::new(100)));
+        let initial_graph = PriceGraph::new(100);
+        let snapshot_manager = Arc::new(SnapshotManager::new(initial_graph.clone()));
+        let working_graph = Mutex::new(initial_graph);
 
         Self {
             config,
             event_channels,
-            price_graph,
+            working_graph,
+            snapshot_manager,
             detector,
             simulator,
             arb_tx,
-            current_block: Arc::new(RwLock::new(BlockInfo::default())),
-            token_index: Arc::new(RwLock::new(TokenIndex::new())),
-            pool_registry: Arc::new(RwLock::new(HashMap::new())),
+            current_block: Arc::new(ArcSwap::from_pointee(BlockInfo::default())),
+            token_index: Arc::new(ArcSwap::from_pointee(TokenIndex::new())),
+            pool_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             rpc_provider,
             metrics,
         }
@@ -208,9 +217,9 @@ impl AetherEngine {
         &self.event_channels
     }
 
-    /// Get a reference to the current block info.
+    /// Get a reference to the current block info (lock-free ArcSwap).
     #[allow(dead_code)]
-    pub fn current_block(&self) -> &Arc<RwLock<BlockInfo>> {
+    pub fn current_block(&self) -> &Arc<ArcSwap<BlockInfo>> {
         &self.current_block
     }
 
@@ -225,10 +234,12 @@ impl AetherEngine {
         fee_bps: u32,
     ) {
         let (t0_idx, t1_idx, num_tokens) = {
-            let mut token_index = self.token_index.write().await;
-            let t0 = token_index.get_or_insert(token0);
-            let t1 = token_index.get_or_insert(token1);
-            (t0, t1, token_index.len())
+            let mut ti = (**self.token_index.load()).clone();
+            let t0 = ti.get_or_insert(token0);
+            let t1 = ti.get_or_insert(token1);
+            let len = ti.len();
+            self.token_index.store(Arc::new(ti));
+            (t0, t1, len)
         };
 
         let pool_id = PoolId {
@@ -246,13 +257,14 @@ impl AetherEngine {
         };
 
         {
-            let mut registry = self.pool_registry.write().await;
-            registry.insert(pool_addr, metadata);
+            let mut reg = (**self.pool_registry.load()).clone();
+            reg.insert(pool_addr, metadata);
+            self.pool_registry.store(Arc::new(reg));
         }
 
-        // Ensure graph can hold the new vertices and add placeholder edges.
+        // Ensure graph can hold the new vertices, add placeholder edges, then publish.
         {
-            let mut graph = self.price_graph.write().await;
+            let mut graph = self.working_graph.lock().await;
             graph.resize(num_tokens);
             // Placeholder edges with rate 1.0 (neutral weight = 0).
             graph.add_edge(
@@ -273,6 +285,8 @@ impl AetherEngine {
                 protocol,
                 U256::ZERO,
             );
+            // Snapshot is published by callers (fetch_initial_reserves, handle_pool_update)
+            // after batch operations, not per-registration, to avoid O(N) clones on startup.
         }
 
         debug!(
@@ -384,12 +398,9 @@ impl AetherEngine {
             };
 
             // Check for duplicate pool address.
-            {
-                let registry = self.pool_registry.read().await;
-                if registry.contains_key(&pool_addr) {
-                    warn!(index = i, %pool_addr, "Duplicate pool address, skipping");
-                    continue;
-                }
+            if self.pool_registry.load().contains_key(&pool_addr) {
+                warn!(index = i, %pool_addr, "Duplicate pool address, skipping");
+                continue;
             }
 
             self.register_pool(pool_addr, token0, token1, protocol, entry.fee_bps)
@@ -422,9 +433,9 @@ impl AetherEngine {
             }
         };
 
-        // Collect pool metadata snapshot to avoid holding the lock during RPC calls.
+        // Collect pool metadata snapshot to avoid holding the guard during RPC calls.
         let pools: Vec<(Address, PoolMetadata)> = {
-            let registry = self.pool_registry.read().await;
+            let registry = self.pool_registry.load();
             registry.iter().map(|(a, m)| (*a, m.clone())).collect()
         };
 
@@ -505,61 +516,69 @@ impl AetherEngine {
             });
         }
 
-        // Collect results and apply to the price graph.
-        let mut fetched: u32 = 0;
-
+        // Collect all RPC results first (concurrently), then apply to the graph
+        // in a single lock acquisition and publish one snapshot.
+        let mut all_results: Vec<ReserveResult> = Vec::with_capacity(pools.len());
         while let Some(result) = join_set.join_next().await {
-            let reserve = match result {
-                Ok(r) => r,
+            match result {
+                Ok(r) => all_results.push(r),
                 Err(e) => {
                     warn!(error = %e, "Reserve fetch task panicked");
-                    continue;
                 }
-            };
-
-            match reserve {
-                ReserveResult::V2 { pool_addr, meta, r0, r1 } => {
-                    let r0_f = u256_to_f64(r0);
-                    let r1_f = u256_to_f64(r1);
-                    if r0_f > 0.0 && r1_f > 0.0 {
-                        let fee = meta.fee_factor();
-                        let mut graph = self.price_graph.write().await;
-                        graph.update_edge_from_reserves(
-                            meta.token0_idx, meta.token1_idx,
-                            meta.pool_id, r0_f, r1_f, fee,
-                        );
-                        graph.update_edge_from_reserves(
-                            meta.token1_idx, meta.token0_idx,
-                            meta.pool_id, r1_f, r0_f, fee,
-                        );
-                        fetched += 1;
-                        debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
-                    }
-                }
-                ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 } => {
-                    const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
-                    let sqrt_f64 = u256_to_f64(sqrt_price_x96);
-                    let price = (sqrt_f64 / TWO_POW_96).powi(2);
-                    if price > 0.0 {
-                        let fee = meta.fee_factor();
-                        let liq = U256::ZERO;
-                        let mut graph = self.price_graph.write().await;
-                        graph.add_edge(
-                            meta.token0_idx, meta.token1_idx,
-                            price * fee, meta.pool_id, pool_addr,
-                            meta.protocol, liq,
-                        );
-                        graph.add_edge(
-                            meta.token1_idx, meta.token0_idx,
-                            (1.0 / price) * fee, meta.pool_id, pool_addr,
-                            meta.protocol, liq,
-                        );
-                        fetched += 1;
-                        debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
-                    }
-                }
-                ReserveResult::Skipped => {}
             }
+        }
+
+        let mut fetched: u32 = 0;
+        {
+            let mut graph = self.working_graph.lock().await;
+            for reserve in all_results {
+                match reserve {
+                    ReserveResult::V2 { pool_addr, meta, r0, r1 } => {
+                        let r0_f = u256_to_f64(r0);
+                        let r1_f = u256_to_f64(r1);
+                        if r0_f > 0.0 && r1_f > 0.0 {
+                            let fee = meta.fee_factor();
+                            graph.update_edge_from_reserves(
+                                meta.token0_idx, meta.token1_idx,
+                                meta.pool_id, r0_f, r1_f, fee,
+                            );
+                            graph.update_edge_from_reserves(
+                                meta.token1_idx, meta.token0_idx,
+                                meta.pool_id, r1_f, r0_f, fee,
+                            );
+                            fetched += 1;
+                            debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
+                        }
+                    }
+                    ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 } => {
+                        const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+                        let sqrt_f64 = u256_to_f64(sqrt_price_x96);
+                        let price = (sqrt_f64 / TWO_POW_96).powi(2);
+                        if price > 0.0 {
+                            let fee = meta.fee_factor();
+                            let liq = U256::ZERO;
+                            graph.add_edge(
+                                meta.token0_idx, meta.token1_idx,
+                                price * fee, meta.pool_id, pool_addr,
+                                meta.protocol, liq,
+                            );
+                            graph.add_edge(
+                                meta.token1_idx, meta.token0_idx,
+                                (1.0 / price) * fee, meta.pool_id, pool_addr,
+                                meta.protocol, liq,
+                            );
+                            fetched += 1;
+                            debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
+                        }
+                    }
+                    ReserveResult::Skipped => {}
+                }
+            }
+
+            // Publish the updated snapshot with current block context.
+            let block = self.current_block.load();
+            self.snapshot_manager
+                .publish(graph.clone(), block.number, block.timestamp as i64);
         }
 
         info!(fetched, total = pools.len(), "Initial reserve fetch complete");
@@ -600,13 +619,11 @@ impl AetherEngine {
         debug!(block = event.block_number, "Processing new block");
         self.metrics.inc_blocks_processed();
 
-        // Update current block info.
-        {
-            let mut block = self.current_block.write().await;
-            block.number = event.block_number;
-            block.timestamp = event.timestamp;
-            block.base_fee = event.base_fee;
-        }
+        self.current_block.store(Arc::new(BlockInfo {
+            number: event.block_number,
+            timestamp: event.timestamp,
+            base_fee: event.base_fee,
+        }));
 
         // Run detection on the price graph.
         self.run_detection_cycle().await;
@@ -624,10 +641,7 @@ impl AetherEngine {
                 debug!(%pool, ?protocol, "Pool reserve update");
 
                 // Look up pool metadata to get graph vertex indices.
-                let meta = {
-                    let registry = self.pool_registry.read().await;
-                    registry.get(&pool).cloned()
-                };
+                let meta = self.pool_registry.load().get(&pool).cloned();
 
                 if let Some(meta) = meta {
                     let r0 = u256_to_f64(reserve0);
@@ -635,7 +649,7 @@ impl AetherEngine {
 
                     if r0 > 0.0 && r1 > 0.0 {
                         let fee = meta.fee_factor();
-                        let mut graph = self.price_graph.write().await;
+                        let mut graph = self.working_graph.lock().await;
                         graph.update_edge_from_reserves(
                             meta.token0_idx,
                             meta.token1_idx,
@@ -652,6 +666,9 @@ impl AetherEngine {
                             r0,
                             fee,
                         );
+                        let block = self.current_block.load();
+                        self.snapshot_manager
+                            .publish(graph.clone(), block.number, block.timestamp as i64);
                     }
                 }
             }
@@ -663,10 +680,7 @@ impl AetherEngine {
             } => {
                 debug!(%pool, %sqrt_price_x96, liquidity, "V3 pool update");
 
-                let meta = {
-                    let registry = self.pool_registry.read().await;
-                    registry.get(&pool).cloned()
-                };
+                let meta = self.pool_registry.load().get(&pool).cloned();
 
                 if let Some(meta) = meta {
                     // price = (sqrt_price_x96 / 2^96)^2
@@ -677,7 +691,7 @@ impl AetherEngine {
                     if price > 0.0 {
                         let fee = meta.fee_factor();
                         let liq = U256::from(liquidity);
-                        let mut graph = self.price_graph.write().await;
+                        let mut graph = self.working_graph.lock().await;
                         graph.add_edge(
                             meta.token0_idx,
                             meta.token1_idx,
@@ -696,6 +710,9 @@ impl AetherEngine {
                             meta.protocol,
                             liq,
                         );
+                        let block = self.current_block.load();
+                        self.snapshot_manager
+                            .publish(graph.clone(), block.number, block.timestamp as i64);
                     }
                 }
             }
@@ -708,6 +725,11 @@ impl AetherEngine {
                 // Default to UniswapV2 with 30 bps fee (most PairCreated events).
                 self.register_pool(pool, token0, token1, ProtocolType::UniswapV2, 30)
                     .await;
+                // Publish snapshot after registration so edges are visible to detection.
+                let graph = self.working_graph.lock().await;
+                let block = self.current_block.load();
+                self.snapshot_manager
+                    .publish(graph.clone(), block.number, block.timestamp as i64);
             }
         }
     }
@@ -716,9 +738,10 @@ impl AetherEngine {
     async fn run_detection_cycle(&self) {
         let t_cycle = Instant::now();
 
-        // Phase 1: Detect cycles and extract candidate data under read locks.
+        // Phase 1: Detect cycles and extract candidate data from lock-free snapshot.
         let candidates = {
-            let graph = self.price_graph.read().await;
+            let snapshot = self.snapshot_manager.load();
+            let graph = &snapshot.graph;
 
             if !graph.has_dirty_edges() && graph.num_edges() == 0 {
                 return;
@@ -730,26 +753,35 @@ impl AetherEngine {
             let t_detect = Instant::now();
             let cycles = if affected.is_empty() {
                 // Full scan (e.g., on first run).
-                self.detector.detect_negative_cycles(&graph)
+                self.detector.detect_negative_cycles(graph)
             } else {
-                self.detector.detect_from_affected(&graph, &affected)
+                self.detector.detect_from_affected(graph, &affected)
             };
             let detect_us = t_detect.elapsed().as_micros();
             self.metrics.observe_detection_latency_us(detect_us);
-            info!(detect_us, "Bellman-Ford detection complete");
+            info!(
+                detect_us,
+                snapshot_version = snapshot.version,
+                "Bellman-Ford detection complete"
+            );
             self.metrics.inc_cycles_detected(cycles.len() as u64);
 
             if cycles.is_empty() {
-                drop(graph);
-                let mut graph = self.price_graph.write().await;
+                // Clear dirty on working graph and publish clean snapshot.
+                let mut graph = self.working_graph.lock().await;
                 graph.clear_dirty();
+                self.snapshot_manager.publish(
+                    graph.clone(),
+                    snapshot.block_number,
+                    snapshot.timestamp_ns,
+                );
                 return;
             }
 
             debug!(count = cycles.len(), "Detected negative cycles");
 
-            let token_index = self.token_index.read().await;
-            let pool_registry = self.pool_registry.read().await;
+            let token_index = self.token_index.load();
+            let pool_registry = self.pool_registry.load();
             let mut candidates = Vec::new();
 
             for cycle in &cycles {
@@ -884,7 +916,7 @@ impl AetherEngine {
         let t_phase2 = Instant::now();
         let mut sim_count: u32 = 0;
         let mut sim_success: u32 = 0;
-        let block_info = self.current_block.read().await.clone();
+        let block_info = (**self.current_block.load()).clone();
 
         for candidate in &candidates {
             // Estimate total gas.
@@ -1090,9 +1122,10 @@ impl AetherEngine {
         let phase2_us = t_phase2.elapsed().as_micros();
         let total_cycle_us = t_cycle.elapsed().as_micros();
 
-        // Phase 3: Clear dirty flags.
-        let mut graph = self.price_graph.write().await;
+        // Phase 3: Clear dirty flags on working graph and publish clean snapshot.
+        let mut graph = self.working_graph.lock().await;
         graph.clear_dirty();
+        self.snapshot_manager.publish(graph.clone(), block_info.number, block_info.timestamp as i64);
 
         info!(
             total_cycle_us,
@@ -1113,14 +1146,20 @@ impl AetherEngine {
 
     /// Get a reference to the token index.
     #[allow(dead_code)]
-    pub fn token_index(&self) -> &Arc<RwLock<TokenIndex>> {
+    pub fn token_index(&self) -> &Arc<ArcSwap<TokenIndex>> {
         &self.token_index
     }
 
     /// Get a reference to the pool registry.
     #[allow(dead_code)]
-    pub fn pool_registry(&self) -> &Arc<RwLock<HashMap<Address, PoolMetadata>>> {
+    pub fn pool_registry(&self) -> &Arc<ArcSwap<HashMap<Address, PoolMetadata>>> {
         &self.pool_registry
+    }
+
+    /// Get a reference to the snapshot manager.
+    #[allow(dead_code)]
+    pub fn snapshot_manager(&self) -> &Arc<SnapshotManager> {
+        &self.snapshot_manager
     }
 }
 
@@ -1211,7 +1250,7 @@ mod tests {
 
         engine.handle_new_block(block_event).await;
 
-        let block = engine.current_block().read().await;
+        let block = engine.current_block().load();
         assert_eq!(block.number, 18_500_000);
         assert_eq!(block.timestamp, 1_700_500_000);
         assert_eq!(block.base_fee, 25_000_000_000);
@@ -1253,7 +1292,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Verify block was processed.
-        let block = engine.current_block().read().await;
+        let block = engine.current_block().load();
         assert_eq!(block.number, 19_000_000);
 
         // Shutdown.
@@ -1388,20 +1427,21 @@ mod tests {
             .await;
 
         // Verify token index has both tokens.
-        let ti = engine.token_index.read().await;
+        let ti = engine.token_index.load();
         assert_eq!(ti.len(), 2);
         assert!(ti.contains(&token0));
         assert!(ti.contains(&token1));
 
         // Verify pool registry has the pool.
-        let reg = engine.pool_registry.read().await;
+        let reg = engine.pool_registry.load();
         assert!(reg.contains_key(&pool));
         let meta = reg.get(&pool).unwrap();
         assert_eq!(meta.protocol, ProtocolType::UniswapV2);
         assert_eq!(meta.fee_bps, 30);
 
-        // Verify graph has 2 edges (bidirectional).
-        let graph = engine.price_graph.read().await;
+        // Verify working graph has 2 edges (bidirectional).
+        // Note: register_pool does not publish to snapshot (deferred to batch callers).
+        let graph = engine.working_graph.lock().await;
         assert_eq!(graph.num_edges(), 2);
     }
 
@@ -1421,8 +1461,9 @@ mod tests {
 
         // Clear dirty from registration.
         {
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
             graph.clear_dirty();
+            engine.snapshot_manager.publish(graph.clone(), 0, 0);
         }
 
         // Send a reserve update.
@@ -1434,9 +1475,9 @@ mod tests {
         };
         engine.handle_pool_update(event).await;
 
-        // Graph should be dirty after the update.
-        let graph = engine.price_graph.read().await;
-        assert!(graph.has_dirty_edges());
+        // Snapshot should be dirty after the update.
+        let snapshot = engine.snapshot_manager.load();
+        assert!(snapshot.graph.has_dirty_edges());
     }
 
     #[tokio::test]
@@ -1454,8 +1495,9 @@ mod tests {
             .await;
 
         {
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
             graph.clear_dirty();
+            engine.snapshot_manager.publish(graph.clone(), 0, 0);
         }
 
         // Send a V3 update with a realistic sqrt_price_x96.
@@ -1469,8 +1511,8 @@ mod tests {
         };
         engine.handle_pool_update(event).await;
 
-        let graph = engine.price_graph.read().await;
-        assert!(graph.has_dirty_edges());
+        let snapshot = engine.snapshot_manager.load();
+        assert!(snapshot.graph.has_dirty_edges());
     }
 
     #[tokio::test]
@@ -1490,7 +1532,7 @@ mod tests {
         engine.handle_pool_update(event).await;
 
         // Should have auto-registered.
-        let reg = engine.pool_registry.read().await;
+        let reg = engine.pool_registry.load();
         assert!(reg.contains_key(&pool));
         let meta = reg.get(&pool).unwrap();
         assert_eq!(meta.protocol, ProtocolType::UniswapV2);
@@ -1530,13 +1572,13 @@ mod tests {
         // Set exchange rates that create a profitable cycle.
         // A→B rate=1.5, B→C rate=1.5, C→A rate=1.5 → product=3.375 > 1.
         {
-            let reg = engine.pool_registry.read().await;
+            let reg = engine.pool_registry.load();
             let meta_ab = reg.get(&pool_ab).unwrap().clone();
             let meta_bc = reg.get(&pool_bc).unwrap().clone();
             let meta_ca = reg.get(&pool_ca).unwrap().clone();
             drop(reg);
 
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
             graph.add_edge(
                 meta_ab.token0_idx,
                 meta_ab.token1_idx,
@@ -1564,15 +1606,15 @@ mod tests {
                 ProtocolType::Curve,
                 U256::from(1_000_000u64),
             );
+            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000);
         }
 
         // Set a block so the detection cycle has context.
-        {
-            let mut block = engine.current_block.write().await;
-            block.number = 18_000_000;
-            block.timestamp = 1_700_000_000;
-            block.base_fee = 0;
-        }
+        engine.current_block.store(Arc::new(BlockInfo {
+            number: 18_000_000,
+            timestamp: 1_700_000_000,
+            base_fee: 0,
+        }));
 
         // Run detection cycle.
         engine.run_detection_cycle().await;
@@ -1580,8 +1622,8 @@ mod tests {
         // The EVM treats calls to Address::ZERO (no code) as a success,
         // so the simulation passes and the arb gets published.
         // Check that dirty flags were cleared.
-        let graph = engine.price_graph.read().await;
-        assert!(!graph.has_dirty_edges());
+        let snapshot = engine.snapshot_manager.load();
+        assert!(!snapshot.graph.has_dirty_edges());
 
         // With zero gas cost and zero profit threshold, the profitable cycle
         // should be detected, simulated (success on empty account), and published.
@@ -1624,7 +1666,7 @@ mod tests {
 
         // 2. Verify all real pools are registered with correct metadata.
         {
-            let registry = engine.pool_registry.read().await;
+            let registry = engine.pool_registry.load();
             assert_eq!(registry.len(), 3);
 
             let meta_v2 = registry.get(&uni_v2_pool).expect("Uniswap V2 pool should be registered");
@@ -1647,13 +1689,13 @@ mod tests {
         //    Sushi:  WETH→USDC = 2100 (expensive WETH) — the arb sells here
         //    V3:     USDC→WETH = 2050 (mid price, creates cycle opportunity)
         {
-            let reg = engine.pool_registry.read().await;
+            let reg = engine.pool_registry.load();
             let meta_v2 = reg.get(&uni_v2_pool).unwrap().clone();
             let meta_sushi = reg.get(&sushi_pool).unwrap().clone();
             let meta_v3 = reg.get(&uni_v3_pool).unwrap().clone();
             drop(reg);
 
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
 
             // Uni V2: USDC→WETH at 1/2000, WETH→USDC at 2000
             graph.add_edge(
@@ -1690,15 +1732,15 @@ mod tests {
                 2050.0, meta_v3.pool_id, uni_v3_pool,
                 ProtocolType::UniswapV3, U256::from(1_000_000u64),
             );
+            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000);
         }
 
         // 4. Set a recent block so detection has context.
-        {
-            let mut block = engine.current_block.write().await;
-            block.number = 18_000_000;
-            block.timestamp = 1_700_000_000;
-            block.base_fee = 0;
-        }
+        engine.current_block.store(Arc::new(BlockInfo {
+            number: 18_000_000,
+            timestamp: 1_700_000_000,
+            base_fee: 0,
+        }));
 
         // 5. Run detection cycle.
         engine.run_detection_cycle().await;
@@ -1836,13 +1878,13 @@ fee_bps = 30
             .await;
 
         {
-            let reg = engine.pool_registry.read().await;
+            let reg = engine.pool_registry.load();
             let meta_ab = reg.get(&pool_ab).unwrap().clone();
             let meta_bc = reg.get(&pool_bc).unwrap().clone();
             let meta_ca = reg.get(&pool_ca).unwrap().clone();
             drop(reg);
 
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
             graph.add_edge(
                 meta_ab.token0_idx,
                 meta_ab.token1_idx,
@@ -1873,10 +1915,17 @@ fee_bps = 30
         }
 
         {
-            let mut block = engine.current_block.write().await;
+            let mut block = (**engine.current_block.load()).clone();
             block.number = 18_000_000;
             block.timestamp = 1_700_000_000;
             block.base_fee = 0;
+            engine.current_block.store(Arc::new(block));
+        }
+
+        // Publish the working graph as a snapshot so run_detection_cycle can read it.
+        {
+            let graph = engine.working_graph.lock().await;
+            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000_000_000_000);
         }
 
         engine.run_detection_cycle().await;
@@ -2121,14 +2170,14 @@ fee_bps = 30
         let r_ca_out = 1000.0_f64 * 1e18;
 
         {
-            let reg = engine.pool_registry.read().await;
+            let reg = engine.pool_registry.load();
             let meta_ab = reg.get(&pool_ab).unwrap().clone();
             let meta_bc = reg.get(&pool_bc).unwrap().clone();
             let meta_ca = reg.get(&pool_ca).unwrap().clone();
             drop(reg);
 
             let fee = 0.997;
-            let mut graph = engine.price_graph.write().await;
+            let mut graph = engine.working_graph.lock().await;
 
             // Set rates from reserves and populate reserve fields.
             graph.add_edge(meta_ab.token0_idx, meta_ab.token1_idx,
@@ -2154,10 +2203,17 @@ fee_bps = 30
         }
 
         {
-            let mut block = engine.current_block.write().await;
+            let mut block = (**engine.current_block.load()).clone();
             block.number = 18_000_000;
             block.timestamp = 1_700_000_000;
             block.base_fee = 0;
+            engine.current_block.store(Arc::new(block));
+        }
+
+        // Publish the working graph as a snapshot so run_detection_cycle can read it.
+        {
+            let graph = engine.working_graph.lock().await;
+            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000_000_000_000);
         }
 
         engine.run_detection_cycle().await;

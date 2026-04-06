@@ -350,7 +350,7 @@ impl ControlService for ControlServiceImpl {
         // Set active_pools to the actual registry size, not an increment,
         // so the count stays accurate across multiple reloads.
         let actual_count = {
-            let registry = self.engine.pool_registry().read().await;
+            let registry = self.engine.pool_registry().load();
             registry.len() as u32
         };
         {

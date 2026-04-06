@@ -19,6 +19,7 @@ aether-state = { path = "../state" }
 aether-detector = { path = "../detector" }
 aether-simulator = { path = "../simulator" }
 alloy = { workspace = true }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
