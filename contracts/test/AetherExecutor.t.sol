@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {AetherExecutor} from "../src/AetherExecutor.sol";
 
 /// @dev Mock Aave pool that reverts on flashLoanSimple (used to test FlashLoanFailed)
@@ -39,6 +40,115 @@ contract MockERC20 {
         balanceOf[to] += amount;
         allowance[from][msg.sender] -= amount;
         return true;
+    }
+}
+
+/// @dev Mock UniV2 pair — expects tokens pre-transferred, calls swap to send output
+contract MockV2Pool {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    /// @dev UniswapV2Pair.swap — tokens already transferred in, just send output
+    fallback() external {
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
+/// @dev Mock UniV3 pool — calls uniswapV3SwapCallback on msg.sender to pull tokenIn
+contract MockV3Pool {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountIn;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountIn, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountIn = _amountIn;
+        amountOut = _amountOut;
+    }
+
+    /// @dev On any call, invoke uniswapV3SwapCallback then send output tokens
+    fallback() external {
+        bytes memory callbackData = abi.encodeWithSignature(
+            "uniswapV3SwapCallback(int256,int256,bytes)",
+            int256(amountIn),
+            int256(0),
+            ""
+        );
+        (bool success,) = msg.sender.call(callbackData);
+        require(success, "V3 callback failed");
+
+        require(tokenIn.balanceOf(address(this)) >= amountIn, "V3: tokens not received");
+
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
+/// @dev Mock Curve pool — pulls tokenIn via transferFrom, sends tokenOut
+contract MockCurvePool {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        uint256 approved = tokenIn.allowance(msg.sender, address(this));
+        require(approved > 0, "Curve: no approval");
+        tokenIn.transferFrom(msg.sender, address(this), approved);
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
+/// @dev Mock Balancer Vault — pulls tokenIn via transferFrom, sends tokenOut
+contract MockBalancerVault {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        uint256 approved = tokenIn.allowance(msg.sender, address(this));
+        require(approved > 0, "Balancer: no approval");
+        tokenIn.transferFrom(msg.sender, address(this), approved);
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
+/// @dev Mock Bancor router — pulls tokenIn via transferFrom, sends tokenOut
+contract MockBancorRouter {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        uint256 approved = tokenIn.allowance(msg.sender, address(this));
+        require(approved > 0, "Bancor: no approval");
+        tokenIn.transferFrom(msg.sender, address(this), approved);
+        tokenOut.transfer(msg.sender, amountOut);
     }
 }
 
@@ -142,12 +252,21 @@ contract AetherExecutorTest is Test {
     AetherExecutor executor;
     MockERC20 token;
     MockERC20 token2;
-    address constant AAVE_POOL = address(0xAA);
+    MockAavePool aavePool;
     address owner;
+
+    // Protocol constants (must match contract)
+    uint8 constant UNISWAP_V2 = 1;
+    uint8 constant UNISWAP_V3 = 2;
+    uint8 constant SUSHISWAP = 3;
+    uint8 constant CURVE = 4;
+    uint8 constant BALANCER_V2 = 5;
+    uint8 constant BANCOR_V3 = 6;
 
     function setUp() public {
         owner = address(this);
-        executor = new AetherExecutor(AAVE_POOL);
+        aavePool = new MockAavePool();
+        executor = new AetherExecutor(address(aavePool));
         token = new MockERC20();
         token2 = new MockERC20();
     }
@@ -161,7 +280,7 @@ contract AetherExecutorTest is Test {
     }
 
     function test_aavePool() public view {
-        assertEq(executor.aavePool(), AAVE_POOL);
+        assertEq(executor.aavePool(), address(aavePool));
     }
 
     // -------------------------------------------------------------------------
@@ -242,7 +361,7 @@ contract AetherExecutorTest is Test {
 
     function test_executeOperation_revert_invalidInitiator() public {
         // Called from the correct Aave pool address but with a foreign initiator
-        vm.prank(AAVE_POOL);
+        vm.prank(address(aavePool));
         vm.expectRevert(AetherExecutor.InvalidInitiator.selector);
         executor.executeOperation(address(token), 1000, 5, address(0xDEAD), "");
     }
@@ -255,11 +374,11 @@ contract AetherExecutorTest is Test {
         address[] memory tokens = new address[](1);
         address[] memory spenders = new address[](1);
         tokens[0] = address(token);
-        spenders[0] = AAVE_POOL;
+        spenders[0] = address(aavePool);
 
         executor.setApprovals(tokens, spenders);
 
-        assertEq(token.allowance(address(executor), AAVE_POOL), type(uint256).max);
+        assertEq(token.allowance(address(executor), address(aavePool)), type(uint256).max);
     }
 
     function test_setApprovals_multiple() public {
@@ -267,12 +386,12 @@ contract AetherExecutorTest is Test {
         address[] memory spenders = new address[](2);
         tokens[0] = address(token);
         tokens[1] = address(token2);
-        spenders[0] = AAVE_POOL;
+        spenders[0] = address(aavePool);
         spenders[1] = address(0xBB);
 
         executor.setApprovals(tokens, spenders);
 
-        assertEq(token.allowance(address(executor), AAVE_POOL), type(uint256).max);
+        assertEq(token.allowance(address(executor), address(aavePool)), type(uint256).max);
         assertEq(token2.allowance(address(executor), address(0xBB)), type(uint256).max);
     }
 
@@ -280,7 +399,7 @@ contract AetherExecutorTest is Test {
         address[] memory tokens = new address[](1);
         address[] memory spenders = new address[](1);
         tokens[0] = address(token);
-        spenders[0] = AAVE_POOL;
+        spenders[0] = address(aavePool);
 
         vm.prank(address(0x456));
         vm.expectRevert(AetherExecutor.NotOwner.selector);
@@ -314,9 +433,9 @@ contract AetherExecutorTest is Test {
         vm.expectRevert(AetherExecutor.TipBpsTooHigh.selector);
         executor.executeArb(steps, address(token), 1000, 10001);
         // 10000 does NOT revert with TipBpsTooHigh (call proceeds past the check)
-        // The low-level call to the mock AAVE_POOL (an EOA) succeeds silently,
-        // which is fine for this boundary check — the full flow is tested elsewhere
-        executor.executeArb(steps, address(token), 1000, 10000);
+        // Use an EOA-backed executor so the flashLoan call succeeds silently
+        AetherExecutor eoaExecutor = new AetherExecutor(address(0xAA));
+        eoaExecutor.executeArb(steps, address(token), 1000, 10000);
     }
 
     function testFuzz_tipBps_tooHigh(uint256 tipBps) public {
@@ -356,7 +475,7 @@ contract AetherExecutorTest is Test {
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
             amountIn: flashloanAmount,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()") // triggers fallback
         });
 
@@ -411,7 +530,7 @@ contract AetherExecutorTest is Test {
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
             amountIn: flashloanAmount,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()")
         });
 
@@ -446,7 +565,7 @@ contract AetherExecutorTest is Test {
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
             amountIn: flashloanAmount,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()")
         });
 
@@ -532,7 +651,7 @@ contract AetherExecutorTest is Test {
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
             amountIn: flashloanAmount,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()")
         });
 
@@ -582,7 +701,7 @@ contract AetherExecutorTest is Test {
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
             amountIn: 100_000,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()")
         });
     }
@@ -613,7 +732,7 @@ contract AetherExecutorTest is Test {
             tokenIn: wethAddr,
             tokenOut: wethAddr,
             amountIn: 100_000,
-            minAmountOut: swapOut,
+            minAmountOut: 1,
             data: abi.encodeWithSignature("swap()")
         });
     }
@@ -627,7 +746,7 @@ contract AetherExecutorTest is Test {
         address[] memory spenders = new address[](1);
         tokens[0] = address(token);
         tokens[1] = address(token2);
-        spenders[0] = AAVE_POOL;
+        spenders[0] = address(aavePool);
 
         vm.expectRevert(AetherExecutor.ArrayLengthMismatch.selector);
         executor.setApprovals(tokens, spenders);
@@ -652,5 +771,411 @@ contract AetherExecutorTest is Test {
         address[] memory spenders = new address[](0);
         // Should not revert
         executor.setApprovals(tokens, spenders);
+    }
+
+    // -------------------------------------------------------------------------
+    // UniV2/Sushi swap tests (pre-transfer pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapUniV2_preTransferPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000; // 0.05%
+
+        // Create mock V2 pool with sufficient output tokens
+        MockV2Pool pool = new MockV2Pool(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(pool), swapOut);
+
+        // Build swap step — V2 swap(uint,uint,address,bytes)
+        bytes memory swapData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            swapOut,
+            address(executor),
+            ""
+        );
+
+        // Build a two-step arb: tokenIn -> tokenOut (V2), tokenOut -> tokenIn (V2 again for repay)
+        // Simpler: single-step with flash loan in tokenOut (so profit is in tokenOut after step)
+        // Simplest: use tokenIn as the flash loan token
+        // Step 1: swap tokenIn -> tokenOut via V2
+
+        // We need the executor to end with more tokenIn than it borrowed
+        // So: flash borrow tokenIn, swap to tokenOut, swap back to tokenIn with profit
+
+        // For simplicity, let's do a single-step with a second pool for the return
+        uint256 returnAmount = flashAmount + premium + 10; // enough to repay + profit
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(executor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(pool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: swapData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        // Verify: pool should receive tokens via transfer (not transferFrom)
+        // Before the swap, pool has 0 tokenIn; after, it has flashAmount
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Check pool received tokenIn via direct transfer
+        assertEq(tokenIn.balanceOf(address(pool)), flashAmount);
+        // Check owner received profit
+        assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // UniV3 swap tests (callback pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapUniV3_callbackPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Create V3 pool
+        MockV3Pool v3Pool = new MockV3Pool(tokenIn, tokenOut, flashAmount, swapOut);
+        tokenOut.mint(address(v3Pool), swapOut);
+
+        // Create return pool (V2 to simplify — swap tokenOut back to tokenIn)
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        // V3 swap calldata (arbitrary — mock uses fallback)
+        bytes memory v3SwapData = abi.encodeWithSignature(
+            "swap(address,bool,int256,uint160,bytes)",
+            address(executor),
+            true,
+            int256(flashAmount),
+            uint160(0),
+            ""
+        );
+
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(executor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V3,
+            pool: address(v3Pool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: v3SwapData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // V3 pool received tokens via callback (not pre-transfer)
+        assertEq(tokenIn.balanceOf(address(v3Pool)), flashAmount);
+        // Owner received profit
+        assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    function test_uniV3Callback_revert_notPendingPool() public {
+        // Calling uniswapV3SwapCallback from a non-pool address should revert
+        vm.prank(address(0xDEAD));
+        vm.expectRevert(AetherExecutor.NotPendingV3Pool.selector);
+        executor.uniswapV3SwapCallback(int256(100), int256(0), "");
+    }
+
+    // -------------------------------------------------------------------------
+    // Curve swap tests (approve + pull pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapCurve_pullPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Create Curve pool
+        MockCurvePool curvePool = new MockCurvePool(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(curvePool), swapOut);
+
+        // Return pool
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory curveData = abi.encodeWithSignature(
+            "exchange(int128,int128,uint256,uint256)",
+            int128(0),
+            int128(1),
+            flashAmount,
+            swapOut
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(executor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: CURVE,
+            pool: address(curvePool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: curveData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Curve pool pulled tokens via transferFrom (approve+pull pattern)
+        assertEq(tokenIn.balanceOf(address(curvePool)), flashAmount);
+        // Approval should be reset to 0 after swap
+        assertEq(tokenIn.allowance(address(executor), address(curvePool)), 0);
+        // Owner received profit
+        assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Balancer swap tests (Vault approve + pull pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapBalancer_vaultPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Create Balancer Vault
+        MockBalancerVault vault = new MockBalancerVault(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(vault), swapOut);
+
+        // Return pool
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory balancerData = abi.encodeWithSignature(
+            "swap(bytes32,address,address,uint256,uint256)",
+            bytes32(0),
+            address(tokenIn),
+            address(tokenOut),
+            flashAmount,
+            swapOut
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(executor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: BALANCER_V2,
+            pool: address(vault),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: balancerData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Vault pulled tokens via transferFrom
+        assertEq(tokenIn.balanceOf(address(vault)), flashAmount);
+        // Approval reset to 0
+        assertEq(tokenIn.allowance(address(executor), address(vault)), 0);
+        // Owner received profit
+        assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bancor swap tests (approve + pull pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapBancor_pullPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Create Bancor router
+        MockBancorRouter bancor = new MockBancorRouter(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(bancor), swapOut);
+
+        // Return pool
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory bancorData = abi.encodeWithSignature(
+            "tradeBySourceAmount(address,address,uint256,uint256,uint256,address)",
+            address(tokenIn),
+            address(tokenOut),
+            flashAmount,
+            swapOut,
+            uint256(block.timestamp + 3600),
+            address(executor)
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(executor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: BANCOR_V3,
+            pool: address(bancor),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: bancorData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Bancor pulled tokens via transferFrom
+        assertEq(tokenIn.balanceOf(address(bancor)), flashAmount);
+        // Approval reset to 0
+        assertEq(tokenIn.allowance(address(executor), address(bancor)), 0);
+        // Owner received profit
+        assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // SushiSwap test (same as UniV2 pre-transfer pattern)
+    // -------------------------------------------------------------------------
+
+    function test_swapSushi_preTransferPattern() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        MockV2Pool pool = new MockV2Pool(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(pool), swapOut);
+
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory swapData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0), swapOut, address(executor), ""
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0), returnAmount, address(executor), ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: SUSHISWAP,
+            pool: address(pool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: swapData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Pool received tokens via direct transfer (same as UniV2)
+        assertEq(tokenIn.balanceOf(address(pool)), flashAmount);
+        assertGt(tokenIn.balanceOf(owner), 0);
     }
 }
