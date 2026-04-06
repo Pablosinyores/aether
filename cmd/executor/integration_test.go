@@ -139,13 +139,14 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 		t.Error("arb1 should be submitted")
 	}
 
-	// Trigger circuit breaker: 3 consecutive reverts
-	rm.RecordRevert()
-	rm.RecordRevert()
-	rm.RecordRevert()
+	// Trigger circuit breaker: 10 consecutive bug reverts pauses the system
+	// (competitive/MEV reverts are excluded — see issue #27)
+	for i := 0; i < 10; i++ {
+		rm.RecordRevert(risk.RevertBug)
+	}
 
 	if rm.State() == risk.StateRunning {
-		t.Fatal("system should be paused after 3 reverts")
+		t.Fatal("system should be paused after 10 bug reverts")
 	}
 
 	// Process second arb — should be rejected

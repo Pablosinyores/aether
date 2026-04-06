@@ -215,25 +215,88 @@ func TestPreflightCheck_SystemNotRunning(t *testing.T) {
 	})
 }
 
-func TestRecordRevert_CircuitBreaker(t *testing.T) {
+func TestRecordRevert_BugCircuitBreaker(t *testing.T) {
 	t.Parallel()
 
-	rm := NewRiskManager(DefaultRiskConfig())
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3 // lower threshold for test speed
+	rm := NewRiskManager(config)
 
-	// Record 3 reverts (threshold for pause)
-	rm.RecordRevert()
-	rm.RecordRevert()
-
-	// Should still be running after 2
+	// Record 2 bug reverts — should still be running.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StateRunning {
-		t.Fatalf("expected Running after 2 reverts, got %s", rm.State())
+		t.Fatalf("expected Running after 2 bug reverts, got %s", rm.State())
 	}
 
-	// 3rd revert triggers pause
-	rm.RecordRevert()
-
+	// 3rd bug revert hits threshold → pause.
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StatePaused {
-		t.Errorf("expected Paused after 3 reverts, got %s", rm.State())
+		t.Errorf("expected Paused after 3 bug reverts, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_CompetitiveDoesNotTriggerCircuitBreaker(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3
+	config.CompetitiveRevertAlertPct = 100 // suppress alert so only CB fires
+	rm := NewRiskManager(config)
+
+	// Record many competitive reverts — circuit breaker must NOT fire.
+	for i := 0; i < 20; i++ {
+		rm.RecordRevert(RevertCompetitive)
+	}
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running after 20 competitive reverts, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_MixedTypes_OnlyBugCountsTowardBreaker(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3
+	config.CompetitiveRevertAlertPct = 100 // suppress alert
+	rm := NewRiskManager(config)
+
+	// 2 competitive + 2 bug = still under threshold (only 2 bug reverts).
+	rm.RecordRevert(RevertCompetitive)
+	rm.RecordRevert(RevertCompetitive)
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running with 2 bug reverts (threshold=3), got %s", rm.State())
+	}
+
+	// One more bug revert → pause.
+	rm.RecordRevert(RevertBug)
+	if rm.State() != StatePaused {
+		t.Errorf("expected Paused after 3rd bug revert, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_CompetitiveRateAlert(t *testing.T) {
+	t.Parallel()
+
+	// Set a low alert threshold to make it easy to trigger.
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 100 // effectively disable CB for this test
+	config.CompetitiveRevertAlertPct = 80 // alert at 80%+
+	rm := NewRiskManager(config)
+
+	// 8 competitive + 2 bug = 80% competitive → should log alert but NOT pause.
+	for i := 0; i < 8; i++ {
+		rm.RecordRevert(RevertCompetitive)
+	}
+	for i := 0; i < 2; i++ {
+		rm.RecordRevert(RevertBug)
+	}
+
+	// System must remain running (CB not triggered).
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running (alert only, not CB), got %s", rm.State())
 	}
 }
 
@@ -245,22 +308,19 @@ func TestRecordRevert_WindowCleanup(t *testing.T) {
 	config.ConsecutiveRevertsPause = 3
 	rm := NewRiskManager(config)
 
-	// RecordRevert adds to recentReverts and cleans entries outside the window.
-	// Since all reverts are recorded "now", they should all be within the window.
-	rm.RecordRevert()
-	rm.RecordRevert()
+	// All bug reverts recorded "now" — all within the window.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
 
-	// 2 reverts within window, system still running
+	// 2 bug reverts: still running.
 	if rm.State() != StateRunning {
-		t.Errorf("expected Running after 2 reverts, got %s", rm.State())
+		t.Errorf("expected Running after 2 bug reverts, got %s", rm.State())
 	}
 
-	// The cleanup logic removes entries outside the window. Since we can't
-	// easily inject old timestamps, we verify that recording a 3rd revert
-	// (all within window) triggers the circuit breaker.
-	rm.RecordRevert()
+	// 3rd bug revert (all within window) → circuit breaker fires.
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StatePaused {
-		t.Errorf("expected Paused after 3 reverts in window, got %s", rm.State())
+		t.Errorf("expected Paused after 3 bug reverts in window, got %s", rm.State())
 	}
 }
 

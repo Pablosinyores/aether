@@ -40,6 +40,7 @@ type RiskFileConfig struct {
 		MaxNodeLatencyMs            int64   `yaml:"max_node_latency_ms"`
 		BundleMissRateAlertPct      float64 `yaml:"bundle_miss_rate_alert_pct"`
 		BundleMissRateWindowMinutes int     `yaml:"bundle_miss_rate_window_minutes"`
+		CompetitiveRevertAlertPct   float64 `yaml:"competitive_revert_alert_pct"`
 	} `yaml:"circuit_breakers"`
 	PositionLimits struct {
 		MaxSingleTradeETH float64 `yaml:"max_single_trade_eth"`
@@ -101,6 +102,9 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 	}
 	if cb.BundleMissRateWindowMinutes <= 0 {
 		return fmt.Errorf("circuit_breakers.bundle_miss_rate_window_minutes must be > 0, got %d", cb.BundleMissRateWindowMinutes)
+	}
+	if cb.CompetitiveRevertAlertPct <= 0 || cb.CompetitiveRevertAlertPct > 100 {
+		return fmt.Errorf("circuit_breakers.competitive_revert_alert_pct must be in (0, 100], got %v", cb.CompetitiveRevertAlertPct)
 	}
 
 	if pl.MaxSingleTradeETH <= 0 {

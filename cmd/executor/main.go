@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -229,6 +230,7 @@ func processArb(
 	}
 
 	results := submitter.SubmitToAll(ctx, bundle)
+	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
@@ -236,6 +238,50 @@ func processArb(
 	rm.RecordBundleResult(successes > 0)
 
 	return successes > 0, nil
+}
+
+// recordSubmissionReverts classifies and records a single revert per arb
+// attempt. When multiple builders reject the same arb, we take the worst-case
+// classification (bug > competitive) so the circuit breaker is not silently
+// bypassed, but we never inflate the count beyond one per submission.
+func recordSubmissionReverts(rm *risk.RiskManager, results []SubmissionResult) {
+	worstType := risk.RevertCompetitive
+	foundRevert := false
+	for _, res := range results {
+		if res.Success || res.Error == nil {
+			continue
+		}
+		errMsg := res.Error.Error()
+		if !looksLikeRevert(errMsg) {
+			continue
+		}
+		foundRevert = true
+		if risk.ClassifyRevert(errMsg) == risk.RevertBug {
+			worstType = risk.RevertBug
+		}
+	}
+	if foundRevert {
+		rm.RecordRevert(worstType)
+	}
+}
+
+// looksLikeRevert returns true when the error message looks like an EVM revert
+// rather than an infrastructure failure (timeout, TLS error, etc.).
+//
+// Competitive patterns are delegated to ClassifyRevert to avoid duplicating the
+// pattern list. Only "revert"/"reverted" keywords are checked here to catch bug
+// reverts that ClassifyRevert doesn't recognise as competitive.
+func looksLikeRevert(errMsg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errMsg))
+	if lower == "" {
+		return true
+	}
+	// If ClassifyRevert recognises it as competitive, it is a revert.
+	if risk.ClassifyRevert(errMsg) == risk.RevertCompetitive {
+		return true
+	}
+	// Catch remaining bug reverts by keyword.
+	return strings.Contains(lower, "revert") || strings.Contains(lower, "reverted")
 }
 
 // consumeArbStream connects to the Rust engine's StreamArbs RPC and

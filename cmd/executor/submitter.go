@@ -38,6 +38,7 @@ type SubmissionResult struct {
 // Submitter handles fan-out submission to multiple builders
 type Submitter struct {
 	builders []BuilderConfig
+	submitFn func(context.Context, BuilderConfig, *Bundle) SubmissionResult
 }
 
 // NewSubmitter creates a new submitter
@@ -90,6 +91,14 @@ func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []Submissio
 
 // submitToBuilder sends bundle to a single builder
 func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
+	if s.submitFn != nil {
+		res := s.submitFn(ctx, builder, bundle)
+		if res.Builder == "" {
+			res.Builder = builder.Name
+		}
+		return res
+	}
+
 	timeout := time.Duration(builder.TimeoutMs) * time.Millisecond
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
