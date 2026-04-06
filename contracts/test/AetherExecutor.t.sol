@@ -92,6 +92,40 @@ contract MockV3Pool {
     }
 }
 
+/// @dev Malicious V3 pool that calls uniswapV3SwapCallback twice to attempt double-spend
+contract MockMaliciousV3Pool {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountIn;
+    uint256 public immutable amountOut;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountIn, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountIn = _amountIn;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        // First callback — should transfer tokens
+        bytes memory callbackData = abi.encodeWithSignature(
+            "uniswapV3SwapCallback(int256,int256,bytes)",
+            int256(amountIn),
+            int256(0),
+            ""
+        );
+        (bool success1,) = msg.sender.call(callbackData);
+        require(success1, "First callback failed");
+
+        // Second callback — should transfer 0 (amountIn already zeroed)
+        (bool success2,) = msg.sender.call(callbackData);
+        require(success2, "Second callback failed");
+
+        // Send output tokens
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
 /// @dev Mock Curve pool — pulls tokenIn via transferFrom, sends tokenOut
 contract MockCurvePool {
     MockERC20 public immutable tokenIn;
@@ -921,6 +955,59 @@ contract AetherExecutorTest is Test {
         vm.prank(address(0xDEAD));
         vm.expectRevert(AetherExecutor.NotPendingV3Pool.selector);
         executor.uniswapV3SwapCallback(int256(100), int256(0), "");
+    }
+
+    function test_uniV3Callback_doubleCall_onlyFirstTransfers() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Malicious pool that calls callback twice
+        MockMaliciousV3Pool malPool = new MockMaliciousV3Pool(tokenIn, tokenOut, flashAmount, swapOut);
+        tokenOut.mint(address(malPool), swapOut);
+
+        // Return pool
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory v3SwapData = abi.encodeWithSignature(
+            "swap(address,bool,int256,uint160,bytes)",
+            address(executor), true, int256(flashAmount), uint160(0), ""
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0), returnAmount, address(executor), ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V3,
+            pool: address(malPool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: v3SwapData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+
+        // Malicious pool only received flashAmount (not 2x) despite calling back twice
+        assertEq(tokenIn.balanceOf(address(malPool)), flashAmount, "double-call should not drain extra tokens");
+        assertGt(tokenIn.balanceOf(owner), 0, "owner should still receive profit");
     }
 
     // -------------------------------------------------------------------------
