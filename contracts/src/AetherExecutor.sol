@@ -13,7 +13,7 @@ contract AetherExecutor {
     address public owner;
     address public immutable aavePool;
 
-    // Protocol constants matching ProtocolType enum
+    // Protocol constants matching ProtocolType enum in crates/common/src/types.rs
     uint8 constant UNISWAP_V2 = 1;
     uint8 constant UNISWAP_V3 = 2;
     uint8 constant SUSHISWAP = 3;
@@ -40,9 +40,11 @@ contract AetherExecutor {
 
     error NotOwner();
     error NotAavePool();
+    error InvalidInitiator();
+    error FlashLoanFailed();
     error InsufficientProfit();
+    error ZeroAddress();
     error SwapFailed(uint256 stepIndex);
-    error InsufficientOutput(uint256 stepIndex, uint256 expected, uint256 actual);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -80,7 +82,7 @@ contract AetherExecutor {
                 uint16(0)
             )
         );
-        require(success, "Flash loan failed");
+        if (!success) revert FlashLoanFailed();
     }
 
     /// @notice Aave V3 flash loan callback
@@ -93,18 +95,20 @@ contract AetherExecutor {
         bytes calldata params
     ) external returns (bool) {
         if (msg.sender != aavePool) revert NotAavePool();
-        require(initiator == address(this), "Invalid initiator");
+        if (initiator != address(this)) revert InvalidInitiator();
 
         (SwapStep[] memory steps, uint256 gasStart) = abi.decode(params, (SwapStep[], uint256));
 
         // Execute all swap steps
-        for (uint256 i = 0; i < steps.length; i++) {
+        uint256 len = steps.length;
+        for (uint256 i = 0; i < len;) {
             _executeSwap(steps[i], i);
+            // Safe: i < len, so i+1 cannot overflow
+            unchecked { ++i; }
         }
 
-        // Repay flash loan (amount + premium)
+        // Repay flash loan (amount + premium); approvals must be pre-set via setApprovals()
         uint256 totalDebt = amount + premium;
-        IERC20(asset).forceApprove(aavePool, totalDebt);
 
         // Calculate and transfer profit
         uint256 balance = IERC20(asset).balanceOf(address(this));
@@ -120,69 +124,87 @@ contract AetherExecutor {
         return true;
     }
 
-    /// @dev Execute a single swap step based on protocol
+    /// @notice Pre-approve spenders to save gas during arb execution
+    /// @dev Call once per token/spender pair (e.g., flashloan token → Aave pool).
+    ///      Uses max approval so executeOperation never needs to re-approve.
+    /// @param tokens ERC20 token addresses to approve
+    /// @param spenders Corresponding spender addresses (must be same length as tokens)
+    function setApprovals(address[] calldata tokens, address[] calldata spenders) external onlyOwner {
+        uint256 len = tokens.length;
+        for (uint256 i = 0; i < len;) {
+            IERC20(tokens[i]).forceApprove(spenders[i], type(uint256).max);
+            // Safe: i < len, so i+1 cannot overflow
+            unchecked { ++i; }
+        }
+    }
+
+    /// @dev Execute a single swap step based on protocol.
+    ///      Final profit validation in executeOperation ensures no net loss;
+    ///      per-step balanceOf checks are omitted to save ~5.2K gas per hop.
     function _executeSwap(SwapStep memory step, uint256 index) internal {
         // Transfer tokens to pool (for protocols that require it)
         IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
 
-        uint256 balanceBefore = IERC20(step.tokenOut).balanceOf(address(this));
-
-        if (step.protocol == UNISWAP_V2 || step.protocol == SUSHISWAP) {
-            _swapUniV2(step);
+        // Hot-path first: UniV2 and UniV3 are by far the most common protocols
+        if (step.protocol == UNISWAP_V2) {
+            _swapUniV2(step, index);
         } else if (step.protocol == UNISWAP_V3) {
-            _swapUniV3(step);
+            _swapUniV3(step, index);
+        } else if (step.protocol == SUSHISWAP) {
+            _swapUniV2(step, index); // SushiSwap uses the same AMM interface as UniV2
         } else if (step.protocol == CURVE) {
-            _swapCurve(step);
+            _swapCurve(step, index);
         } else if (step.protocol == BALANCER_V2) {
-            _swapBalancer(step);
+            _swapBalancer(step, index);
         } else if (step.protocol == BANCOR_V3) {
-            _swapBancor(step);
+            _swapBancor(step, index);
         } else {
             revert SwapFailed(index);
         }
-
-        uint256 balanceAfter = IERC20(step.tokenOut).balanceOf(address(this));
-        uint256 amountOut = balanceAfter - balanceBefore;
-        if (amountOut < step.minAmountOut) {
-            revert InsufficientOutput(index, step.minAmountOut, amountOut);
-        }
     }
 
-    function _swapUniV2(SwapStep memory step) internal {
+    /// @dev UniswapV2 (and SushiSwap) swap. Token already transferred to pool.
+    function _swapUniV2(SwapStep memory step, uint256 index) internal {
         // UniswapV2Pair.swap(uint amount0Out, uint amount1Out, address to, bytes data)
-        // We already transferred tokenIn, now call swap
         (bool success,) = step.pool.call(step.data);
-        require(success, "UniV2 swap failed");
+        if (!success) revert SwapFailed(index);
     }
 
-    function _swapUniV3(SwapStep memory step) internal {
+    /// @dev UniswapV3 swap.
+    function _swapUniV3(SwapStep memory step, uint256 index) internal {
         (bool success,) = step.pool.call(step.data);
-        require(success, "UniV3 swap failed");
+        if (!success) revert SwapFailed(index);
     }
 
-    function _swapCurve(SwapStep memory step) internal {
+    /// @dev Curve exchange swap.
+    function _swapCurve(SwapStep memory step, uint256 index) internal {
         (bool success,) = step.pool.call(step.data);
-        require(success, "Curve swap failed");
+        if (!success) revert SwapFailed(index);
     }
 
-    function _swapBalancer(SwapStep memory step) internal {
+    /// @dev Balancer V2 swap.
+    function _swapBalancer(SwapStep memory step, uint256 index) internal {
         (bool success,) = step.pool.call(step.data);
-        require(success, "Balancer swap failed");
+        if (!success) revert SwapFailed(index);
     }
 
-    function _swapBancor(SwapStep memory step) internal {
+    /// @dev Bancor V3 swap.
+    function _swapBancor(SwapStep memory step, uint256 index) internal {
         (bool success,) = step.pool.call(step.data);
-        require(success, "Bancor swap failed");
+        if (!success) revert SwapFailed(index);
     }
 
     /// @notice Emergency token rescue - owner only
+    /// @param token ERC20 token to rescue
+    /// @param amount Amount to rescue
     function rescue(address token, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(owner, amount);
     }
 
-    /// @notice Transfer ownership
+    /// @notice Transfer contract ownership
+    /// @param newOwner Address of new owner; must be non-zero
     function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Zero address");
+        if (newOwner == address(0)) revert ZeroAddress();
         owner = newOwner;
     }
 
