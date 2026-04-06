@@ -50,13 +50,13 @@ mod tests {
 
     #[test]
     fn test_univ3_swap_gas_no_ticks() {
-        assert_eq!(estimate_swap_gas(ProtocolType::UniswapV3, 0), 100_000);
+        assert_eq!(estimate_swap_gas(ProtocolType::UniswapV3, 0), 200_000);
     }
 
     #[test]
     fn test_univ3_swap_gas_with_ticks() {
-        // 100_000 + 5 * 5_000 = 125_000
-        assert_eq!(estimate_swap_gas(ProtocolType::UniswapV3, 5), 125_000);
+        // 200_000 + 5 * 5_000 = 225_000
+        assert_eq!(estimate_swap_gas(ProtocolType::UniswapV3, 5), 225_000);
     }
 
     #[test]
@@ -98,8 +98,8 @@ mod tests {
     #[test]
     fn test_total_gas_triangle_arb() {
         // UniV2 -> UniV3 (3 ticks) -> SushiSwap
-        // 131_000 + 60_000 + (100_000 + 3*5_000) + 60_000
-        // = 131_000 + 60_000 + 115_000 + 60_000 = 366_000
+        // 131_000 + 60_000 + (200_000 + 3*5_000) + 60_000
+        // = 131_000 + 60_000 + 215_000 + 60_000 = 466_000
         let protocols = [
             ProtocolType::UniswapV2,
             ProtocolType::UniswapV3,
@@ -107,7 +107,7 @@ mod tests {
         ];
         let ticks = [0, 3, 0];
         let total = estimate_total_gas(&protocols, &ticks);
-        assert_eq!(total, 366_000);
+        assert_eq!(total, 466_000);
     }
 
     #[test]
@@ -116,9 +116,9 @@ mod tests {
         let protocols = [ProtocolType::UniswapV3, ProtocolType::UniswapV3];
         let ticks = [5]; // Only one entry for two protocols
         let total = estimate_total_gas(&protocols, &ticks);
-        // 131_000 + (100_000 + 5*5_000) + (100_000 + 0*5_000)
-        // = 131_000 + 125_000 + 100_000 = 356_000
-        assert_eq!(total, 356_000);
+        // 131_000 + (200_000 + 5*5_000) + (200_000 + 0*5_000)
+        // = 131_000 + 225_000 + 200_000 = 556_000
+        assert_eq!(total, 556_000);
     }
 
     #[test]
@@ -133,9 +133,9 @@ mod tests {
         ];
         let ticks = [0, 0, 0, 0, 0, 0];
         let total = estimate_total_gas(&protocols, &ticks);
-        // 131_000 + 60_000 + 100_000 + 60_000 + 130_000 + 120_000 + 150_000
-        // = 131_000 + 620_000 = 751_000
-        assert_eq!(total, 751_000);
+        // 131_000 + 60_000 + 200_000 + 60_000 + 130_000 + 120_000 + 150_000
+        // = 131_000 + 720_000 = 851_000
+        assert_eq!(total, 851_000);
     }
 
     // --------------- gas_cost_wei ---------------
