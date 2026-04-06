@@ -263,10 +263,14 @@ contract AetherExecutor {
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
         if (msg.sender != _pendingV3Pool) revert NotPendingV3Pool();
 
+        // At least one delta must be positive (amount owed to the pool)
+        require(amount0Delta > 0 || amount1Delta > 0, "V3: no amount owed");
         // Transfer the owed amount to the pool (whichever delta is positive)
         uint256 amountOwed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
         // Cap at our expected amount to prevent a malicious pool from draining extra tokens
         if (amountOwed > _pendingV3AmountIn) amountOwed = _pendingV3AmountIn;
+        // Zero out to prevent double-spend if pool calls back multiple times
+        _pendingV3AmountIn = 0;
 
         IERC20(_pendingV3TokenIn).safeTransfer(msg.sender, amountOwed);
     }
