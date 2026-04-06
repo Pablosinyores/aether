@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 )
@@ -326,5 +327,75 @@ func TestGasOracle_FetchOnce_MultipleBaseFees(t *testing.T) {
 	// Should use the last baseFee entry (42 gwei = pending block).
 	if fees.BaseFee.Cmp(big.NewInt(42e9)) != 0 {
 		t.Errorf("BaseFee: got %s, want 42000000000", fees.BaseFee)
+	}
+}
+
+// sequenceMockFeeHistory returns different results on successive calls.
+// Not concurrency-safe — use only in sequential test scenarios.
+type sequenceMockFeeHistory struct {
+	results []*ethereum.FeeHistory
+	errs    []error
+	calls   int
+}
+
+func (m *sequenceMockFeeHistory) FeeHistory(_ context.Context, _ uint64, _ *big.Int, _ []float64) (*ethereum.FeeHistory, error) {
+	i := m.calls
+	m.calls++
+	if i < len(m.errs) && m.errs[i] != nil {
+		return nil, m.errs[i]
+	}
+	if i < len(m.results) {
+		return m.results[i], nil
+	}
+	// Repeat last result for any extra calls.
+	return m.results[len(m.results)-1], nil
+}
+
+func TestGasOracle_UpdateLoop_ErrorThenRecover(t *testing.T) {
+	t.Parallel()
+
+	mock := &sequenceMockFeeHistory{
+		results: []*ethereum.FeeHistory{
+			nil, // call 0: error
+			{    // call 1: success
+				OldestBlock:  big.NewInt(100),
+				BaseFee:      []*big.Int{big.NewInt(25e9)},
+				Reward:       [][]*big.Int{{big.NewInt(1e9)}},
+				GasUsedRatio: []float64{0.5},
+			},
+		},
+		errs: []error{
+			fmt.Errorf("node unavailable"), // call 0 fails
+			nil,                            // call 1 succeeds
+		},
+	}
+
+	go_ := NewGasOracle(300.0)
+	go_.SetClient(mock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Run UpdateLoop with a very short interval so two ticks fire quickly.
+	done := make(chan struct{})
+	go func() {
+		go_.UpdateLoop(ctx, 50*time.Millisecond)
+		close(done)
+	}()
+
+	// Wait enough for 2 ticks.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	<-done
+
+	if mock.calls < 2 {
+		t.Fatalf("expected at least 2 RPC calls, got %d", mock.calls)
+	}
+
+	// After the first tick (error), fees should still be defaults (30 gwei).
+	// After the second tick (success), fees should be 25 gwei.
+	fees := go_.CurrentFees()
+	if fees.BaseFee.Cmp(big.NewInt(25e9)) != 0 {
+		t.Errorf("BaseFee after recovery: got %s, want 25000000000", fees.BaseFee)
 	}
 }
