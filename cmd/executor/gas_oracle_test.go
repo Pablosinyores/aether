@@ -185,6 +185,7 @@ func TestGasOracle_MaxFeeFormula(t *testing.T) {
 // --- Mock RPC tests ---
 
 // mockFeeHistoryProvider implements FeeHistoryProvider for testing.
+// Not concurrency-safe — use only in sequential test scenarios.
 type mockFeeHistoryProvider struct {
 	result *ethereum.FeeHistory
 	err    error
