@@ -181,7 +181,7 @@ fn test_gas_estimation_multi_hop() {
     ];
     let tick_counts = vec![0, 5, 0];
     let total = gas::estimate_total_gas(&protocols, &tick_counts);
-    let expected = 21_000 + 80_000 + 30_000 + 60_000 + (100_000 + 5 * 5_000) + 130_000;
+    let expected = 21_000 + 80_000 + 30_000 + 60_000 + (200_000 + 5 * 5_000) + 130_000;
     assert_eq!(total, expected);
 }
 

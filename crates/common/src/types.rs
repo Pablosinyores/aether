@@ -18,7 +18,7 @@ impl ProtocolType {
     pub fn base_gas(&self) -> u64 {
         match self {
             ProtocolType::UniswapV2 => 60_000,
-            ProtocolType::UniswapV3 => 100_000,
+            ProtocolType::UniswapV3 => 200_000,
             ProtocolType::SushiSwap => 60_000,
             ProtocolType::Curve => 130_000,
             ProtocolType::BalancerV2 => 120_000,
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn test_protocol_type_base_gas() {
         assert_eq!(ProtocolType::UniswapV2.base_gas(), 60_000);
-        assert_eq!(ProtocolType::UniswapV3.base_gas(), 100_000);
+        assert_eq!(ProtocolType::UniswapV3.base_gas(), 200_000);
         assert_eq!(ProtocolType::SushiSwap.base_gas(), 60_000);
         assert_eq!(ProtocolType::Curve.base_gas(), 130_000);
         assert_eq!(ProtocolType::BalancerV2.base_gas(), 120_000);
