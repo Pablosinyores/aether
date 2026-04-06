@@ -195,6 +195,7 @@ func TestNonce_PendingCount(t *testing.T) {
 // --- Mock RPC tests ---
 
 // mockNonceProvider implements NonceProvider for testing.
+// Not concurrency-safe — use only in sequential test scenarios.
 type mockNonceProvider struct {
 	nonce uint64
 	err   error

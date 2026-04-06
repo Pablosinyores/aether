@@ -11,8 +11,12 @@ import (
 )
 
 // weiToGwei converts a wei value to gwei as a float64.
+// Uses big.Float to avoid silent truncation for values exceeding math.MaxInt64.
 func weiToGwei(wei *big.Int) float64 {
-	return float64(wei.Int64()) / 1e9
+	f := new(big.Float).SetInt(wei)
+	f.Quo(f, new(big.Float).SetFloat64(1e9))
+	v, _ := f.Float64()
+	return v
 }
 
 // FeeHistoryProvider is the interface for fetching on-chain fee history.
@@ -88,7 +92,7 @@ func (go_ *GasOracle) Update(baseFee *big.Int, priorityFee *big.Int) {
 		BaseFee:        new(big.Int).Set(baseFee),
 		MaxFeePerGas:   maxFee,
 		MaxPriorityFee: new(big.Int).Set(priorityFee),
-		GasPriceGwei:   float64(baseFee.Int64()) / 1e9,
+		GasPriceGwei:   weiToGwei(baseFee),
 	}
 }
 
@@ -123,7 +127,7 @@ func (go_ *GasOracle) FetchOnce(ctx context.Context) (GasFees, error) {
 		baseFee = feeHistory.BaseFee[len(feeHistory.BaseFee)-1]
 	}
 	if baseFee == nil || baseFee.Sign() == 0 {
-		// Fallback: keep current value.
+		log.Printf("Gas oracle: WARNING eth_feeHistory returned zero/nil baseFee, keeping last known values")
 		return go_.CurrentFees(), nil
 	}
 
