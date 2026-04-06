@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -54,9 +55,9 @@ func TestBuildBundle_Basic(t *testing.T) {
 	}
 
 	// Executor address
-	expectedAddr := "0x1234567890abcdef1234567890abcdef12345678"
-	if arbTx.To() == nil || arbTx.To().Hex() != "0x1234567890AbcdEF1234567890aBcdef12345678" {
-		t.Errorf("arb tx To: expected %s, got %v", expectedAddr, arbTx.To())
+	expectedAddr := common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
+	if arbTx.To() == nil || *arbTx.To() != expectedAddr {
+		t.Errorf("arb tx To: expected %s, got %v", expectedAddr.Hex(), arbTx.To())
 	}
 
 	// Calldata
