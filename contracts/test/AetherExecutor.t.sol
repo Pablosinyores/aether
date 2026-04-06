@@ -65,6 +65,47 @@ contract MockAavePool {
     }
 }
 
+/// @dev Mock WETH that supports deposit/withdraw with native ETH
+contract MockWETH {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        allowance[from][msg.sender] -= amount;
+        return true;
+    }
+
+    /// @dev Simulates WETH.withdraw: burns WETH balance and sends native ETH
+    function withdraw(uint256 wad) external {
+        require(balanceOf[msg.sender] >= wad, "Insufficient WETH balance");
+        balanceOf[msg.sender] -= wad;
+        (bool sent,) = msg.sender.call{value: wad}("");
+        require(sent, "ETH transfer failed");
+    }
+
+    receive() external payable {}
+}
+
 /// @dev Mock swap pool that simulates a profitable swap by minting extra tokens
 contract MockSwapPool {
     address public tokenOut;
@@ -342,6 +383,73 @@ contract AetherExecutorTest is Test {
         );
     }
 
+    // --- WETH tip tests ---
+
+    function test_executeArb_wethTip_sendsNativeEth() public {
+        address WETH_ADDR = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+        // Deploy MockWETH code at the canonical WETH address
+        _deployMockWethAt(WETH_ADDR);
+
+        (AetherExecutor wethExecutor, AetherExecutor.SwapStep[] memory steps) =
+            _buildWethArbFixture(WETH_ADDR, 1000);
+
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+
+        // Fund MockWETH with native ETH so withdraw() can send ETH back
+        vm.deal(WETH_ADDR, 10_000);
+
+        // tipBps=9000 -> tip=900, ownerProfit=100
+        wethExecutor.executeArb(steps, WETH_ADDR, 100_000, 9000);
+
+        // Coinbase received native ETH, not WETH tokens
+        assertEq(coinbase.balance, 900, "coinbase should receive native ETH tip");
+        assertEq(MockWETH(payable(WETH_ADDR)).balanceOf(coinbase), 0, "coinbase should not hold WETH");
+        // Owner still receives WETH (not unwrapped)
+        assertEq(MockWETH(payable(WETH_ADDR)).balanceOf(address(this)), 100, "owner WETH profit incorrect");
+        // Executor has no leftover
+        assertEq(MockWETH(payable(WETH_ADDR)).balanceOf(address(wethExecutor)), 0, "executor should have zero WETH");
+    }
+
+    function test_executeArb_nonWeth_sendsErc20Tip() public {
+        // Verify that non-WETH assets still use ERC-20 transfer (no native ETH sent)
+        MockAavePool mockPool = new MockAavePool();
+        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool));
+        MockERC20 arbToken = new MockERC20();
+
+        uint256 flashloanAmount = 100_000;
+        uint256 premium = (flashloanAmount * 5) / 10000;
+        uint256 totalDebt = flashloanAmount + premium;
+        uint256 targetProfit = 1000;
+        uint256 swapOut = totalDebt + targetProfit;
+
+        MockSwapPool swapPool = new MockSwapPool(address(arbToken), swapOut);
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](1);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: 1,
+            pool: address(swapPool),
+            tokenIn: address(arbToken),
+            tokenOut: address(arbToken),
+            amountIn: flashloanAmount,
+            minAmountOut: swapOut,
+            data: abi.encodeWithSignature("swap()")
+        });
+
+        address coinbase = address(0xC01B);
+        vm.coinbase(coinbase);
+
+        uint256 tipBps = 9000;
+        uint256 expectedTip = (targetProfit * tipBps) / 10000;
+
+        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, tipBps);
+
+        // Coinbase received ERC-20, not native ETH
+        assertEq(arbToken.balanceOf(coinbase), expectedTip, "coinbase should receive ERC-20 tip");
+        assertEq(coinbase.balance, 0, "coinbase should not receive native ETH for non-WETH");
+    }
+
     // --- Helpers ---
 
     /// @dev Deploy a mock Aave pool + executor + token, with a swap pool that yields targetProfit
@@ -374,6 +482,37 @@ contract AetherExecutorTest is Test {
             pool: _lastSwapPool,
             tokenIn: address(arbToken),
             tokenOut: address(arbToken),
+            amountIn: 100_000,
+            minAmountOut: swapOut,
+            data: abi.encodeWithSignature("swap()")
+        });
+    }
+
+    /// @dev Deploy MockWETH bytecode at a specific address using vm.etch
+    function _deployMockWethAt(address target) internal {
+        bytes memory wethCode = type(MockWETH).creationCode;
+        address deployed;
+        assembly { deployed := create(0, add(wethCode, 0x20), mload(wethCode)) }
+        vm.etch(target, deployed.code);
+    }
+
+    /// @dev Build executor + swap steps for a WETH arb with given profit
+    function _buildWethArbFixture(address wethAddr, uint256 targetProfit)
+        internal
+        returns (AetherExecutor wethExecutor, AetherExecutor.SwapStep[] memory steps)
+    {
+        MockAavePool mockPool = new MockAavePool();
+        wethExecutor = new AetherExecutor(address(mockPool));
+
+        uint256 swapOut = 100_000 + (100_000 * 5) / 10000 + targetProfit;
+        MockSwapPool swapPool = new MockSwapPool(wethAddr, swapOut);
+
+        steps = new AetherExecutor.SwapStep[](1);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: 1,
+            pool: address(swapPool),
+            tokenIn: wethAddr,
+            tokenOut: wethAddr,
             amountIn: 100_000,
             minAmountOut: swapOut,
             data: abi.encodeWithSignature("swap()")

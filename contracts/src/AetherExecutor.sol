@@ -4,6 +4,10 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+interface IWETH {
+    function withdraw(uint256 wad) external;
+}
+
 /// @title AetherExecutor - Flash loan arbitrage executor
 /// @notice Executes cross-DEX arbitrage using Aave V3 flash loans
 /// @dev All swap steps must be profitable after gas + flash loan premium
@@ -12,6 +16,9 @@ contract AetherExecutor {
 
     address public owner;
     address public immutable aavePool;
+
+    /// @dev Canonical WETH address on Ethereum mainnet
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     // Protocol constants matching ProtocolType enum
     uint8 constant UNISWAP_V2 = 1;
@@ -45,6 +52,7 @@ contract AetherExecutor {
     error SwapFailed(uint256 stepIndex);
     error InsufficientOutput(uint256 stepIndex, uint256 expected, uint256 actual);
     error TipBpsTooHigh();
+    error CoinbaseTipFailed();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -141,7 +149,15 @@ contract AetherExecutor {
         unchecked { ownerProfit = profit - tipAmount; }
 
         if (tipAmount > 0) {
-            IERC20(asset).safeTransfer(block.coinbase, tipAmount);
+            if (asset == WETH) {
+                // Unwrap WETH to native ETH so builders recognize the coinbase tip
+                IWETH(asset).withdraw(tipAmount);
+                (bool sent,) = block.coinbase.call{value: tipAmount}("");
+                if (!sent) revert CoinbaseTipFailed();
+            } else {
+                // Non-WETH fallback: ERC-20 transfer (builders won't prioritize)
+                IERC20(asset).safeTransfer(block.coinbase, tipAmount);
+            }
         }
         if (ownerProfit > 0) {
             IERC20(asset).safeTransfer(owner, ownerProfit);
