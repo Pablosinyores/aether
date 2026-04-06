@@ -215,7 +215,7 @@ func processArb(
 
 	gasFees := bundler.gasOracle.CurrentFees()
 	gasGwei := gasFees.GasPriceGwei
-	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
+	tipSharePct := rm.CalculateTipShare()
 
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {

@@ -358,7 +358,7 @@ func TestCalculateTipShare_NoHistory(t *testing.T) {
 	rm := NewRiskManager(DefaultRiskConfig())
 
 	// With no bundle history, should return the 90% base.
-	got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+	got := rm.CalculateTipShare()
 	if got != 90.0 {
 		t.Errorf("CalculateTipShare with no history: got %.1f%%, want 90.0%%", got)
 	}
@@ -393,7 +393,7 @@ func TestCalculateTipShare_Adaptive(t *testing.T) {
 				rm.RecordBundleResult(false)
 			}
 
-			got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+			got := rm.CalculateTipShare()
 			if got < tc.wantMin || got > tc.wantMax {
 				t.Errorf("CalculateTipShare: got %.1f%%, want in [%.1f%%, %.1f%%]",
 					got, tc.wantMin, tc.wantMax)
@@ -414,7 +414,7 @@ func TestCalculateTipShare_ClampedToMax(t *testing.T) {
 		rm.RecordBundleResult(false)
 	}
 
-	got := rm.CalculateTipShare(fracETHWei(t, 1, 100), 100.0)
+	got := rm.CalculateTipShare()
 	if got > cfg.MaxTipSharePct {
 		t.Errorf("CalculateTipShare exceeded max: got %.1f%%, max %.1f%%", got, cfg.MaxTipSharePct)
 	}

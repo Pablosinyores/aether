@@ -224,10 +224,7 @@ func (rm *RiskManager) BundleMissRate() float64 {
 // the tip increases toward MaxTipSharePct to incentivize builders. When
 // inclusion is above 50%, the tip decreases toward a 70% floor to retain more
 // profit. The result is always clamped to [70, MaxTipSharePct].
-//
-// profitWei and gasGwei are accepted for future use (e.g. adjusting tip based
-// on profit margin or gas conditions) but are currently unused.
-func (rm *RiskManager) CalculateTipShare(_ *big.Int, _ float64) float64 {
+func (rm *RiskManager) CalculateTipShare() float64 {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
