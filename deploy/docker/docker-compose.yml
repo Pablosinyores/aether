@@ -18,7 +18,8 @@ services:
       - ETH_RPC_URL=${ETH_RPC_URL:-}
       - AETHER_NODES_CONFIG=/app/config/nodes.yaml
     env_file:
-      - ../../.env
+      - path: ../../.env
+        required: false
     restart: unless-stopped
     depends_on:
       - redis
@@ -38,6 +39,9 @@ services:
       - GRPC_ADDRESS=aether-rust:50051
       - METRICS_PORT=9090
       - DASHBOARD_PORT=8080
+    env_file:
+      - path: ../../.env
+        required: false
     restart: unless-stopped
     depends_on:
       - aether-rust

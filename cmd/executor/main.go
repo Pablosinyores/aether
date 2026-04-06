@@ -48,11 +48,6 @@ func defaultConfig() Config {
 func loadConfig() Config {
 	cfg := defaultConfig()
 
-	// Environment overrides for container / systemd deployments
-	if v := os.Getenv("GRPC_ADDRESS"); v != "" {
-		cfg.GRPCAddress = v
-	}
-
 	// Try loading builders from config/builders.yaml
 	buildersPath := config.ConfigPath("builders.yaml")
 	bc, err := config.LoadBuildersConfig(buildersPath)
