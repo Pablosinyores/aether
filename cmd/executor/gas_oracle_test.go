@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"math/big"
 	"sync"
 	"testing"
+
+	"github.com/ethereum/go-ethereum"
 )
 
 func TestNewGasOracle_Defaults(t *testing.T) {
@@ -175,5 +179,151 @@ func TestGasOracle_MaxFeeFormula(t *testing.T) {
 					fees.MaxFeePerGas.String(), expectedMaxFee.String())
 			}
 		})
+	}
+}
+
+// --- Mock RPC tests ---
+
+// mockFeeHistoryProvider implements FeeHistoryProvider for testing.
+type mockFeeHistoryProvider struct {
+	result *ethereum.FeeHistory
+	err    error
+	calls  int
+}
+
+func (m *mockFeeHistoryProvider) FeeHistory(_ context.Context, _ uint64, _ *big.Int, _ []float64) (*ethereum.FeeHistory, error) {
+	m.calls++
+	return m.result, m.err
+}
+
+func TestGasOracle_FetchOnce_RealFees(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockFeeHistoryProvider{
+		result: &ethereum.FeeHistory{
+			OldestBlock:  big.NewInt(100),
+			BaseFee:      []*big.Int{big.NewInt(45e9)},        // 45 gwei
+			Reward:       [][]*big.Int{{big.NewInt(3e9)}},      // 3 gwei priority
+			GasUsedRatio: []float64{0.5},
+		},
+	}
+
+	go_ := NewGasOracle(300.0)
+	go_.SetClient(mock)
+
+	fees, err := go_.FetchOnce(context.Background())
+	if err != nil {
+		t.Fatalf("FetchOnce returned error: %v", err)
+	}
+	if mock.calls != 1 {
+		t.Errorf("expected 1 RPC call, got %d", mock.calls)
+	}
+
+	// baseFee should be 45 gwei
+	if fees.BaseFee.Cmp(big.NewInt(45e9)) != 0 {
+		t.Errorf("BaseFee: got %s, want 45000000000", fees.BaseFee)
+	}
+	// priorityFee should be 3 gwei
+	if fees.MaxPriorityFee.Cmp(big.NewInt(3e9)) != 0 {
+		t.Errorf("MaxPriorityFee: got %s, want 3000000000", fees.MaxPriorityFee)
+	}
+	// maxFee = 2*45 + 3 = 93 gwei
+	if fees.MaxFeePerGas.Cmp(big.NewInt(93e9)) != 0 {
+		t.Errorf("MaxFeePerGas: got %s, want 93000000000", fees.MaxFeePerGas)
+	}
+	// GasPriceGwei should be 45
+	if fees.GasPriceGwei != 45.0 {
+		t.Errorf("GasPriceGwei: got %f, want 45.0", fees.GasPriceGwei)
+	}
+}
+
+func TestGasOracle_FetchOnce_RPCError_KeepsLast(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockFeeHistoryProvider{
+		err: fmt.Errorf("connection refused"),
+	}
+
+	go_ := NewGasOracle(300.0)
+	// Set a known state first.
+	go_.Update(big.NewInt(50e9), big.NewInt(5e9))
+	go_.SetClient(mock)
+
+	fees, err := go_.FetchOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected error from FetchOnce")
+	}
+	// Fees should remain at 50 gwei / 5 gwei from the prior Update.
+	if fees.BaseFee.Cmp(big.NewInt(50e9)) != 0 {
+		t.Errorf("BaseFee after error: got %s, want 50000000000", fees.BaseFee)
+	}
+	if fees.MaxPriorityFee.Cmp(big.NewInt(5e9)) != 0 {
+		t.Errorf("MaxPriorityFee after error: got %s, want 5000000000", fees.MaxPriorityFee)
+	}
+}
+
+func TestGasOracle_FetchOnce_NoClient(t *testing.T) {
+	t.Parallel()
+
+	go_ := NewGasOracle(300.0)
+	// No client set — should return defaults without error.
+	fees, err := go_.FetchOnce(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fees.BaseFee.Cmp(big.NewInt(30e9)) != 0 {
+		t.Errorf("BaseFee without client: got %s, want 30000000000", fees.BaseFee)
+	}
+}
+
+func TestGasOracle_IsGasTooHigh_WithRealData(t *testing.T) {
+	t.Parallel()
+
+	// Simulate a high gas environment: 350 gwei base fee.
+	mock := &mockFeeHistoryProvider{
+		result: &ethereum.FeeHistory{
+			OldestBlock:  big.NewInt(200),
+			BaseFee:      []*big.Int{big.NewInt(350e9)},
+			Reward:       [][]*big.Int{{big.NewInt(2e9)}},
+			GasUsedRatio: []float64{0.9},
+		},
+	}
+
+	go_ := NewGasOracle(300.0)
+	go_.SetClient(mock)
+
+	if _, err := go_.FetchOnce(context.Background()); err != nil {
+		t.Fatalf("FetchOnce: %v", err)
+	}
+
+	if !go_.IsGasTooHigh() {
+		t.Error("expected IsGasTooHigh()=true with 350 gwei base fee and 300 gwei threshold")
+	}
+}
+
+func TestGasOracle_FetchOnce_MultipleBaseFees(t *testing.T) {
+	t.Parallel()
+
+	// eth_feeHistory may return baseFee for N+1 blocks (pending included).
+	// We take the last entry as it represents the pending block.
+	mock := &mockFeeHistoryProvider{
+		result: &ethereum.FeeHistory{
+			OldestBlock:  big.NewInt(100),
+			BaseFee:      []*big.Int{big.NewInt(40e9), big.NewInt(42e9)},
+			Reward:       [][]*big.Int{{big.NewInt(1e9)}},
+			GasUsedRatio: []float64{0.6},
+		},
+	}
+
+	go_ := NewGasOracle(300.0)
+	go_.SetClient(mock)
+
+	fees, err := go_.FetchOnce(context.Background())
+	if err != nil {
+		t.Fatalf("FetchOnce: %v", err)
+	}
+	// Should use the last baseFee entry (42 gwei = pending block).
+	if fees.BaseFee.Cmp(big.NewInt(42e9)) != 0 {
+		t.Errorf("BaseFee: got %s, want 42000000000", fees.BaseFee)
 	}
 }
