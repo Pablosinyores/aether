@@ -50,6 +50,7 @@ contract AetherExecutor {
     error NotAavePool();
     error InvalidInitiator();
     error FlashLoanFailed();
+    error NotPendingV3Pool();
     error InsufficientProfit();
     error InsufficientOutput(uint256 stepIndex, uint256 actual, uint256 expected);
     error ZeroAddress();
@@ -62,6 +63,11 @@ contract AetherExecutor {
         if (msg.sender != owner) revert NotOwner();
         _;
     }
+
+    // UniswapV3 callback state — set before the swap call, validated in callback
+    address private _pendingV3Pool;
+    address private _pendingV3TokenIn;
+    uint256 private _pendingV3AmountIn;
 
     constructor(address _aavePool) {
         owner = msg.sender;
@@ -193,25 +199,31 @@ contract AetherExecutor {
     }
 
     /// @dev Execute a single swap step based on protocol.
+    ///      Each protocol handler manages its own token transfer pattern.
     ///      Per-step slippage protection via minAmountOut enforced after each swap.
     function _executeSwap(SwapStep memory step, uint256 index) internal {
-        // Transfer tokens to pool (for protocols that require it)
-        IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
-
         uint256 balanceBefore = IERC20(step.tokenOut).balanceOf(address(this));
 
         // Hot-path first: UniV2 and UniV3 are by far the most common protocols
         if (step.protocol == UNISWAP_V2) {
+            // UniV2: pre-transfer tokens to pool, then call swap
+            IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
             _swapUniV2(step, index);
         } else if (step.protocol == UNISWAP_V3) {
+            // UniV3: pool calls back uniswapV3SwapCallback to pull tokens
             _swapUniV3(step, index);
         } else if (step.protocol == SUSHISWAP) {
-            _swapUniV2(step, index); // SushiSwap uses the same AMM interface as UniV2
+            // Sushi: same pre-transfer pattern as UniV2
+            IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
+            _swapUniV2(step, index);
         } else if (step.protocol == CURVE) {
+            // Curve: approve then pool pulls via transferFrom
             _swapCurve(step, index);
         } else if (step.protocol == BALANCER_V2) {
+            // Balancer: approve Vault then Vault pulls via transferFrom
             _swapBalancer(step, index);
         } else if (step.protocol == BANCOR_V3) {
+            // Bancor: approve then router pulls via transferFrom
             _swapBancor(step, index);
         } else {
             revert SwapFailed(index);
@@ -226,33 +238,61 @@ contract AetherExecutor {
 
     /// @dev UniswapV2 (and SushiSwap) swap. Token already transferred to pool.
     function _swapUniV2(SwapStep memory step, uint256 index) internal {
-        // UniswapV2Pair.swap(uint amount0Out, uint amount1Out, address to, bytes data)
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
     }
 
-    /// @dev UniswapV3 swap.
+    /// @dev UniV3: set callback state, call pool.swap(), pool calls back uniswapV3SwapCallback
     function _swapUniV3(SwapStep memory step, uint256 index) internal {
+        _pendingV3Pool = step.pool;
+        _pendingV3TokenIn = step.tokenIn;
+        _pendingV3AmountIn = step.amountIn;
+
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
+
+        // Clear callback state
+        _pendingV3Pool = address(0);
+        _pendingV3TokenIn = address(0);
+        _pendingV3AmountIn = 0;
     }
 
-    /// @dev Curve exchange swap.
+    /// @notice UniswapV3 swap callback — called by the pool during swap to collect tokenIn
+    /// @param amount0Delta Amount of token0 owed (positive = owed by caller)
+    /// @param amount1Delta Amount of token1 owed (positive = owed by caller)
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        if (msg.sender != _pendingV3Pool) revert NotPendingV3Pool();
+
+        // Transfer the owed amount to the pool (whichever delta is positive)
+        uint256 amountOwed = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
+        // Cap at our expected amount to prevent a malicious pool from draining extra tokens
+        if (amountOwed > _pendingV3AmountIn) amountOwed = _pendingV3AmountIn;
+
+        IERC20(_pendingV3TokenIn).safeTransfer(msg.sender, amountOwed);
+    }
+
+    /// @dev Curve: approve pool to pull tokens, call exchange, reset approval
     function _swapCurve(SwapStep memory step, uint256 index) internal {
+        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
+        IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
-    /// @dev Balancer V2 swap.
+    /// @dev Balancer: approve Vault to pull tokens, call swap, reset approval
     function _swapBalancer(SwapStep memory step, uint256 index) internal {
+        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
+        IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
-    /// @dev Bancor V3 swap.
+    /// @dev Bancor: approve router to pull tokens, call trade, reset approval
     function _swapBancor(SwapStep memory step, uint256 index) internal {
+        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
+        IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
     /// @notice Emergency token rescue - owner only
