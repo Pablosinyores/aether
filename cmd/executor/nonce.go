@@ -7,15 +7,19 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/ethclient"
 )
+
+// NonceProvider is the interface for fetching on-chain nonce.
+type NonceProvider interface {
+	PendingNonceAt(ctx context.Context, account common.Address) (uint64, error)
+}
 
 // NonceManager handles atomic nonce management with periodic on-chain sync
 type NonceManager struct {
 	current atomic.Uint64
 	pending atomic.Int32 // Number of pending transactions
 	address common.Address
-	client  *ethclient.Client
+	client  NonceProvider
 }
 
 // NewNonceManager creates a new nonce manager
@@ -26,7 +30,7 @@ func NewNonceManager(initialNonce uint64) *NonceManager {
 }
 
 // SetSyncSource configures the address and client for on-chain nonce sync.
-func (nm *NonceManager) SetSyncSource(address common.Address, client *ethclient.Client) {
+func (nm *NonceManager) SetSyncSource(address common.Address, client NonceProvider) {
 	nm.address = address
 	nm.client = client
 }
