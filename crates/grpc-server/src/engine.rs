@@ -719,7 +719,7 @@ impl AetherEngine {
                 self.detector.detect_from_affected(&graph, &affected)
             };
             let detect_us = t_detect.elapsed().as_micros();
-            self.metrics.set_detection_latency_us(detect_us);
+            self.metrics.observe_detection_latency_us(detect_us);
             info!(detect_us, "Bellman-Ford detection complete");
             self.metrics.inc_cycles_detected(cycles.len() as u64);
 
