@@ -32,11 +32,11 @@ func TestMetricsEndpoint_ContainsRequiredMetrics(t *testing.T) {
 	}
 
 	required := []string{
-		"bundles_submitted",
-		"bundles_included",
-		"profit_total_wei",
-		"gas_spent_wei",
-		"risk_rejections",
+		"aether_bundles_submitted_total",
+		"aether_bundles_included_total",
+		"aether_profit_total_wei",
+		"aether_gas_spent_wei_total",
+		"aether_risk_rejections_total",
 	}
 
 	payload := string(body)

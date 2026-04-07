@@ -14,23 +14,23 @@ import (
 
 var (
 	bundlesSubmitted = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "bundles_submitted",
+		Name: "aether_bundles_submitted_total",
 		Help: "Total bundles submitted for builder fanout",
 	})
 	bundlesIncluded = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "bundles_included",
+		Name: "aether_bundles_included_total",
 		Help: "Total bundles with at least one builder acceptance",
 	})
 	profitTotalWei = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "profit_total_wei",
+		Name: "aether_profit_total_wei",
 		Help: "Total estimated net profit for included bundles in wei",
 	})
 	gasSpentWei = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "gas_spent_wei",
+		Name: "aether_gas_spent_wei_total",
 		Help: "Total estimated gas spent for included bundles in wei",
 	})
 	riskRejections = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "risk_rejections",
+		Name: "aether_risk_rejections_total",
 		Help: "Total arbs rejected by preflight risk checks",
 	})
 )

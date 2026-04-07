@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 pub struct EngineMetrics {
     registry: Registry,
-    detection_latency_us: IntGauge,
+    detection_latency_ms: Histogram,
     cycles_detected: IntCounter,
     simulations_run: IntCounter,
     arbs_published: IntCounter,
@@ -19,51 +20,54 @@ impl EngineMetrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
-        let detection_latency_us = IntGauge::new(
-            "detection_latency_us",
-            "Detection latency in microseconds",
+        let detection_latency_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_detection_latency_ms",
+                "Detection latency in milliseconds",
+            )
+            .buckets(vec![0.1, 0.5, 1.0, 3.0, 5.0, 10.0, 50.0]),
         )
-        .expect("detection_latency_us gauge");
+        .expect("aether_detection_latency_ms histogram");
         let cycles_detected = IntCounter::new(
-            "cycles_detected",
+            "aether_cycles_detected_total",
             "Total negative cycles detected",
         )
-        .expect("cycles_detected counter");
+        .expect("aether_cycles_detected_total counter");
         let simulations_run = IntCounter::new(
-            "simulations_run",
+            "aether_simulations_run_total",
             "Total simulations executed",
         )
-        .expect("simulations_run counter");
+        .expect("aether_simulations_run_total counter");
         let arbs_published = IntCounter::new(
-            "arbs_published",
+            "aether_arbs_published_total",
             "Total validated arbs published",
         )
-        .expect("arbs_published counter");
+        .expect("aether_arbs_published_total counter");
         let blocks_processed = IntCounter::new(
-            "blocks_processed",
+            "aether_blocks_processed_total",
             "Total blocks processed",
         )
-        .expect("blocks_processed counter");
+        .expect("aether_blocks_processed_total counter");
 
         registry
-            .register(Box::new(detection_latency_us.clone()))
-            .expect("register detection_latency_us");
+            .register(Box::new(detection_latency_ms.clone()))
+            .expect("register aether_detection_latency_ms");
         registry
             .register(Box::new(cycles_detected.clone()))
-            .expect("register cycles_detected");
+            .expect("register aether_cycles_detected_total");
         registry
             .register(Box::new(simulations_run.clone()))
-            .expect("register simulations_run");
+            .expect("register aether_simulations_run_total");
         registry
             .register(Box::new(arbs_published.clone()))
-            .expect("register arbs_published");
+            .expect("register aether_arbs_published_total");
         registry
             .register(Box::new(blocks_processed.clone()))
-            .expect("register blocks_processed");
+            .expect("register aether_blocks_processed_total");
 
         Self {
             registry,
-            detection_latency_us,
+            detection_latency_ms,
             cycles_detected,
             simulations_run,
             arbs_published,
@@ -71,13 +75,9 @@ impl EngineMetrics {
         }
     }
 
-    pub fn set_detection_latency_us(&self, value: u128) {
-        let clamped = if value > i64::MAX as u128 {
-            i64::MAX
-        } else {
-            value as i64
-        };
-        self.detection_latency_us.set(clamped);
+    pub fn observe_detection_latency_us(&self, us: u128) {
+        let ms = us as f64 / 1000.0;
+        self.detection_latency_ms.observe(ms);
     }
 
     pub fn inc_cycles_detected(&self, count: u64) {
@@ -148,7 +148,10 @@ async fn handle_connection(
     metrics: Arc<EngineMetrics>,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 1024];
-    let n = socket.read(&mut buf).await?;
+    let n = match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    };
     if n == 0 {
         return Ok(());
     }
@@ -161,14 +164,14 @@ async fn handle_connection(
         .unwrap_or("/");
 
     if path != "/metrics" {
-        let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        let response = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
         socket.write_all(response.as_bytes()).await?;
         return Ok(());
     }
 
     let body = metrics.render();
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
     socket.write_all(header.as_bytes()).await?;
@@ -197,7 +200,7 @@ mod tests {
     fn test_metrics_render_contains_required_names() {
         let metrics = EngineMetrics::new();
 
-        metrics.set_detection_latency_us(123);
+        metrics.observe_detection_latency_us(3000); // 3ms
         metrics.inc_cycles_detected(2);
         metrics.inc_simulations_run(3);
         metrics.inc_arbs_published(4);
@@ -206,19 +209,21 @@ mod tests {
         let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
 
         for name in [
-            "detection_latency_us",
-            "cycles_detected",
-            "simulations_run",
-            "arbs_published",
-            "blocks_processed",
+            "aether_detection_latency_ms",
+            "aether_cycles_detected_total",
+            "aether_simulations_run_total",
+            "aether_arbs_published_total",
+            "aether_blocks_processed_total",
         ] {
             assert!(output.contains(name), "missing metric {name}");
         }
 
-        assert!(output.contains("detection_latency_us 123"));
-        assert!(output.contains("cycles_detected 2"));
-        assert!(output.contains("simulations_run 3"));
-        assert!(output.contains("arbs_published 4"));
-        assert!(output.contains("blocks_processed 1"));
+        // Histogram emits _count and _sum
+        assert!(output.contains("aether_detection_latency_ms_count 1"));
+        assert!(output.contains("aether_detection_latency_ms_sum 3"));
+        assert!(output.contains("aether_cycles_detected_total 2"));
+        assert!(output.contains("aether_simulations_run_total 3"));
+        assert!(output.contains("aether_arbs_published_total 4"));
+        assert!(output.contains("aether_blocks_processed_total 1"));
     }
 }
