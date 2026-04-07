@@ -2,6 +2,7 @@ package risk
 
 import (
 	"math/big"
+	"sync"
 	"testing"
 )
 
@@ -532,6 +533,47 @@ func TestCalculateTipShare_ContinuesAfterWindowFills(t *testing.T) {
 	if tipAfterMisses <= tipAfterFill {
 		t.Errorf("strategy frozen after window fill: tip did not increase after misses (before=%.1f, after=%.1f)", tipAfterFill, tipAfterMisses)
 	}
+}
+
+// TestCalculateTipShare_ConcurrentAccess exercises RecordBundleResult and
+// CalculateTipShare from multiple goroutines simultaneously. Run with
+// -race to validate mutex correctness.
+func TestCalculateTipShare_ConcurrentAccess(t *testing.T) {
+	rm := NewRiskManager(DefaultRiskConfig())
+	profit := ethWei(t, 1)
+
+	const goroutines = 10
+	const iters = 50
+
+	var wg sync.WaitGroup
+
+	// Writers: record bundle results concurrently.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				rm.RecordBundleResult(j%2 == 0)
+			}
+		}(i)
+	}
+
+	// Readers: calculate tip share concurrently with writes.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				tip := rm.CalculateTipShare(profit, 30.0)
+				if tip < DefaultRiskConfig().MinTipSharePct || tip > DefaultRiskConfig().MaxTipSharePct {
+					t.Errorf("tip share %.1f%% out of bounds [%.1f%%, %.1f%%]",
+						tip, DefaultRiskConfig().MinTipSharePct, DefaultRiskConfig().MaxTipSharePct)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestWeiToETH(t *testing.T) {
