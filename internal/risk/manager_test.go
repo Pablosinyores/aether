@@ -507,6 +507,33 @@ func TestCalculateTipShare_RespectsConfiguredBounds(t *testing.T) {
 	}
 }
 
+func TestCalculateTipShare_ContinuesAfterWindowFills(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// Fill the window with 110 included bundles (> 100 window size).
+	for i := 0; i < 110; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	// Strategy should have decreased from 90% toward min due to high inclusion.
+	tipAfterFill := rm.CalculateTipShare(profitWei, 30.0)
+
+	// Record 60 misses — pushes inclusion below 50% low threshold in a 100-entry window.
+	for i := 0; i < 60; i++ {
+		rm.RecordBundleResult(false)
+	}
+
+	// Strategy must still respond — not frozen after window wrap.
+	tipAfterMisses := rm.CalculateTipShare(profitWei, 30.0)
+	if tipAfterMisses <= tipAfterFill {
+		t.Errorf("strategy frozen after window fill: tip did not increase after misses (before=%.1f, after=%.1f)", tipAfterFill, tipAfterMisses)
+	}
+}
+
 func TestWeiToETH(t *testing.T) {
 	t.Parallel()
 

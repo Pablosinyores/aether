@@ -108,10 +108,10 @@ type RiskManager struct {
 	dailyVolume         *big.Int    // Wei
 	dailyPnL            *big.Int    // Wei (can be negative)
 	dailyResetTime      time.Time
-	bundleResults       []bool // Sliding window ring buffer
-	bundleResultIdx     int    // Next write position; always increments (never resets)
-	bundleResultCount   int    // Entries filled (capped at window size)
-	lastAdjustedAtIdx   int    // Gate: tip share adjusted when bundleResultIdx > this
+	bundleResults      []bool // Sliding window ring buffer
+	bundleResultIdx    int    // Next write position; always increments (never resets)
+	bundleResultCount  int    // Entries filled (capped at window size)
+	lastAdjustedAtIdx  int    // Gate: bundleResultIdx value at last tip adjustment
 
 	// Prometheus-style counters (read via atomic; no external dependency).
 	BugRevertTotal  atomic.Int64
@@ -148,8 +148,8 @@ func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) fl
 	defer rm.mu.Unlock()
 
 	// Only adjust when new bundle feedback has arrived since the last adjustment.
-	// Use bundleResultIdx (always increments) as the gate — bundleResultCount is
-	// capped at the window size and would cause the gate to freeze after 100 results.
+	// Use bundleResultIdx (always increments) not bundleResultCount (capped at window size)
+	// to avoid freezing the gate after the ring buffer fills at 100 entries.
 	if rm.bundleResultIdx == 0 || rm.bundleResultIdx <= rm.lastAdjustedAtIdx {
 		return rm.lastTipSharePct
 	}
