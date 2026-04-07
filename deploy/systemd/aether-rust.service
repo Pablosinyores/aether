@@ -1,9 +1,8 @@
 [Unit]
 Description=Aether Arbitrage Engine - Rust Core
 Documentation=https://github.com/aether/docs
-After=network-online.target postgresql.service redis.service
+After=network-online.target
 Wants=network-online.target
-Requires=postgresql.service redis.service
 
 [Service]
 Type=simple

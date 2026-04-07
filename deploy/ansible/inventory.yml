@@ -8,9 +8,6 @@ all:
     aether_bin_dir: /opt/aether/bin
     aether_data_dir: /opt/aether/data
     aether_log_dir: /opt/aether/logs
-    postgres_db: aether
-    postgres_user: aether
-    redis_port: 6379
     prometheus_port: 9091
     grafana_port: 3000
 

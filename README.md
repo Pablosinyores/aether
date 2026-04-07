@@ -19,7 +19,7 @@ Sub-millisecond opportunity detection across Uniswap V2/V3, SushiSwap, Curve, Ba
 | Monitoring & API | **Go** | Prometheus, gRPC, `net/http` |
 | On-Chain Executor | **Solidity** | Aave V3 Flash Loans, OpenZeppelin |
 | Inter-Service Communication | Both | gRPC + Protobuf over Unix Domain Sockets |
-| Infrastructure | — | PostgreSQL, Redis, Prometheus, Grafana, Loki |
+| Infrastructure | — | Prometheus, Grafana, Loki |
 
 ---
 
@@ -200,13 +200,13 @@ Start the full stack locally with infrastructure services:
 ./scripts/deploy.sh docker up
 ```
 
-This starts: `aether-rust`, `aether-go`, PostgreSQL, Redis, Prometheus.
+This starts: `aether-rust`, `aether-go`, Prometheus.
 
 ### Manual Start
 
 ```bash
 # 1. Start infrastructure
-docker compose -f deploy/docker/docker-compose.yml up -d postgres redis prometheus
+docker compose -f deploy/docker/docker-compose.yml up -d prometheus
 
 # 2. Start Rust core (gRPC server)
 cargo run --release --bin aether-grpc-server
