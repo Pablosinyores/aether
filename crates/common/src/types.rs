@@ -18,7 +18,7 @@ impl ProtocolType {
     pub fn base_gas(&self) -> u64 {
         match self {
             ProtocolType::UniswapV2 => 60_000,
-            ProtocolType::UniswapV3 => 200_000,
+            ProtocolType::UniswapV3 => 180_000,
             ProtocolType::SushiSwap => 60_000,
             ProtocolType::Curve => 130_000,
             ProtocolType::BalancerV2 => 120_000,
