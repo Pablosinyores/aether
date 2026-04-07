@@ -14,23 +14,23 @@ import (
 
 var (
 	bundlesSubmitted = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "aether_bundles_submitted_total",
+		Name: "aether_executor_bundles_submitted_total",
 		Help: "Total bundles submitted for builder fanout",
 	})
 	bundlesIncluded = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "aether_bundles_included_total",
+		Name: "aether_executor_bundles_included_total",
 		Help: "Total bundles with at least one builder acceptance",
 	})
 	profitTotalWei = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "aether_profit_total_wei",
+		Name: "aether_executor_profit_wei_total",
 		Help: "Total estimated net profit for included bundles in wei",
 	})
 	gasSpentWei = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "aether_gas_spent_wei_total",
+		Name: "aether_executor_gas_spent_wei_total",
 		Help: "Total estimated gas spent for included bundles in wei",
 	})
 	riskRejections = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "aether_risk_rejections_total",
+		Name: "aether_executor_risk_rejections_total",
 		Help: "Total arbs rejected by preflight risk checks",
 	})
 )
@@ -90,7 +90,10 @@ func addBigIntCounter(counter prometheus.Counter, value *big.Int) {
 	if value == nil || value.Sign() == 0 {
 		return
 	}
-	f, _ := new(big.Float).SetInt(value).Float64()
+	f, accuracy := new(big.Float).SetInt(value).Float64()
+	if accuracy != big.Exact {
+		log.Printf("Metrics precision loss: %s truncated to %.0f", value.String(), f)
+	}
 	if f == 0 {
 		return
 	}

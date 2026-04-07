@@ -139,7 +139,7 @@ struct CycleCandidate {
 }
 
 impl AetherEngine {
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn new(config: EngineConfig, arb_tx: broadcast::Sender<ProtoValidatedArb>) -> Self {
         let metrics = Arc::new(EngineMetrics::new());
         Self::new_with_metrics(config, arb_tx, metrics)
