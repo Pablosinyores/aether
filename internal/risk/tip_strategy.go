@@ -5,6 +5,10 @@ import (
 )
 
 // TipStrategy computes the tip share percentage to use for bundle submission.
+//
+// SAFETY: Implementations may hold mutable state (e.g. AdaptiveTipStrategy).
+// CalculateTip must only be called while the caller holds RiskManager.mu —
+// never invoke it directly without that lock, or concurrent calls will race.
 type TipStrategy interface {
 	CalculateTip(profitWei *big.Int, inclusionRate float64, gasGwei float64) float64
 }
