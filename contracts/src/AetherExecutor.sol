@@ -272,6 +272,10 @@ contract AetherExecutor {
         // Zero out to prevent double-spend if pool calls back multiple times
         _pendingV3AmountIn = 0;
 
+        // Skip transfer if nothing owed (e.g. second callback after double-spend protection)
+        // Some ERC20s revert on zero-amount transfers
+        if (amountOwed == 0) return;
+
         IERC20(_pendingV3TokenIn).safeTransfer(msg.sender, amountOwed);
     }
 
