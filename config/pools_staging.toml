@@ -1,0 +1,22 @@
+# Aether Pool Registry - Staging / E2E Test Override
+#
+# Uses WETH/DAI pairs (both 18-decimal tokens) so the optimizer's raw-reserve
+# input-range logic works correctly. WETH/USDC has a 12-order-of-magnitude
+# decimal mismatch (18 vs 6) that causes min_input > max_input, making the
+# ternary-search degenerate. DAI avoids this because it also has 18 decimals.
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0xC3D03e4F041Fd4cD388c549Ee2A29a9E5075882f"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 25
+tier = "hot"

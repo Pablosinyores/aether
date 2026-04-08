@@ -33,20 +33,26 @@ SWAP_INTERVAL="${SWAP_INTERVAL:-300}"        # Inject new swap every 5 minutes
 SKIP_BUILD="${SKIP_BUILD:-0}"
 KEEP_LOGS="${KEEP_LOGS:-1}"
 
-# Anvil default account 0 — used as deployer + searcher
-SEARCHER_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcda11cb7257a0b8d2"
-SEARCHER_ADDR="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+# Anvil default account 0 — used as deployer + staging searcher.
+# Named STAGING_KEY (not SEARCHER_KEY) so .env cannot override it.
+STAGING_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcda11cb7257a0b8d2"
+STAGING_ADDR="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
 # Mainnet addresses (exist on fork)
-USDC="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+# We use DAI/WETH pairs (both 18 decimals) so the optimizer's raw-reserve range
+# works correctly. USDC has 6 decimals which causes a decimal mismatch in the
+# min_liquidity cap, making max_input < min_input and the arb unprofitable.
+DAI="0x6B175474E89094C44Da98b954EedeAC495271d0F"
 WETH="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 UNIV2_ROUTER="0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
-UNIV2_POOL="0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
-SUSHI_POOL="0x397FF1542f962076d0BFE58eA045FfA2d347ACa0"
+UNIV2_DAI_WETH="0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"
+SUSHI_DAI_WETH="0xC3D03e4F041Fd4cD388c549Ee2A29a9E5075882f"
 SUSHI_ROUTER="0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
-# Known USDC whale on mainnet (Circle/Centre reserve)
-USDC_WHALE="0x55FE002aefF02F77364de339a1292923A15844B8"
+# DAI whale: Compound cDAI contract (~5.9M DAI on mainnet fork)
+DAI_WHALE="0x5d3a536E4D6DbD6114cc1Ead35777bAB948E3643"
 AAVE_V3_POOL="0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+# Staging pools config — uses DAI/WETH to avoid 18 vs 6 decimal optimizer issue
+STAGING_POOLS_CONFIG="$PROJECT_ROOT/config/pools_staging.toml"
 
 # --- Colors & Logging ---
 
@@ -132,6 +138,10 @@ if [ -f .env ]; then
     log_info "Loaded .env"
 fi
 
+# Unset RUST_LOG so it doesn't pollute cast/forge stdout with debug output.
+# The Rust service sets it explicitly in Phase 6.
+unset RUST_LOG
+
 # Validate ETH_RPC_URL
 if [ -z "${ETH_RPC_URL:-}" ]; then
     log_error "ETH_RPC_URL not set. Required for Anvil fork source."
@@ -214,36 +224,43 @@ ANVIL_PID=$!
 
 wait_for_port "$ANVIL_PORT" "Anvil" 60
 
-# Verify fork is working
-FORK_BLOCK=$(cast block-number --rpc-url "$ANVIL_RPC" 2>/dev/null || echo "0")
+# Verify fork is working (tail -1 strips any stray debug lines)
+FORK_BLOCK=$(cast block-number --rpc-url "$ANVIL_RPC" 2>/dev/null | tail -1 || echo "0")
 if [ "$FORK_BLOCK" = "0" ]; then
     log_error "Anvil fork failed — could not fetch block number"
     exit 1
 fi
 log_ok "Anvil forked at block $FORK_BLOCK"
 
+# Fund the DAI whale with 1 ETH for gas. On the mainnet fork the whale
+# (Compound cDAI contract) holds plenty of DAI but has no ETH for gas.
+# anvil_setBalance mints ETH without requiring a real transaction.
+# 1 ETH = 0xDE0B6B3A7640000 wei
+cast rpc anvil_setBalance "$DAI_WHALE" "0xDE0B6B3A7640000" \
+    --rpc-url "$ANVIL_RPC" > /dev/null 2>&1 || true
+log_ok "Funded DAI whale ($DAI_WHALE) with 1 ETH for gas"
+
 # --- Phase 4: Deploy AetherExecutor Contract ---
 
 log_step "Phase 4: Deploy AetherExecutor Contract"
 
 log_info "Deploying AetherExecutor to Anvil fork..."
-DEPLOY_OUTPUT=$(forge script contracts/script/Deploy.s.sol \
+# || true prevents set -e from exiting on non-zero; we check EXECUTOR_ADDR below
+DEPLOY_OUTPUT=$(cd "$PROJECT_ROOT/contracts" && forge script script/Deploy.s.sol \
     --rpc-url "$ANVIL_RPC" \
-    --private-key "$SEARCHER_KEY" \
+    --private-key "$STAGING_KEY" \
     --broadcast \
-    --root "$PROJECT_ROOT/contracts" \
-    2>&1)
+    2>&1) || true
 
 EXECUTOR_ADDR=$(echo "$DEPLOY_OUTPUT" | grep "AetherExecutor deployed at:" | awk '{print $NF}')
 if [ -z "$EXECUTOR_ADDR" ]; then
-    log_warn "Could not parse deploy address, using forge create fallback..."
-    DEPLOY_OUTPUT=$(forge create \
+    log_warn "Could not parse deploy address from forge script, using forge create fallback..."
+    DEPLOY_OUTPUT=$(cd "$PROJECT_ROOT/contracts" && forge create \
         --rpc-url "$ANVIL_RPC" \
-        --private-key "$SEARCHER_KEY" \
-        --root "$PROJECT_ROOT/contracts" \
+        --private-key "$STAGING_KEY" \
         "src/AetherExecutor.sol:AetherExecutor" \
         --constructor-args "$AAVE_V3_POOL" \
-        2>&1)
+        2>&1) || true
     EXECUTOR_ADDR=$(echo "$DEPLOY_OUTPUT" | grep "Deployed to:" | awk '{print $3}')
 fi
 
@@ -267,7 +284,9 @@ log_step "Phase 5: Seed Price Divergence (Create Arb Opportunity)"
 
 seed_arb_opportunity() {
     local direction="${1:-uniswap}"  # "uniswap" or "sushi"
-    local swap_amount="${2:-5000000000000}"  # 5M USDC (6 decimals)
+    # 500K DAI (18 decimals) = 500000 * 10^18 = 5*10^23
+    # Large enough to move the price ~0.5% on a $50M pool and create a real arb
+    local swap_amount="${2:-500000000000000000000000}"
     local router token_in_label
 
     if [ "$direction" = "uniswap" ]; then
@@ -280,33 +299,45 @@ seed_arb_opportunity() {
 
     local deadline=$(($(date +%s) + 3600))
 
-    log_info "Swapping USDC->WETH on $token_in_label to create price divergence..."
+    log_info "Swapping DAI->WETH on $token_in_label to create price divergence..."
 
-    # Approve router for USDC spending
-    cast send "$USDC" \
+    local approve_out swap_out
+    # Approve router for DAI spending (|| true so set -e doesn't abort)
+    approve_out=$(cast send "$DAI" \
         "approve(address,uint256)" "$router" "$swap_amount" \
-        --from "$USDC_WHALE" \
+        --from "$DAI_WHALE" \
         --unlocked \
         --rpc-url "$ANVIL_RPC" \
-        > /dev/null 2>&1
+        2>&1) || true
 
-    # Execute swap — moves price on one DEX while the other stays unchanged
-    cast send "$router" \
+    # A real error starts with "Error:" on its own line
+    if echo "$approve_out" | grep -q "^Error:"; then
+        log_warn "DAI approve failed: $(echo "$approve_out" | grep "^Error:" | head -1)"
+        return 1
+    fi
+
+    # Execute swap — moves DAI/WETH price on one DEX while the other stays unchanged
+    swap_out=$(cast send "$router" \
         "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)" \
-        "$swap_amount" "0" "[$USDC,$WETH]" "$USDC_WHALE" "$deadline" \
-        --from "$USDC_WHALE" \
+        "$swap_amount" "0" "[$DAI,$WETH]" "$DAI_WHALE" "$deadline" \
+        --from "$DAI_WHALE" \
         --unlocked \
         --rpc-url "$ANVIL_RPC" \
-        > /dev/null 2>&1
+        2>&1) || true
 
-    # Mine a block to finalize
-    cast rpc anvil_mine 1 --rpc-url "$ANVIL_RPC" > /dev/null 2>&1
+    if echo "$swap_out" | grep -q "^Error:"; then
+        log_warn "DAI swap failed: $(echo "$swap_out" | grep "^Error:" | head -1)"
+        return 1
+    fi
 
-    log_ok "Price divergence seeded via $token_in_label swap"
+    # Mine a block to finalize and emit Sync events for the engine to pick up
+    cast rpc anvil_mine 1 --rpc-url "$ANVIL_RPC" > /dev/null 2>&1 || true
+
+    log_ok "Price divergence seeded via $token_in_label DAI/WETH swap"
 }
 
-# Initial seed: large swap on UniV2 moves its price while SushiSwap stays unchanged
-seed_arb_opportunity "uniswap" "5000000000000"
+# Initial seed: large DAI swap on UniV2 moves its price while SushiSwap stays unchanged
+seed_arb_opportunity "uniswap" "500000000000000000000000"
 
 # --- Phase 6: Start Rust gRPC Server ---
 
@@ -316,7 +347,7 @@ log_info "Starting Rust core (gRPC + detection engine)..."
 ETH_RPC_URL="$ANVIL_RPC" \
 GRPC_ADDRESS="127.0.0.1:${GRPC_PORT}" \
 RUST_LOG="info" \
-AETHER_POOLS_CONFIG="$PROJECT_ROOT/config/pools.toml" \
+AETHER_POOLS_CONFIG="$STAGING_POOLS_CONFIG" \
 RUST_METRICS_PORT="$RUST_METRICS_PORT" \
     ./target/release/aether-rust \
     > "$LOG_DIR/rust.log" 2>&1 &
@@ -347,7 +378,7 @@ log_step "Phase 7: Start Go Executor"
 log_info "Starting Go executor..."
 ETH_RPC_URL="$ANVIL_RPC" \
 GRPC_ADDRESS="127.0.0.1:${GRPC_PORT}" \
-SEARCHER_KEY="$SEARCHER_KEY" \
+SEARCHER_KEY="$STAGING_KEY" \
 METRICS_PORT="$GO_METRICS_PORT" \
 DASHBOARD_PORT="$DASHBOARD_PORT" \
     "$BIN_DIR/aether-executor" \
@@ -433,7 +464,7 @@ while true; do
     NOW=$(date +%s)
     if [ $(( NOW - LAST_SWAP_TIME )) -ge "$SWAP_INTERVAL" ]; then
         log_info "Injecting fresh price divergence ($SWAP_DIRECTION)..."
-        seed_arb_opportunity "$SWAP_DIRECTION" "2000000000000" || log_warn "Swap injection failed (non-fatal)"
+        seed_arb_opportunity "$SWAP_DIRECTION" "200000000000000000000000" || log_warn "Swap injection failed (non-fatal)"
         LAST_SWAP_TIME=$NOW
         # Alternate direction
         if [ "$SWAP_DIRECTION" = "sushi" ]; then
@@ -459,7 +490,7 @@ cast rpc anvil_setNextBlockBaseFeePerGas "0x5D21DBA000" --rpc-url "$ANVIL_RPC" >
 cast rpc anvil_mine 1 --rpc-url "$ANVIL_RPC" > /dev/null 2>&1 || true
 
 # Seed another arb opportunity so the engine has something to process at high gas
-seed_arb_opportunity "uniswap" "3000000000000" || true
+seed_arb_opportunity "uniswap" "300000000000000000000000" || true
 
 # Wait for the engine to process the high-gas block and for Go executor to evaluate
 sleep 15
