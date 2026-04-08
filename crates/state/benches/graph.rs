@@ -242,7 +242,9 @@ fn bench_edge_index_lookup(c: &mut Criterion) {
             let proto = protocols[i % protocols.len()];
             let pid = PoolId {
                 address: Address::from_slice(&[
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    (i >> 24) as u8,
+                    (i >> 16) as u8,
                     (i >> 8) as u8,
                     (i & 0xff) as u8,
                     proto as u8,
