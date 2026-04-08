@@ -12,6 +12,16 @@ import (
 	aethergrpc "github.com/aether-arb/aether/internal/grpc"
 )
 
+// grpcAddr returns the gRPC address for integration tests.
+// Respects GRPC_ADDRESS env var so tests can target UDS or alternative ports.
+func grpcAddr(t *testing.T) string {
+	t.Helper()
+	if addr := os.Getenv("GRPC_ADDRESS"); addr != "" {
+		return addr
+	}
+	return "[::1]:50051"
+}
+
 // TestGRPCCrossLanguage_HealthCheck starts the real Rust gRPC server binary
 // and verifies that the Go health-check client can communicate with it.
 //
@@ -53,7 +63,7 @@ func TestGRPCCrossLanguage_HealthCheck(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Connect Go client to the Rust server
-	client, err := aethergrpc.Dial("[::1]:50051")
+	client, err := aethergrpc.Dial(grpcAddr(t))
 	if err != nil {
 		t.Fatalf("failed to dial Rust server: %v", err)
 	}
@@ -106,7 +116,7 @@ func TestGRPCCrossLanguage_StreamArbs(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	client, err := aethergrpc.Dial("[::1]:50051")
+	client, err := aethergrpc.Dial(grpcAddr(t))
 	if err != nil {
 		t.Fatalf("failed to dial Rust server: %v", err)
 	}
@@ -161,7 +171,7 @@ func TestGRPCCrossLanguage_ControlSetState(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	client, err := aethergrpc.Dial("[::1]:50051")
+	client, err := aethergrpc.Dial(grpcAddr(t))
 	if err != nil {
 		t.Fatalf("failed to dial Rust server: %v", err)
 	}
