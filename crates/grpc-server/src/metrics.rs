@@ -10,6 +10,7 @@ use tracing::{info, warn};
 pub struct EngineMetrics {
     registry: Registry,
     detection_latency_ms: Histogram,
+    simulation_latency_ms: Histogram,
     cycles_detected: IntCounter,
     simulations_run: IntCounter,
     arbs_published: IntCounter,
@@ -28,6 +29,14 @@ impl EngineMetrics {
             .buckets(vec![0.1, 0.5, 1.0, 3.0, 5.0, 10.0, 50.0]),
         )
         .expect("aether_detection_latency_ms histogram");
+        let simulation_latency_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_simulation_latency_ms",
+                "EVM simulation latency in milliseconds",
+            )
+            .buckets(vec![0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0]),
+        )
+        .expect("aether_simulation_latency_ms histogram");
         let cycles_detected = IntCounter::new(
             "aether_cycles_detected_total",
             "Total negative cycles detected",
@@ -53,6 +62,9 @@ impl EngineMetrics {
             .register(Box::new(detection_latency_ms.clone()))
             .expect("register aether_detection_latency_ms");
         registry
+            .register(Box::new(simulation_latency_ms.clone()))
+            .expect("register aether_simulation_latency_ms");
+        registry
             .register(Box::new(cycles_detected.clone()))
             .expect("register aether_cycles_detected_total");
         registry
@@ -68,6 +80,7 @@ impl EngineMetrics {
         Self {
             registry,
             detection_latency_ms,
+            simulation_latency_ms,
             cycles_detected,
             simulations_run,
             arbs_published,
@@ -78,6 +91,11 @@ impl EngineMetrics {
     pub fn observe_detection_latency_us(&self, us: u128) {
         let ms = us as f64 / 1000.0;
         self.detection_latency_ms.observe(ms);
+    }
+
+    pub fn observe_simulation_latency_us(&self, us: u128) {
+        let ms = us as f64 / 1000.0;
+        self.simulation_latency_ms.observe(ms);
     }
 
     pub fn inc_cycles_detected(&self, count: u64) {
@@ -201,6 +219,7 @@ mod tests {
         let metrics = EngineMetrics::new();
 
         metrics.observe_detection_latency_us(3000); // 3ms
+        metrics.observe_simulation_latency_us(5000); // 5ms
         metrics.inc_cycles_detected(2);
         metrics.inc_simulations_run(3);
         metrics.inc_arbs_published(4);
@@ -210,6 +229,7 @@ mod tests {
 
         for name in [
             "aether_detection_latency_ms",
+            "aether_simulation_latency_ms",
             "aether_cycles_detected_total",
             "aether_simulations_run_total",
             "aether_arbs_published_total",
@@ -221,6 +241,8 @@ mod tests {
         // Histogram emits _count and _sum
         assert!(output.contains("aether_detection_latency_ms_count 1"));
         assert!(output.contains("aether_detection_latency_ms_sum 3"));
+        assert!(output.contains("aether_simulation_latency_ms_count 1"));
+        assert!(output.contains("aether_simulation_latency_ms_sum 5"));
         assert!(output.contains("aether_cycles_detected_total 2"));
         assert!(output.contains("aether_simulations_run_total 3"));
         assert!(output.contains("aether_arbs_published_total 4"));

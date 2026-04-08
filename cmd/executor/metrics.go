@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -33,6 +38,23 @@ var (
 		Name: "aether_executor_risk_rejections_total",
 		Help: "Total arbs rejected by preflight risk checks",
 	})
+	endToEndLatencyMs = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "aether_end_to_end_latency_ms",
+		Help:    "End-to-end latency from arb detection to bundle submission in ms",
+		Buckets: []float64{10, 50, 100, 250, 500, 1000, 2000, 5000},
+	})
+	gasPriceGwei = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aether_gas_price_gwei",
+		Help: "Current gas oracle base fee reading in gwei",
+	})
+	dailyPnlEth = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aether_daily_pnl_eth",
+		Help: "Cumulative daily profit minus gas costs in ETH, resets at UTC midnight",
+	})
+	ethBalance = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aether_eth_balance",
+		Help: "Current ETH balance of the searcher wallet",
+	})
 )
 
 func init() {
@@ -42,6 +64,10 @@ func init() {
 		profitTotalWei,
 		gasSpentWei,
 		riskRejections,
+		endToEndLatencyMs,
+		gasPriceGwei,
+		dailyPnlEth,
+		ethBalance,
 	)
 }
 
@@ -80,6 +106,8 @@ func recordBundleIncluded(profitWei *big.Int, gasGwei float64, gasUsed uint64) {
 	bundlesIncluded.Inc()
 	addBigIntCounter(profitTotalWei, profitWei)
 	addGasSpent(gasGwei, gasUsed)
+	gasCostWei := gasGwei * 1e9 * float64(gasUsed)
+	addPnl(profitWei, gasCostWei)
 }
 
 func recordRiskRejection() {
@@ -107,4 +135,80 @@ func addGasSpent(gasGwei float64, gasUsed uint64) {
 	gasWei := gasGwei * 1e9
 	gasSpent := gasWei * float64(gasUsed)
 	gasSpentWei.Add(gasSpent)
+}
+
+// --- End-to-end latency ---
+
+func recordEndToEndLatency(detectedAtNs int64) {
+	if detectedAtNs <= 0 {
+		return
+	}
+	detectedAt := time.Unix(0, detectedAtNs)
+	latencyMs := float64(time.Since(detectedAt).Milliseconds())
+	if latencyMs >= 0 {
+		endToEndLatencyMs.Observe(latencyMs)
+	}
+}
+
+// --- Gas price gauge ---
+
+func recordGasPrice(gwei float64) {
+	gasPriceGwei.Set(gwei)
+}
+
+// --- Daily PnL tracker ---
+
+var (
+	pnlMu  sync.Mutex
+	pnlWei = new(big.Int)
+	pnlDay time.Time
+)
+
+func addPnl(profitWei *big.Int, gasCostWei float64) {
+	pnlMu.Lock()
+	defer pnlMu.Unlock()
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	if !today.Equal(pnlDay) {
+		pnlWei.SetInt64(0)
+		pnlDay = today
+	}
+
+	if profitWei != nil {
+		pnlWei.Add(pnlWei, profitWei)
+	}
+	if gasCostWei > 0 {
+		gasCost := new(big.Int).SetUint64(uint64(gasCostWei))
+		pnlWei.Sub(pnlWei, gasCost)
+	}
+
+	ethVal, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(pnlWei),
+		new(big.Float).SetFloat64(1e18),
+	).Float64()
+	dailyPnlEth.Set(ethVal)
+}
+
+// --- ETH balance watcher ---
+
+func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			bal, err := client.BalanceAt(ctx, addr, nil)
+			if err != nil {
+				log.Printf("WARNING: eth_getBalance failed: %v", err)
+				continue
+			}
+			ethVal, _ := new(big.Float).Quo(
+				new(big.Float).SetInt(bal),
+				new(big.Float).SetFloat64(1e18),
+			).Float64()
+			ethBalance.Set(ethVal)
+		}
+	}
 }

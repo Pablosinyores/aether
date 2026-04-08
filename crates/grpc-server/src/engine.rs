@@ -1056,6 +1056,7 @@ impl AetherEngine {
             let sim_us = t_sim.elapsed().as_micros();
             sim_count += 1;
             self.metrics.inc_simulations_run(1);
+            self.metrics.observe_simulation_latency_us(sim_us);
 
             if !sim_result.success {
                 debug!(sim_us, reason = ?sim_result.revert_reason, "Simulation failed, skipping");
