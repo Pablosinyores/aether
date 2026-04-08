@@ -737,10 +737,10 @@ impl AetherEngine {
         let t_cycle = Instant::now();
 
         // Snapshot the current working graph for this detection cycle.
-        // This atomically captures all pending dirty edges and resets the
-        // working copy for the next cycle's event accumulation.
-        // Any events arriving during detection will set NEW dirty flags on
-        // working_graph, which will be picked up by the next cycle.
+        // Clone and clear_dirty MUST be atomic under the Mutex: if an event
+        // slips in between clone and clear, its dirty flag would be set on
+        // working_graph, then immediately wiped by clear_dirty — that pool
+        // update would never trigger a detection scan (TOCTOU on dirty flags).
         let (detection_graph, block_number, timestamp_ns) = {
             let mut graph = self.working_graph.lock().await;
             let snapshot_graph = graph.clone();
@@ -749,15 +749,15 @@ impl AetherEngine {
             (snapshot_graph, block.number, block.timestamp as i64)
         };
 
-        self.snapshot_manager
-            .publish(detection_graph, block_number, timestamp_ns);
-
-        // Phase 1: Detect cycles and extract candidate data from lock-free snapshot.
+        // Phase 1: Detect cycles using the local detection_graph directly.
+        // Publish to snapshot_manager AFTER detection so external readers
+        // only see snapshots whose detection has completed.
         let candidates = {
-            let snapshot = self.snapshot_manager.load();
-            let graph = &snapshot.graph;
+            let graph = &detection_graph;
 
             if !graph.has_dirty_edges() && graph.num_edges() == 0 {
+                self.snapshot_manager
+                    .publish(detection_graph, block_number, timestamp_ns);
                 return;
             }
 
@@ -775,12 +775,14 @@ impl AetherEngine {
             self.metrics.observe_detection_latency_us(detect_us);
             info!(
                 detect_us,
-                snapshot_version = snapshot.version,
+                block_number,
                 "Bellman-Ford detection complete"
             );
             self.metrics.inc_cycles_detected(cycles.len() as u64);
 
             if cycles.is_empty() {
+                self.snapshot_manager
+                    .publish(detection_graph, block_number, timestamp_ns);
                 return;
             }
 
@@ -913,8 +915,12 @@ impl AetherEngine {
             }
 
             candidates
-            // graph and token_index read locks released here.
         };
+
+        // Publish the snapshot after detection completes so external readers
+        // only see snapshots that have been fully evaluated.
+        self.snapshot_manager
+            .publish(detection_graph, block_number, timestamp_ns);
 
         let phase1_us = t_cycle.elapsed().as_micros();
 
@@ -1609,7 +1615,6 @@ mod tests {
                 ProtocolType::Curve,
                 U256::from(1_000_000u64),
             );
-            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000);
         }
 
         // Set a block so the detection cycle has context.
@@ -1737,7 +1742,6 @@ mod tests {
                 2050.0, meta_v3.pool_id, uni_v3_pool,
                 ProtocolType::UniswapV3, U256::from(1_000_000u64),
             );
-            engine.snapshot_manager.publish(graph.clone(), 18_000_000, 1_700_000_000);
         }
 
         // 4. Set a recent block so detection has context.
