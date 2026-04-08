@@ -25,12 +25,17 @@ func ethToWei(eth float64) *big.Int {
 }
 
 // newTestComponents creates a standard set of executor components for testing.
+// The submitter has no searcher key, so bundles without RawTxs will fail
+// submission (expected until signer is wired into test setup).
 func newTestComponents() (*risk.RiskManager, *BundleConstructor, *Submitter) {
 	rm := risk.NewRiskManager(risk.DefaultRiskConfig())
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
 	bundler := NewBundleConstructor(nm, go_, nil, 1)
-	submitter := NewSubmitter(defaultBuilderConfigs())
+	submitter, _ := NewSubmitter(defaultBuilderConfigs(), "")
+	submitter.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
+		return SubmissionResult{Builder: builder.Name, Success: true, BundleHash: "test-hash"}
+	}
 	return rm, bundler, submitter
 }
 
@@ -182,7 +187,7 @@ func TestProcessArb_CompetitiveReverts_DoNotPause(t *testing.T) {
 		{Name: "b2", Enabled: true, TimeoutMs: 1000},
 		{Name: "b3", Enabled: true, TimeoutMs: 1000},
 	}
-	submitter := NewSubmitter(builders)
+	submitter, _ := NewSubmitter(builders, "")
 	submitter.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
 		return SubmissionResult{
 			Builder: builder.Name,
@@ -224,7 +229,7 @@ func TestProcessArb_BugReverts_PauseSystem(t *testing.T) {
 		{Name: "b1", Enabled: true, TimeoutMs: 1000},
 		{Name: "b2", Enabled: true, TimeoutMs: 1000},
 	}
-	submitter := NewSubmitter(builders)
+	submitter, _ := NewSubmitter(builders, "")
 	submitter.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
 		return SubmissionResult{
 			Builder: builder.Name,
@@ -265,7 +270,7 @@ func TestProcessArb_NonRevertErrors_NotCounted(t *testing.T) {
 	bundler := NewBundleConstructor(nm, go_, nil, 1)
 
 	builders := []BuilderConfig{{Name: "b1", Enabled: true, TimeoutMs: 1000}}
-	submitter := NewSubmitter(builders)
+	submitter, _ := NewSubmitter(builders, "")
 	submitter.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
 		return SubmissionResult{
 			Builder: builder.Name,
@@ -321,7 +326,7 @@ func TestSubmitter_CustomSubmitFn_IsUsed(t *testing.T) {
 	t.Parallel()
 
 	builders := []BuilderConfig{{Name: "mock", Enabled: true, TimeoutMs: 1000}}
-	s := NewSubmitter(builders)
+	s, _ := NewSubmitter(builders, "")
 	s.submitFn = func(ctx context.Context, builder BuilderConfig, bundle *Bundle) SubmissionResult {
 		return SubmissionResult{
 			Builder:    builder.Name,
