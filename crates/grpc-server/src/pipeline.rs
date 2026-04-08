@@ -60,7 +60,7 @@ pub fn arb_hop_to_proto(hop: &ArbHop) -> aether_proto::ArbHop {
     }
 }
 
-/// Convert a native `SwapStep` to a proto `SwapStep`.
+/// Convert a native `SwapStep` to a proto `SwapStep` (by reference).
 pub fn swap_step_to_proto(step: &SwapStep) -> aether_proto::SwapStep {
     aether_proto::SwapStep {
         protocol: protocol_to_proto(step.protocol),
@@ -70,6 +70,20 @@ pub fn swap_step_to_proto(step: &SwapStep) -> aether_proto::SwapStep {
         amount_in: u256_to_bytes(&step.amount_in),
         min_amount_out: u256_to_bytes(&step.min_amount_out),
         calldata: Bytes::from(step.calldata.clone()),
+    }
+}
+
+/// Convert a native `SwapStep` to a proto `SwapStep` by value, moving the
+/// calldata buffer rather than cloning it.
+fn swap_step_into_proto(step: SwapStep) -> aether_proto::SwapStep {
+    aether_proto::SwapStep {
+        protocol: protocol_to_proto(step.protocol),
+        pool_address: address_to_bytes(&step.pool_address),
+        token_in: address_to_bytes(&step.token_in),
+        token_out: address_to_bytes(&step.token_out),
+        amount_in: u256_to_bytes(&step.amount_in),
+        min_amount_out: u256_to_bytes(&step.min_amount_out),
+        calldata: Bytes::from(step.calldata),
     }
 }
 
@@ -103,13 +117,14 @@ pub fn validated_arb_to_proto(arb: &ValidatedArb) -> aether_proto::ValidatedArb 
 /// message that gets published to the gRPC stream for the Go executor.
 ///
 /// `flashloan_token` and `flashloan_amount` come from the optimizer / calldata
-/// builder.  `calldata` is the ABI-encoded `executeArb()` payload.
+/// builder. `calldata` and `steps` are taken by value so their buffers are
+/// moved rather than copied into the proto message.
 pub fn build_validated_arb(
     opportunity: &ArbOpportunity,
     sim_result: &SimulationResult,
     flashloan_token: Address,
     flashloan_amount: U256,
-    steps: &[SwapStep],
+    steps: Vec<SwapStep>,
     calldata: Vec<u8>,
 ) -> aether_proto::ValidatedArb {
     // Use the simulation gas_used for total_gas when available.
@@ -137,7 +152,7 @@ pub fn build_validated_arb(
         timestamp_ns: opportunity.timestamp_ns,
         flashloan_token: address_to_bytes(&flashloan_token),
         flashloan_amount: u256_to_bytes(&flashloan_amount),
-        steps: steps.iter().map(swap_step_to_proto).collect(),
+        steps: steps.into_iter().map(swap_step_into_proto).collect(),
         calldata: Bytes::from(calldata),
     }
 }
@@ -400,8 +415,8 @@ mod tests {
             &sim_result,
             addresses::WETH,
             U256::from(1_000_000_000_000_000_000u128),
-            &steps,
-            calldata.clone(),
+            steps,
+            calldata,
         );
 
         assert_eq!(proto.id, "opp-001");
@@ -443,7 +458,7 @@ mod tests {
             &sim_result,
             addresses::WETH,
             U256::from(1_000_000_000_000_000_000u128),
-            &[],
+            vec![],
             vec![],
         );
 
@@ -478,7 +493,7 @@ mod tests {
             &sim_result,
             Address::ZERO,
             U256::ZERO,
-            &[],
+            vec![],
             vec![],
         );
 

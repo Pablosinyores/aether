@@ -28,6 +28,7 @@ revm-database = { version = "10", default-features = false, features = ["std", "
 tonic = "0.13"
 prost = "0.13"
 tonic-build = "0.13"
+prost-build = "0.13"
 # Data structures
 dashmap = "6"
 # Serialization
