@@ -32,6 +32,11 @@ impl EvmSimulator {
         Self::new(SimConfig::default())
     }
 
+    /// Return a reference to the simulator's configuration.
+    pub fn config(&self) -> &SimConfig {
+        &self.config
+    }
+
     /// Simulate a transaction on forked state.
     /// Returns SimulationResult with success/failure, gas used, and profit info.
     pub fn simulate(
