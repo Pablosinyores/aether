@@ -6,6 +6,8 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
@@ -142,6 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let uds = UnixListener::bind(uds_path)?;
+            // Restrict socket access to the process owner — UDS bypasses
+            // network-layer controls (iptables, mTLS), so file permissions
+            // are the only access control for ControlService endpoints.
+            std::fs::set_permissions(
+                uds_path,
+                PermissionsExt::from_mode(0o600),
+            )?;
             info!(path = %uds_path, "gRPC server listening on UDS");
             let stream = UnixListenerStream::new(uds);
             server.serve_with_incoming(stream).await.map_err(|e| {

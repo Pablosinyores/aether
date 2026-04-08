@@ -178,7 +178,7 @@ func main() {
 
 	startMetricsServer()
 
-	if strings.HasPrefix(cfg.GRPCAddress, "unix://") {
+	if strings.HasPrefix(cfg.GRPCAddress, "unix:") {
 		log.Printf("Executor service started, gRPC target: %s (UDS)", cfg.GRPCAddress)
 	} else {
 		log.Printf("Executor service started, gRPC target: %s (TCP)", cfg.GRPCAddress)

@@ -958,7 +958,7 @@ impl AetherEngine {
                 &sim_result,
                 candidate.flashloan_token,
                 input_amount,
-                &steps,
+                steps,
                 calldata,
             );
 

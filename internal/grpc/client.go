@@ -33,9 +33,8 @@ type Client struct {
 // first RPC call rather than during Dial, so this function returns quickly
 // even if the Rust server is not yet running.
 func Dial(addr string) (*Client, error) {
-	// grpc-go natively supports the unix:// scheme, so both TCP addresses
-	// (e.g. "localhost:50051") and UDS paths (e.g. "unix:///var/run/aether/engine.sock")
-	// work without a custom dialer.
+	// grpc-go natively supports the unix:// scheme — UDS paths
+	// (e.g. "unix:///var/run/aether/engine.sock") work without a custom dialer.
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
