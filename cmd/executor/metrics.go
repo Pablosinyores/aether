@@ -51,7 +51,7 @@ var (
 		Name: "aether_daily_pnl_eth",
 		Help: "Cumulative daily profit minus gas costs in ETH, resets at UTC midnight",
 	})
-	ethBalance = prometheus.NewGauge(prometheus.GaugeOpts{
+	ethBalanceGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "aether_eth_balance",
 		Help: "Current ETH balance of the searcher wallet",
 	})
@@ -67,7 +67,7 @@ func init() {
 		endToEndLatencyMs,
 		gasPriceGwei,
 		dailyPnlEth,
-		ethBalance,
+		ethBalanceGauge,
 	)
 }
 
@@ -144,7 +144,7 @@ func recordEndToEndLatency(detectedAtNs int64) {
 		return
 	}
 	detectedAt := time.Unix(0, detectedAtNs)
-	latencyMs := float64(time.Since(detectedAt).Milliseconds())
+	latencyMs := float64(time.Since(detectedAt).Nanoseconds()) / 1e6
 	if latencyMs >= 0 {
 		endToEndLatencyMs.Observe(latencyMs)
 	}
@@ -177,7 +177,7 @@ func addPnl(profitWei *big.Int, gasCostWei float64) {
 	if profitWei != nil {
 		pnlWei.Add(pnlWei, profitWei)
 	}
-	if gasCostWei > 0 {
+	if gasCostWei > 0 && gasCostWei == gasCostWei { // NaN != NaN
 		gasCost := new(big.Int).SetUint64(uint64(gasCostWei))
 		pnlWei.Sub(pnlWei, gasCost)
 	}
@@ -208,7 +208,7 @@ func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common
 				new(big.Float).SetInt(bal),
 				new(big.Float).SetFloat64(1e18),
 			).Float64()
-			ethBalance.Set(ethVal)
+			ethBalanceGauge.Set(ethVal)
 		}
 	}
 }

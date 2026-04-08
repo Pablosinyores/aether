@@ -262,9 +262,9 @@ func processArb(
 	}
 
 	// Submit to all builders
+	recordEndToEndLatency(arb.GetTimestampNs())
 	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
-	recordEndToEndLatency(arb.GetTimestampNs())
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 

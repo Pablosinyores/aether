@@ -34,7 +34,7 @@ impl EngineMetrics {
                 "aether_simulation_latency_ms",
                 "EVM simulation latency in milliseconds",
             )
-            .buckets(vec![0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0]),
+            .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0]),
         )
         .expect("aether_simulation_latency_ms histogram");
         let cycles_detected = IntCounter::new(
