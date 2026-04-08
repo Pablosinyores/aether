@@ -1398,7 +1398,7 @@ mod tests {
         assert_eq!(block.base_fee, 25_000_000_000);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_engine_detection_cycle_empty_graph() {
         let (tx, _rx) = broadcast::channel(100);
         let engine = AetherEngine::new(EngineConfig::default(), tx);
@@ -2092,7 +2092,7 @@ fee_bps = 30
         assert_eq!(config.slippage_bps, 500);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_optimizer_finds_optimal_input_not_hardcoded() {
         let arb = setup_triangle_engine(
             100,
@@ -2117,7 +2117,7 @@ fee_bps = 30
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_expected_out_is_nonzero_per_hop() {
         let arb = setup_triangle_engine(
             100,
@@ -2139,7 +2139,7 @@ fee_bps = 30
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_slippage_protection_active() {
         let arb = setup_triangle_engine(
             100,
@@ -2161,7 +2161,7 @@ fee_bps = 30
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_optimizer_respects_liquidity_cap() {
         // Set small liquidity so the optimizer is capped.
         let small_liquidity = U256::from(500_000_000_000_000_000u128); // 0.5 ETH
@@ -2178,7 +2178,7 @@ fee_bps = 30
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_hop_amounts_chain_correctly() {
         let arb = setup_triangle_engine(
             100,
@@ -2202,7 +2202,7 @@ fee_bps = 30
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_unprofitable_cycle_filtered_by_optimizer() {
         // rates 0.9^3 = 0.729 < 1 — unprofitable.
         let result = setup_triangle_engine(
@@ -2220,7 +2220,7 @@ fee_bps = 30
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_custom_slippage_bps_applied() {
         // 500 bps = 5% slippage
         let arb = setup_triangle_engine(
@@ -2253,7 +2253,7 @@ fee_bps = 30
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_optimizer_output_exceeds_input_for_profitable_cycle() {
         let arb = setup_triangle_engine(
             100,
@@ -2275,7 +2275,7 @@ fee_bps = 30
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_optimizer_profit_ge_fixed_1eth_with_reserves() {
         // Set up engine with realistic reserves so AMM math is exercised.
         let (tx, mut rx) = broadcast::channel(100);
