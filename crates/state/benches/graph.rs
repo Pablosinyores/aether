@@ -270,6 +270,7 @@ fn bench_edge_index_lookup(c: &mut Criterion) {
             &pool_ids,
             |b, pool_ids| {
                 b.iter(|| {
+                    g.clear_dirty();
                     for &(from, to, pid) in pool_ids.iter() {
                         g.update_edge_from_reserves(from, to, pid, 1000.0, 2050.0, 0.997);
                     }
@@ -283,6 +284,7 @@ fn bench_edge_index_lookup(c: &mut Criterion) {
             &pool_ids,
             |b, pool_ids| {
                 b.iter(|| {
+                    g.clear_dirty();
                     for &(from, to, pid) in pool_ids.iter() {
                         g.add_edge(
                             from,

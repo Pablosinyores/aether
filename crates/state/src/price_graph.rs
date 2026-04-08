@@ -92,22 +92,12 @@ impl PriceGraph {
             existing.weight = weight;
             existing.liquidity = liquidity;
             // Mirror the update in the flat edge list via O(1) index lookup.
-            debug_assert!(
-                self.edge_index.contains_key(&(from, to, pool_id)),
-                "edge_index missing key ({from}, {to}, {pool_id:?}) during update"
-            );
-            if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
-                debug_assert!(
-                    idx < self.dirty.len(),
-                    "edge index {idx} exceeds dirty bitvec len {}",
-                    self.dirty.len()
-                );
-                self.all_edges[idx].weight = weight;
-                self.all_edges[idx].liquidity = liquidity;
-                if idx < self.dirty.len() {
-                    self.dirty[idx] = true;
-                }
-            }
+            // Direct indexing: panics if the key is missing, which is correct —
+            // the adjacency list found the edge, so edge_index must agree.
+            let idx = self.edge_index[&(from, to, pool_id)];
+            self.all_edges[idx].weight = weight;
+            self.all_edges[idx].liquidity = liquidity;
+            self.dirty[idx] = true;
         } else {
             self.edges[from].push(edge.clone());
             let idx = self.all_edges.len();
@@ -145,21 +135,11 @@ impl PriceGraph {
         {
             existing.weight = -rate.ln();
             // Mirror the update in the flat edge list via O(1) index lookup.
-            debug_assert!(
-                self.edge_index.contains_key(&(from, to, pool_id)),
-                "edge_index missing key ({from}, {to}, {pool_id:?}) during update"
-            );
-            if let Some(&idx) = self.edge_index.get(&(from, to, pool_id)) {
-                debug_assert!(
-                    idx < self.dirty.len(),
-                    "edge index {idx} exceeds dirty bitvec len {}",
-                    self.dirty.len()
-                );
-                self.all_edges[idx].weight = existing.weight;
-                if idx < self.dirty.len() {
-                    self.dirty[idx] = true;
-                }
-            }
+            // Direct indexing: panics if the key is missing, which is correct —
+            // the adjacency list found the edge, so edge_index must agree.
+            let idx = self.edge_index[&(from, to, pool_id)];
+            self.all_edges[idx].weight = existing.weight;
+            self.dirty[idx] = true;
         }
     }
 
