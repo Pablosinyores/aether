@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use alloy::network::Ethereum;
@@ -18,7 +18,7 @@ use aether_detector::optimizer::ternary_search_optimal_input;
 use aether_ingestion::event_decoder::PoolEvent;
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
 use aether_simulator::calldata::build_execute_arb_calldata;
-use aether_simulator::fork::{ForkedState, RpcForkedState};
+use aether_simulator::fork::{prewarm_state, ForkedState, PrewarmedState, RpcForkedState};
 use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
 use aether_state::snapshot::SnapshotManager;
@@ -50,6 +50,9 @@ pub struct EngineConfig {
     pub tip_bps: u64,
     /// Slippage tolerance in basis points (100 = 1%).
     pub slippage_bps: u32,
+    /// Maximum number of parallel EVM simulations per block cycle.
+    /// Should match the number of pinned CPUs (CPU 0-3 → 4).
+    pub max_parallel_sims: usize,
 }
 
 impl Default for EngineConfig {
@@ -63,6 +66,7 @@ impl Default for EngineConfig {
             executor_address: Address::ZERO,
             tip_bps: 9000,
             slippage_bps: 100,
+            max_parallel_sims: 4,
         }
     }
 }
@@ -924,180 +928,312 @@ impl AetherEngine {
 
         let phase1_us = t_cycle.elapsed().as_micros();
 
-        // Phase 2: Simulate and publish (no graph lock needed).
+        // Phase 2: Simulate in parallel and publish (no graph lock needed).
         let t_phase2 = Instant::now();
         let mut sim_count: u32 = 0;
         let mut sim_success: u32 = 0;
         let block_info = (**self.current_block.load()).clone();
 
-        for candidate in &candidates {
-            // Estimate total gas.
-            let total_gas =
-                estimate_total_gas(&candidate.protocols, &candidate.tick_counts);
-            let gas_cost = gas_cost_wei(total_gas, self.config.gas_price_gwei);
+        // Pre-filter candidates and build simulation inputs (cheap, sequential).
+        struct SimInput {
+            opp: ArbOpportunity,
+            steps: Vec<SwapStep>,
+            calldata: Vec<u8>,
+            flashloan_token: Address,
+            input_amount: U256,
+            net_profit: u128,
+        }
 
-            // ── Optimizer: find the optimal input amount ──
-            let min_input = U256::from(10_000_000_000_000_000u128); // 0.01 ETH
-            let max_trade = U256::from(50_000_000_000_000_000_000u128); // 50 ETH
-            let max_input = if candidate.min_liquidity < max_trade
-                && !candidate.min_liquidity.is_zero()
-            {
-                candidate.min_liquidity
-            } else {
-                max_trade
-            };
+        let executor_addr = self.config.executor_address;
+        let tip_bps = U256::from(self.config.tip_bps);
 
-            let hop_reserves = &candidate.reserves;
-            let hop_fee_factors = &candidate.fee_factors;
-            let hop_rates = &candidate.exchange_rates;
-            let profit_fn = |input: U256| -> i128 {
-                let mut current = u256_to_f64(input);
-                for i in 0..hop_reserves.len() {
-                    let (x, y) = hop_reserves[i];
-                    let fee = hop_fee_factors[i];
-                    if x > 0.0 && y > 0.0 {
-                        // Constant-product AMM: dy = (dx * fee * y) / (x + dx * fee)
-                        current = (current * fee * y) / (x + current * fee);
-                    } else {
-                        // Fallback to linear rate when reserves are unknown.
-                        current *= hop_rates[i];
-                    }
-                }
-                let output = current as i128;
-                let input_i128 = u256_to_f64(input) as i128;
-                output
-                    .saturating_sub(input_i128)
-                    .saturating_sub(gas_cost as i128)
-            };
+        let sim_inputs: Vec<SimInput> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let total_gas =
+                    estimate_total_gas(&candidate.protocols, &candidate.tick_counts);
+                let gas_cost = gas_cost_wei(total_gas, self.config.gas_price_gwei);
 
-            let (optimal_input, net_profit_i128) = if min_input < max_input {
-                ternary_search_optimal_input(min_input, max_input, 80, profit_fn)
-            } else {
-                (min_input, profit_fn(min_input))
-            };
-
-            if net_profit_i128 <= 0 {
-                debug!("Cycle unprofitable after optimizer + gas costs");
-                continue;
-            }
-
-            let net_profit: u128 = match net_profit_i128.try_into() {
-                Ok(v) => v,
-                Err(_) => continue, // should not happen after <= 0 guard
-            };
-            if net_profit < self.config.min_profit_threshold_wei {
-                debug!(
-                    net_profit,
-                    threshold = self.config.min_profit_threshold_wei,
-                    "Below min profit threshold"
-                );
-                continue;
-            }
-
-            let input_amount = optimal_input;
-
-            // ── Compute per-hop amount_in and expected_out ──
-            let mut optimized_hops = candidate.hops.clone();
-            let mut current_amount = input_amount;
-            for (i, hop) in optimized_hops.iter_mut().enumerate() {
-                hop.amount_in = current_amount;
-                let dx = u256_to_f64(current_amount);
-                let (x, y) = candidate.reserves[i];
-                let fee = candidate.fee_factors[i];
-                let out_f64 = if x > 0.0 && y > 0.0 {
-                    (dx * fee * y) / (x + dx * fee)
+                // ── Optimizer: find the optimal input amount ──
+                let min_input = U256::from(10_000_000_000_000_000u128); // 0.01 ETH
+                let max_trade = U256::from(50_000_000_000_000_000_000u128); // 50 ETH
+                let max_input = if candidate.min_liquidity < max_trade
+                    && !candidate.min_liquidity.is_zero()
+                {
+                    candidate.min_liquidity
                 } else {
-                    dx * candidate.exchange_rates[i]
+                    max_trade
                 };
-                let out_u256 = U256::from(out_f64 as u128);
-                hop.expected_out = out_u256;
-                current_amount = out_u256;
-            }
 
-            let gross_profit_wei = (u256_to_f64(current_amount) as u128)
-                .saturating_sub(u256_to_f64(input_amount) as u128);
-
-            // ── Build SwapSteps with configurable slippage ──
-            let slippage_denom = U256::from(10_000u32);
-            let clamped_bps = self.config.slippage_bps.min(9999);
-            let slippage_factor = slippage_denom - U256::from(clamped_bps);
-            let steps: Vec<SwapStep> = optimized_hops
-                .iter()
-                .map(|hop| {
-                    let min_out = hop.expected_out * slippage_factor / slippage_denom;
-                    SwapStep {
-                        protocol: hop.protocol,
-                        pool_address: hop.pool_address,
-                        token_in: hop.token_in,
-                        token_out: hop.token_out,
-                        amount_in: hop.amount_in,
-                        min_amount_out: min_out,
-                        calldata: vec![],
+                let hop_reserves = &candidate.reserves;
+                let hop_fee_factors = &candidate.fee_factors;
+                let hop_rates = &candidate.exchange_rates;
+                let profit_fn = |input: U256| -> i128 {
+                    let mut current = u256_to_f64(input);
+                    for i in 0..hop_reserves.len() {
+                        let (x, y) = hop_reserves[i];
+                        let fee = hop_fee_factors[i];
+                        if x > 0.0 && y > 0.0 {
+                            // Constant-product AMM: dy = (dx * fee * y) / (x + dx * fee)
+                            current = (current * fee * y) / (x + current * fee);
+                        } else {
+                            // Fallback to linear rate when reserves are unknown.
+                            current *= hop_rates[i];
+                        }
                     }
+                    let output = current as i128;
+                    let input_i128 = u256_to_f64(input) as i128;
+                    output
+                        .saturating_sub(input_i128)
+                        .saturating_sub(gas_cost as i128)
+                };
+
+                let (optimal_input, net_profit_i128) = if min_input < max_input {
+                    ternary_search_optimal_input(min_input, max_input, 80, profit_fn)
+                } else {
+                    (min_input, profit_fn(min_input))
+                };
+
+                if net_profit_i128 <= 0 {
+                    debug!("Cycle unprofitable after optimizer + gas costs");
+                    return None;
+                }
+
+                let net_profit: u128 = match net_profit_i128.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                if net_profit < self.config.min_profit_threshold_wei {
+                    debug!(
+                        net_profit,
+                        threshold = self.config.min_profit_threshold_wei,
+                        "Below min profit threshold"
+                    );
+                    return None;
+                }
+
+                let input_amount = optimal_input;
+
+                // ── Compute per-hop amount_in and expected_out ──
+                let mut optimized_hops = candidate.hops.clone();
+                let mut current_amount = input_amount;
+                for (i, hop) in optimized_hops.iter_mut().enumerate() {
+                    hop.amount_in = current_amount;
+                    let dx = u256_to_f64(current_amount);
+                    let (x, y) = candidate.reserves[i];
+                    let fee = candidate.fee_factors[i];
+                    let out_f64 = if x > 0.0 && y > 0.0 {
+                        (dx * fee * y) / (x + dx * fee)
+                    } else {
+                        dx * candidate.exchange_rates[i]
+                    };
+                    let out_u256 = U256::from(out_f64 as u128);
+                    hop.expected_out = out_u256;
+                    current_amount = out_u256;
+                }
+
+                let gross_profit_wei = (u256_to_f64(current_amount) as u128)
+                    .saturating_sub(u256_to_f64(input_amount) as u128);
+
+                // ── Build SwapSteps with configurable slippage ──
+                let slippage_denom = U256::from(10_000u32);
+                let clamped_bps = self.config.slippage_bps.min(9999);
+                let slippage_factor = slippage_denom - U256::from(clamped_bps);
+                let steps: Vec<SwapStep> = optimized_hops
+                    .iter()
+                    .map(|hop| {
+                        let min_out = hop.expected_out * slippage_factor / slippage_denom;
+                        SwapStep {
+                            protocol: hop.protocol,
+                            pool_address: hop.pool_address,
+                            token_in: hop.token_in,
+                            token_out: hop.token_out,
+                            amount_in: hop.amount_in,
+                            min_amount_out: min_out,
+                            calldata: vec![],
+                        }
+                    })
+                    .collect();
+
+                let calldata = build_execute_arb_calldata(
+                    &steps,
+                    candidate.flashloan_token,
+                    input_amount,
+                    tip_bps,
+                );
+
+                let opp = ArbOpportunity {
+                    id: format!("arb-{}-{}", block_info.number, candidate.path_id),
+                    hops: optimized_hops,
+                    total_profit_wei: U256::from(gross_profit_wei),
+                    total_gas,
+                    gas_cost_wei: U256::from(gas_cost),
+                    net_profit_wei: U256::from(net_profit),
+                    block_number: block_info.number,
+                    timestamp_ns: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as i64,
+                };
+
+                Some(SimInput {
+                    opp,
+                    steps,
+                    calldata,
+                    flashloan_token: candidate.flashloan_token,
+                    input_amount,
+                    net_profit,
                 })
-                .collect();
+            })
+            .collect();
 
-            // Build calldata.
-            let calldata = build_execute_arb_calldata(
-                &steps,
-                candidate.flashloan_token,
-                input_amount,
-                U256::from(self.config.tip_bps)
-            );
+        // Pre-warm: fetch contract code and V2 reserve slots once before
+        // spawning parallel tasks, so every task's RpcForkedState cache starts
+        // hot. Without this, each task independently fetches the same executor
+        // and pool bytecode — N tasks × M addresses = N×M cold RPC round-trips.
+        let sim_config = self.simulator.config().clone();
+        let rpc_provider = self.rpc_provider.clone();
 
-            // Create ArbOpportunity.
-            let opp = ArbOpportunity {
-                id: format!("arb-{}-{}", block_info.number, candidate.path_id),
-                hops: optimized_hops,
-                total_profit_wei: U256::from(gross_profit_wei),
-                total_gas,
-                gas_cost_wei: U256::from(gas_cost),
-                net_profit_wei: U256::from(net_profit),
-                block_number: block_info.number,
-                timestamp_ns: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as i64,
-            };
-
-            // Simulate on forked state.
-            let executor_addr = self.config.executor_address;
-
-            let t_sim = Instant::now();
-            let sim_result = if let Some(ref provider) = self.rpc_provider {
-                // RPC-backed fork: lazily fetches real contract code/storage.
-                match RpcForkedState::new(
-                    provider.clone(),
-                    block_info.number,
-                    block_info.timestamp,
-                    block_info.base_fee as u64,
-                ) {
-                    Some(rpc_state) => {
-                        self.simulator
-                            .simulate_rpc(rpc_state, executor_addr, calldata.clone())
-                    }
-                    None => {
-                        debug!("RpcForkedState::new returned None (not in multi-threaded runtime?), falling back to empty state");
-                        let forked_state = ForkedState::new_empty(
-                            block_info.number,
-                            block_info.timestamp,
-                            block_info.base_fee as u64,
-                        );
-                        self.simulator
-                            .simulate(&forked_state, executor_addr, calldata.clone())
+        let prewarmed: Option<Arc<PrewarmedState>> = if let Some(ref provider) = rpc_provider {
+            // Collect unique addresses across all simulation inputs.
+            let mut code_addrs: Vec<Address> = vec![executor_addr];
+            let mut v2_addrs: Vec<Address> = vec![];
+            for input in &sim_inputs {
+                for step in &input.steps {
+                    code_addrs.push(step.pool_address);
+                    if matches!(
+                        step.protocol,
+                        ProtocolType::UniswapV2 | ProtocolType::SushiSwap
+                    ) {
+                        v2_addrs.push(step.pool_address);
                     }
                 }
-            } else {
-                // Empty state fallback (no RPC configured).
-                let forked_state = ForkedState::new_empty(
-                    block_info.number,
-                    block_info.timestamp,
-                    block_info.base_fee as u64,
-                );
-                self.simulator
-                    .simulate(&forked_state, executor_addr, calldata.clone())
+            }
+            code_addrs.sort_unstable();
+            code_addrs.dedup();
+            v2_addrs.sort_unstable();
+            v2_addrs.dedup();
+
+            let state =
+                prewarm_state(provider, block_info.number, &code_addrs, &v2_addrs).await;
+            Some(Arc::new(state))
+        } else {
+            None
+        };
+
+        // Semaphore caps parallel simulations — permits are acquired before
+        // spawning so at most max_parallel_sims tasks exist at a time.
+        // This prevents N-4 parked tasks from holding tokio worker threads.
+        let semaphore = Arc::new(Semaphore::new(self.config.max_parallel_sims));
+
+        let mut sim_handles: Vec<tokio::task::JoinHandle<_>> = Vec::new();
+        for input in sim_inputs {
+            // Acquire before spawning — ensures only max_parallel_sims tasks
+            // exist concurrently, so no worker threads are held by parked tasks.
+            let permit = Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("semaphore closed");
+            let sim_config = sim_config.clone();
+            let rpc_provider = rpc_provider.clone();
+            let prewarmed = prewarmed.clone();
+            let block_number = block_info.number;
+            let block_timestamp = block_info.timestamp;
+            let base_fee = block_info.base_fee as u64;
+
+            sim_handles.push(tokio::spawn(async move {
+                // Hold permit for the lifetime of this task.
+                let _permit = permit;
+
+                // block_in_place: signals tokio to spawn extra workers for
+                // remaining async tasks while this worker runs blocking revm.
+                // Keeps tokio runtime context alive for WrapDatabaseAsync.
+                tokio::task::block_in_place(|| {
+                        // Thread-local simulator reuses the instance across
+                        // successive block cycles on the same OS thread,
+                        // avoiding repeated EvmSimulator construction overhead.
+                        thread_local! {
+                            static LOCAL_SIM: std::cell::RefCell<Option<EvmSimulator>> =
+                                const { std::cell::RefCell::new(None) };
+                        }
+
+                        LOCAL_SIM.with(|cell| {
+                            let mut borrow = cell.borrow_mut();
+                            if borrow.is_none() {
+                                *borrow = Some(EvmSimulator::new(sim_config));
+                            }
+                            let simulator = borrow.as_ref().unwrap();
+                            let t_sim = Instant::now();
+
+                            // Extract calldata to avoid partial move of input.
+                            let calldata = input.calldata.clone();
+
+                            let sim_result = if let Some(ref provider) = rpc_provider {
+                                match RpcForkedState::new(
+                                    provider.clone(),
+                                    block_number,
+                                    block_timestamp,
+                                    base_fee,
+                                ) {
+                                    Some(mut rpc_state) => {
+                                        // Inject pre-warmed contract code and
+                                        // storage so simulation reads are served
+                                        // from cache, not cold RPC fetches.
+                                        if let Some(ref pw) = prewarmed {
+                                            pw.inject_into(&mut rpc_state);
+                                        }
+                                        simulator.simulate_rpc(
+                                            rpc_state,
+                                            executor_addr,
+                                            calldata,
+                                        )
+                                    }
+                                    None => {
+                                        debug!("RpcForkedState::new returned None, falling back to empty state");
+                                        let forked_state = ForkedState::new_empty(
+                                            block_number,
+                                            block_timestamp,
+                                            base_fee,
+                                        );
+                                        simulator.simulate(
+                                            &forked_state,
+                                            executor_addr,
+                                            calldata,
+                                        )
+                                    }
+                                }
+                            } else {
+                                let forked_state = ForkedState::new_empty(
+                                    block_number,
+                                    block_timestamp,
+                                    base_fee,
+                                );
+                                simulator.simulate(
+                                    &forked_state,
+                                    executor_addr,
+                                    calldata,
+                                )
+                            };
+
+                            let sim_us = t_sim.elapsed().as_micros();
+                            (input, sim_result, sim_us)
+                        })
+                    })
+                }));
+        }
+
+        // Collect results from all parallel simulations.
+        let sim_results = futures::future::join_all(sim_handles).await;
+
+        for result in sim_results {
+            let (input, sim_result, sim_us) = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "Simulation task panicked");
+                    continue;
+                }
             };
-            let sim_us = t_sim.elapsed().as_micros();
+
             sim_count += 1;
             self.metrics.inc_simulations_run(1);
             self.metrics.observe_simulation_latency_us(sim_us);
@@ -1107,14 +1243,13 @@ impl AetherEngine {
                 continue;
             }
 
-            // Build proto ValidatedArb and publish.
             let proto_arb = pipeline::build_validated_arb(
-                &opp,
+                &input.opp,
                 &sim_result,
-                candidate.flashloan_token,
-                input_amount,
-                steps,
-                calldata,
+                input.flashloan_token,
+                input.input_amount,
+                input.steps,
+                input.calldata,
             );
 
             if let Err(e) = self.arb_tx.send(proto_arb) {
@@ -1123,8 +1258,8 @@ impl AetherEngine {
                 sim_success += 1;
                 self.metrics.inc_arbs_published(1);
                 info!(
-                    id = %opp.id,
-                    net_profit_wei = net_profit,
+                    id = %input.opp.id,
+                    net_profit_wei = input.net_profit,
                     sim_us,
                     "Published validated arb"
                 );
@@ -1548,7 +1683,7 @@ mod tests {
         assert_eq!(meta.fee_bps, 30);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_detection_cycle_with_registered_pools() {
         let (tx, mut rx) = broadcast::channel(100);
         let engine = AetherEngine::new(
@@ -1642,7 +1777,7 @@ mod tests {
         assert!(!arb.hops.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_bootstrap_pools_then_detect_arb() {
         // Integration test: bootstrap real mainnet pools from config/pools.toml,
         // set profitable exchange rates on the graph, run detection, and confirm

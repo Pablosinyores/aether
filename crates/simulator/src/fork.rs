@@ -1,5 +1,5 @@
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider};
 use futures::future::join_all;
 use revm::bytecode::Bytecode;
@@ -18,18 +18,25 @@ use tracing::{debug, warn};
 /// RPC fetches are eliminated — all simulations sharing the same block see
 /// the same contract state without redundant network round-trips.
 pub struct PrewarmedState {
-    accounts: Vec<(Address, AccountInfo)>,
+    /// Bytecode cache: (code_hash, bytecode) pairs for pre-fetched contracts.
+    ///
+    /// Stored by code hash (not address) and injected directly into
+    /// `CacheDB::cache.contracts` — this warms the bytecode cache without
+    /// touching account balance or nonce, so pools that hold ETH (V3, Curve,
+    /// Balancer) are not incorrectly zeroed before simulation.
+    code_cache: Vec<(B256, Bytecode)>,
     /// (address, slot, value) — pre-fetched storage slots (e.g. V2 reserves).
     storage: Vec<(Address, U256, U256)>,
 }
 
 impl PrewarmedState {
-    /// Inject pre-fetched data into an `RpcForkedState`'s in-memory cache.
-    /// Any subsequent read for these addresses is served locally; only truly
-    /// unknown state (untouched storage slots, etc.) falls back to RPC.
+    /// Inject pre-fetched bytecode and storage into an `RpcForkedState` cache.
+    ///
+    /// Bytecode is inserted by code hash only — balance and nonce are left for
+    /// lazy RPC fetch so on-chain ETH holdings are never clobbered with zero.
     pub fn inject_into(&self, state: &mut RpcForkedState) {
-        for (addr, info) in &self.accounts {
-            state.db.insert_account_info(*addr, info.clone());
+        for (code_hash, bytecode) in &self.code_cache {
+            state.db.cache.contracts.insert(*code_hash, bytecode.clone());
         }
         for &(addr, slot, value) in &self.storage {
             if let Err(e) = state.db.insert_account_storage(addr, slot, value) {
@@ -60,6 +67,8 @@ pub async fn prewarm_state(
     let block_id = BlockId::from(block_number);
 
     // Fetch contract code for every address in parallel.
+    // Returns (code_hash, bytecode) pairs — we warm the bytecode cache only,
+    // leaving account balance/nonce for lazy RPC fetch.
     let code_futs = code_addresses.iter().map(|&addr| {
         let p = provider.clone();
         async move {
@@ -69,14 +78,7 @@ pub async fn prewarm_state(
                     let bytecode = Bytecode::new_raw(
                         revm::primitives::Bytes::copy_from_slice(&code),
                     );
-                    let info = AccountInfo {
-                        balance: U256::ZERO,
-                        nonce: 0,
-                        code_hash,
-                        code: Some(bytecode),
-                        ..Default::default()
-                    };
-                    Some((addr, info))
+                    Some((code_hash, bytecode))
                 }
                 Ok(_) => None, // empty bytecode (EOA)
                 Err(e) => {
@@ -120,7 +122,7 @@ pub async fn prewarm_state(
     );
 
     PrewarmedState {
-        accounts: code_results.into_iter().flatten().collect(),
+        code_cache: code_results.into_iter().flatten().collect(),
         storage: storage_results.into_iter().flatten().collect(),
     }
 }
