@@ -25,23 +25,22 @@ type BundleConstructor struct {
 	nonceManager *NonceManager
 	gasOracle    *GasOracle
 	signer       *TransactionSigner
-	tipSharePct  float64
 	chainID      int64
 }
 
 // NewBundleConstructor creates a new bundle constructor.
 // The signer is used to sign transactions; if nil, transactions are left unsigned.
-func NewBundleConstructor(nm *NonceManager, go_ *GasOracle, signer *TransactionSigner, tipPct float64, chainID int64) *BundleConstructor {
+func NewBundleConstructor(nm *NonceManager, go_ *GasOracle, signer *TransactionSigner, chainID int64) *BundleConstructor {
 	return &BundleConstructor{
 		nonceManager: nm,
 		gasOracle:    go_,
 		signer:       signer,
-		tipSharePct:  tipPct,
 		chainID:      chainID,
 	}
 }
 
 // BuildBundle constructs a [arb_tx, tip_tx] bundle from an arb opportunity.
+// tipSharePct is passed per-call to avoid TOCTOU races with shared state.
 // The coinbase parameter is the block proposer's address for the tip payment.
 func (bc *BundleConstructor) BuildBundle(
 	arbCalldata []byte,
@@ -50,6 +49,7 @@ func (bc *BundleConstructor) BuildBundle(
 	gasEstimate uint64,
 	targetBlock uint64,
 	coinbase common.Address,
+	tipSharePct float64,
 ) (*Bundle, error) {
 	gasFees := bc.gasOracle.CurrentFees()
 	nonce := bc.nonceManager.Next()
@@ -68,8 +68,8 @@ func (bc *BundleConstructor) BuildBundle(
 		Data:      arbCalldata,
 	})
 
-	// Tip transaction (send % of profit to block proposer)
-	tipAmount := new(big.Int).Mul(profitWei, big.NewInt(int64(bc.tipSharePct)))
+	// Tip transaction (send % of profit to builder coinbase)
+	tipAmount := new(big.Int).Mul(profitWei, big.NewInt(int64(tipSharePct)))
 	tipAmount.Div(tipAmount, big.NewInt(100))
 
 	tipTx := types.NewTx(&types.DynamicFeeTx{

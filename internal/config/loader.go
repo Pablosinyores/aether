@@ -40,11 +40,13 @@ type RiskFileConfig struct {
 		MaxNodeLatencyMs            int64   `yaml:"max_node_latency_ms"`
 		BundleMissRateAlertPct      float64 `yaml:"bundle_miss_rate_alert_pct"`
 		BundleMissRateWindowMinutes int     `yaml:"bundle_miss_rate_window_minutes"`
+		CompetitiveRevertAlertPct   float64 `yaml:"competitive_revert_alert_pct"`
 	} `yaml:"circuit_breakers"`
 	PositionLimits struct {
 		MaxSingleTradeETH float64 `yaml:"max_single_trade_eth"`
 		MaxDailyVolumeETH float64 `yaml:"max_daily_volume_eth"`
 		MinProfitETH      float64 `yaml:"min_profit_eth"`
+		MinTipSharePct    float64 `yaml:"min_tip_share_pct"`
 		MaxTipSharePct    float64 `yaml:"max_tip_share_pct"`
 	} `yaml:"position_limits"`
 	System struct {
@@ -102,6 +104,9 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 	if cb.BundleMissRateWindowMinutes <= 0 {
 		return fmt.Errorf("circuit_breakers.bundle_miss_rate_window_minutes must be > 0, got %d", cb.BundleMissRateWindowMinutes)
 	}
+	if cb.CompetitiveRevertAlertPct <= 0 || cb.CompetitiveRevertAlertPct > 100 {
+		return fmt.Errorf("circuit_breakers.competitive_revert_alert_pct must be in (0, 100], got %v", cb.CompetitiveRevertAlertPct)
+	}
 
 	if pl.MaxSingleTradeETH <= 0 {
 		return fmt.Errorf("position_limits.max_single_trade_eth must be > 0, got %v", pl.MaxSingleTradeETH)
@@ -112,8 +117,14 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 	if pl.MinProfitETH <= 0 {
 		return fmt.Errorf("position_limits.min_profit_eth must be > 0, got %v", pl.MinProfitETH)
 	}
+	if pl.MinTipSharePct <= 0 || pl.MinTipSharePct > 100 {
+		return fmt.Errorf("position_limits.min_tip_share_pct must be in (0, 100], got %v", pl.MinTipSharePct)
+	}
 	if pl.MaxTipSharePct <= 0 || pl.MaxTipSharePct > 100 {
 		return fmt.Errorf("position_limits.max_tip_share_pct must be in (0, 100], got %v", pl.MaxTipSharePct)
+	}
+	if pl.MinTipSharePct >= pl.MaxTipSharePct {
+		return fmt.Errorf("position_limits.min_tip_share_pct must be < position_limits.max_tip_share_pct, got min=%v max=%v", pl.MinTipSharePct, pl.MaxTipSharePct)
 	}
 
 	return nil
@@ -127,6 +138,8 @@ func ValidateRiskConfig(cfg RiskFileConfig) error {
 type BuilderEntry struct {
 	Name      string `yaml:"name"`
 	URL       string `yaml:"url"`
+	AuthType  string `yaml:"auth_type"`
+	AuthKey   string `yaml:"auth_key"`
 	Enabled   bool   `yaml:"enabled"`
 	TimeoutMs int    `yaml:"timeout_ms"`
 }
@@ -141,6 +154,8 @@ type BuildersFileConfig struct {
 }
 
 // LoadBuildersConfig reads and parses a builders YAML config file.
+// Environment variables in ${VAR} format are expanded before parsing,
+// allowing secrets like API keys to be injected at runtime.
 func LoadBuildersConfig(path string) (BuildersFileConfig, error) {
 	var cfg BuildersFileConfig
 
@@ -148,6 +163,8 @@ func LoadBuildersConfig(path string) (BuildersFileConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("read builders config %s: %w", path, err)
 	}
+
+	data = expandEnvVars(data)
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse builders config %s: %w", path, err)
@@ -174,6 +191,16 @@ func ValidateBuildersConfig(cfg BuildersFileConfig) error {
 		}
 		if b.TimeoutMs <= 0 {
 			return fmt.Errorf("builders[%d].timeout_ms must be > 0, got %d", i, b.TimeoutMs)
+		}
+		switch b.AuthType {
+		case "flashbots", "none", "":
+			// valid
+		case "api_key":
+			if b.AuthKey == "" {
+				return fmt.Errorf("builders[%d].auth_key must not be empty when auth_type is api_key", i)
+			}
+		default:
+			return fmt.Errorf("builders[%d].auth_type must be flashbots, api_key, or none, got %q", i, b.AuthType)
 		}
 	}
 	return nil

@@ -66,8 +66,11 @@ func TestLoadRiskConfig_ValidFile(t *testing.T) {
 	if cfg.CircuitBreakers.MaxGasGwei != 300 {
 		t.Errorf("MaxGasGwei = %v, want 300", cfg.CircuitBreakers.MaxGasGwei)
 	}
-	if cfg.CircuitBreakers.ConsecutiveRevertsPause != 3 {
-		t.Errorf("ConsecutiveRevertsPause = %d, want 3", cfg.CircuitBreakers.ConsecutiveRevertsPause)
+	if cfg.CircuitBreakers.ConsecutiveRevertsPause != 10 {
+		t.Errorf("ConsecutiveRevertsPause = %d, want 10", cfg.CircuitBreakers.ConsecutiveRevertsPause)
+	}
+	if cfg.CircuitBreakers.CompetitiveRevertAlertPct != 90 {
+		t.Errorf("CompetitiveRevertAlertPct = %v, want 90", cfg.CircuitBreakers.CompetitiveRevertAlertPct)
 	}
 	if cfg.CircuitBreakers.RevertWindowMinutes != 10 {
 		t.Errorf("RevertWindowMinutes = %d, want 10", cfg.CircuitBreakers.RevertWindowMinutes)
@@ -95,6 +98,9 @@ func TestLoadRiskConfig_ValidFile(t *testing.T) {
 	}
 	if cfg.PositionLimits.MinProfitETH != 0.001 {
 		t.Errorf("MinProfitETH = %v, want 0.001", cfg.PositionLimits.MinProfitETH)
+	}
+	if cfg.PositionLimits.MinTipSharePct != 50 {
+		t.Errorf("MinTipSharePct = %v, want 50", cfg.PositionLimits.MinTipSharePct)
 	}
 	if cfg.PositionLimits.MaxTipSharePct != 95 {
 		t.Errorf("MaxTipSharePct = %v, want 95", cfg.PositionLimits.MaxTipSharePct)
@@ -199,6 +205,31 @@ func TestValidateRiskConfig_ZeroMaxTipShare(t *testing.T) {
 	}
 }
 
+func TestValidateRiskConfig_ZeroMinTipShare(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.PositionLimits.MinTipSharePct = 0
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for MinTipSharePct=0, got nil")
+	}
+}
+
+func TestValidateRiskConfig_MinTipShareNotLessThanMax(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.PositionLimits.MinTipSharePct = 95
+	cfg.PositionLimits.MaxTipSharePct = 95
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error when MinTipSharePct >= MaxTipSharePct, got nil")
+	}
+}
+
 func TestValidateRiskConfig_ZeroConsecutiveReverts(t *testing.T) {
 	t.Parallel()
 
@@ -218,6 +249,30 @@ func TestValidateRiskConfig_Valid(t *testing.T) {
 	err := ValidateRiskConfig(cfg)
 	if err != nil {
 		t.Fatalf("expected no error for valid config, got: %v", err)
+	}
+}
+
+func TestValidateRiskConfig_ZeroCompetitiveRevertAlertPct(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.CircuitBreakers.CompetitiveRevertAlertPct = 0
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for CompetitiveRevertAlertPct=0, got nil")
+	}
+}
+
+func TestValidateRiskConfig_CompetitiveRevertAlertPctOver100(t *testing.T) {
+	t.Parallel()
+
+	cfg := validRiskFileConfig()
+	cfg.CircuitBreakers.CompetitiveRevertAlertPct = 101
+
+	err := ValidateRiskConfig(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for CompetitiveRevertAlertPct=101, got nil")
 	}
 }
 
@@ -465,8 +520,9 @@ func writeTempFile(t *testing.T, name string, data []byte) string {
 func validRiskFileConfig() RiskFileConfig {
 	var cfg RiskFileConfig
 	cfg.CircuitBreakers.MaxGasGwei = 300
-	cfg.CircuitBreakers.ConsecutiveRevertsPause = 3
+	cfg.CircuitBreakers.ConsecutiveRevertsPause = 10
 	cfg.CircuitBreakers.RevertWindowMinutes = 10
+	cfg.CircuitBreakers.CompetitiveRevertAlertPct = 90
 	cfg.CircuitBreakers.DailyLossHaltETH = 0.5
 	cfg.CircuitBreakers.MinETHBalance = 0.1
 	cfg.CircuitBreakers.MaxNodeLatencyMs = 500
@@ -475,6 +531,7 @@ func validRiskFileConfig() RiskFileConfig {
 	cfg.PositionLimits.MaxSingleTradeETH = 50.0
 	cfg.PositionLimits.MaxDailyVolumeETH = 500.0
 	cfg.PositionLimits.MinProfitETH = 0.001
+	cfg.PositionLimits.MinTipSharePct = 50
 	cfg.PositionLimits.MaxTipSharePct = 95
 	return cfg
 }

@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -59,6 +60,8 @@ func loadConfig() Config {
 			builders = append(builders, BuilderConfig{
 				Name:      b.Name,
 				URL:       b.URL,
+				AuthType:  b.AuthType,
+				AuthKey:   b.AuthKey,
 				Enabled:   b.Enabled,
 				TimeoutMs: b.TimeoutMs,
 			})
@@ -94,20 +97,28 @@ func main() {
 
 	cfg := loadConfig()
 
-	// Load searcher private key for transaction signing.
-	var txSigner *TransactionSigner
+	// Load searcher private key for transaction signing and bundle submission.
 	searcherKey := os.Getenv("SEARCHER_KEY")
-	os.Unsetenv("SEARCHER_KEY")
+
+	// Create submitter BEFORE clearing the key — it needs the key for FlashbotsSigner.
+	submitter, err := NewSubmitter(cfg.BuilderConfigs, searcherKey)
+	if err != nil {
+		log.Fatalf("Failed to create submitter: %v", err)
+	}
+
+	var txSigner *TransactionSigner
 	if searcherKey != "" {
-		var err error
-		txSigner, err = NewTransactionSigner(searcherKey, cfg.ChainID)
-		if err != nil {
-			log.Fatalf("Failed to load SEARCHER_KEY: %v", err)
+		var signerErr error
+		txSigner, signerErr = NewTransactionSigner(searcherKey, cfg.ChainID)
+		if signerErr != nil {
+			log.Fatalf("Failed to load SEARCHER_KEY: %v", signerErr)
 		}
 		log.Printf("Searcher address: %s", txSigner.Address().Hex())
 	} else {
 		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
 	}
+
+	os.Unsetenv("SEARCHER_KEY")
 
 	// Connect to Ethereum node for block header queries (coinbase).
 	var ethClient *ethclient.Client
@@ -145,8 +156,14 @@ func main() {
 	}
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
-	submitter := NewSubmitter(cfg.BuilderConfigs)
-	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.TipSharePct, cfg.ChainID)
+	if ethClient != nil {
+		gasOracle.SetClient(ethClient)
+		// Fetch real gas prices before first arb evaluation.
+		if _, err := gasOracle.FetchOnce(ctx); err != nil {
+			log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
+		}
+	}
+	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
 	sigCh := make(chan os.Signal, 1)
@@ -168,6 +185,8 @@ func main() {
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
 
+	startMetricsServer()
+
 	log.Printf("Executor service started, gRPC target: %s", cfg.GRPCAddress)
 	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
 
@@ -185,7 +204,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.TipSharePct, cfg.EthBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ethClient, cfg.ExecutorAddr, cfg.EthBalance)
 		}()
 	}
 
@@ -212,7 +231,6 @@ func processArb(
 	submitter *Submitter,
 	ethClient *ethclient.Client,
 	executorAddr string,
-	tipSharePct float64,
 	ethBalance float64,
 ) (submitted bool, err error) {
 	// Parse net_profit_wei from proto bytes to big.Int
@@ -224,14 +242,15 @@ func processArb(
 	// Get current gas price from the bundler's gas oracle
 	gasFees := bundler.gasOracle.CurrentFees()
 	gasGwei := gasFees.GasPriceGwei
+	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
 
 	// Preflight risk check
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {
+		recordRiskRejection()
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
-
 	// Fetch block.coinbase from latest block header for the tip transaction.
 	coinbase := common.Address{}
 	if ethClient != nil {
@@ -243,29 +262,79 @@ func processArb(
 		}
 	}
 
-	// Build bundle
-	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase)
+	// Build bundle — tipSharePct passed directly to avoid TOCTOU races.
+	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, profitWei, arb.TotalGas, arb.BlockNumber+1, coinbase, tipSharePct)
 	if err != nil {
 		return false, fmt.Errorf("build bundle: %w", err)
 	}
 
 	// Submit to all builders
+	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
+	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
 
 	// Record result for miss rate tracking
-	rm.RecordBundleResult(successes > 0)
+	included := successes > 0
+	if included {
+		recordBundleIncluded(profitWei, gasGwei, arb.TotalGas)
+	}
+	rm.RecordBundleResult(included)
 
-	return successes > 0, nil
+	return included, nil
+}
+
+// recordSubmissionReverts classifies and records a single revert per arb
+// attempt. When multiple builders reject the same arb, we take the worst-case
+// classification (bug > competitive) so the circuit breaker is not silently
+// bypassed, but we never inflate the count beyond one per submission.
+func recordSubmissionReverts(rm *risk.RiskManager, results []SubmissionResult) {
+	worstType := risk.RevertCompetitive
+	foundRevert := false
+	for _, res := range results {
+		if res.Success || res.Error == nil {
+			continue
+		}
+		errMsg := res.Error.Error()
+		if !looksLikeRevert(errMsg) {
+			continue
+		}
+		foundRevert = true
+		if risk.ClassifyRevert(errMsg) == risk.RevertBug {
+			worstType = risk.RevertBug
+		}
+	}
+	if foundRevert {
+		rm.RecordRevert(worstType)
+	}
+}
+
+// looksLikeRevert returns true when the error message looks like an EVM revert
+// rather than an infrastructure failure (timeout, TLS error, etc.).
+//
+// Competitive patterns are delegated to ClassifyRevert to avoid duplicating the
+// pattern list. Only "revert"/"reverted" keywords are checked here to catch bug
+// reverts that ClassifyRevert doesn't recognise as competitive.
+func looksLikeRevert(errMsg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errMsg))
+	if lower == "" {
+		return true
+	}
+	// If ClassifyRevert recognises it as competitive, it is a revert.
+	if risk.ClassifyRevert(errMsg) == risk.RevertCompetitive {
+		return true
+	}
+	// Catch remaining bug reverts by keyword.
+	return strings.Contains(lower, "revert") || strings.Contains(lower, "reverted")
 }
 
 // consumeArbStream connects to the Rust engine's StreamArbs RPC and
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, tipSharePct float64, ethBalance float64) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ethClient *ethclient.Client, executorAddr string, ethBalance float64) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -301,7 +370,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, tipSharePct, ethBalance)
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter, ethClient, executorAddr, ethBalance)
 			if err != nil {
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
 			}

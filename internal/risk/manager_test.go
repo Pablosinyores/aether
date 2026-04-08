@@ -2,6 +2,7 @@ package risk
 
 import (
 	"math/big"
+	"sync"
 	"testing"
 )
 
@@ -162,6 +163,24 @@ func TestPreflightCheck_TipShareTooHigh(t *testing.T) {
 	}
 }
 
+func TestPreflightCheck_TipShareTooLow(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+
+	result := rm.PreflightCheck(
+		fracETHWei(t, 1, 100),
+		ethWei(t, 10),
+		100.0,
+		49.0, // 49% — below 50% min
+		1.0,
+	)
+
+	if result.Approved {
+		t.Error("expected rejected for tip share too low, got approved")
+	}
+}
+
 func TestPreflightCheck_SystemNotRunning(t *testing.T) {
 	t.Parallel()
 
@@ -215,25 +234,88 @@ func TestPreflightCheck_SystemNotRunning(t *testing.T) {
 	})
 }
 
-func TestRecordRevert_CircuitBreaker(t *testing.T) {
+func TestRecordRevert_BugCircuitBreaker(t *testing.T) {
 	t.Parallel()
 
-	rm := NewRiskManager(DefaultRiskConfig())
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3 // lower threshold for test speed
+	rm := NewRiskManager(config)
 
-	// Record 3 reverts (threshold for pause)
-	rm.RecordRevert()
-	rm.RecordRevert()
-
-	// Should still be running after 2
+	// Record 2 bug reverts — should still be running.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StateRunning {
-		t.Fatalf("expected Running after 2 reverts, got %s", rm.State())
+		t.Fatalf("expected Running after 2 bug reverts, got %s", rm.State())
 	}
 
-	// 3rd revert triggers pause
-	rm.RecordRevert()
-
+	// 3rd bug revert hits threshold → pause.
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StatePaused {
-		t.Errorf("expected Paused after 3 reverts, got %s", rm.State())
+		t.Errorf("expected Paused after 3 bug reverts, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_CompetitiveDoesNotTriggerCircuitBreaker(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3
+	config.CompetitiveRevertAlertPct = 100 // suppress alert so only CB fires
+	rm := NewRiskManager(config)
+
+	// Record many competitive reverts — circuit breaker must NOT fire.
+	for i := 0; i < 20; i++ {
+		rm.RecordRevert(RevertCompetitive)
+	}
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running after 20 competitive reverts, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_MixedTypes_OnlyBugCountsTowardBreaker(t *testing.T) {
+	t.Parallel()
+
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 3
+	config.CompetitiveRevertAlertPct = 100 // suppress alert
+	rm := NewRiskManager(config)
+
+	// 2 competitive + 2 bug = still under threshold (only 2 bug reverts).
+	rm.RecordRevert(RevertCompetitive)
+	rm.RecordRevert(RevertCompetitive)
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running with 2 bug reverts (threshold=3), got %s", rm.State())
+	}
+
+	// One more bug revert → pause.
+	rm.RecordRevert(RevertBug)
+	if rm.State() != StatePaused {
+		t.Errorf("expected Paused after 3rd bug revert, got %s", rm.State())
+	}
+}
+
+func TestRecordRevert_CompetitiveRateAlert(t *testing.T) {
+	t.Parallel()
+
+	// Set a low alert threshold to make it easy to trigger.
+	config := DefaultRiskConfig()
+	config.ConsecutiveRevertsPause = 100 // effectively disable CB for this test
+	config.CompetitiveRevertAlertPct = 80 // alert at 80%+
+	rm := NewRiskManager(config)
+
+	// 8 competitive + 2 bug = 80% competitive → should log alert but NOT pause.
+	for i := 0; i < 8; i++ {
+		rm.RecordRevert(RevertCompetitive)
+	}
+	for i := 0; i < 2; i++ {
+		rm.RecordRevert(RevertBug)
+	}
+
+	// System must remain running (CB not triggered).
+	if rm.State() != StateRunning {
+		t.Errorf("expected Running (alert only, not CB), got %s", rm.State())
 	}
 }
 
@@ -245,22 +327,19 @@ func TestRecordRevert_WindowCleanup(t *testing.T) {
 	config.ConsecutiveRevertsPause = 3
 	rm := NewRiskManager(config)
 
-	// RecordRevert adds to recentReverts and cleans entries outside the window.
-	// Since all reverts are recorded "now", they should all be within the window.
-	rm.RecordRevert()
-	rm.RecordRevert()
+	// All bug reverts recorded "now" — all within the window.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
 
-	// 2 reverts within window, system still running
+	// 2 bug reverts: still running.
 	if rm.State() != StateRunning {
-		t.Errorf("expected Running after 2 reverts, got %s", rm.State())
+		t.Errorf("expected Running after 2 bug reverts, got %s", rm.State())
 	}
 
-	// The cleanup logic removes entries outside the window. Since we can't
-	// easily inject old timestamps, we verify that recording a 3rd revert
-	// (all within window) triggers the circuit breaker.
-	rm.RecordRevert()
+	// 3rd bug revert (all within window) → circuit breaker fires.
+	rm.RecordRevert(RevertBug)
 	if rm.State() != StatePaused {
-		t.Errorf("expected Paused after 3 reverts in window, got %s", rm.State())
+		t.Errorf("expected Paused after 3 bug reverts in window, got %s", rm.State())
 	}
 }
 
@@ -302,15 +381,17 @@ func TestRecordBundleResult(t *testing.T) {
 	rm.RecordBundleResult(false)
 
 	rm.mu.RLock()
-	submitted := rm.bundlesSubmitted
-	included := rm.bundlesIncluded
+	count := rm.bundleResultCount
 	rm.mu.RUnlock()
 
-	if submitted != 3 {
-		t.Errorf("bundlesSubmitted: got %d, want 3", submitted)
+	if count != 3 {
+		t.Errorf("bundleResultCount: got %d, want 3", count)
 	}
-	if included != 2 {
-		t.Errorf("bundlesIncluded: got %d, want 2", included)
+
+	// Miss rate should be ~33.3% (1 miss out of 3)
+	missRate := rm.BundleMissRate()
+	if missRate < 33.0 || missRate > 34.0 {
+		t.Errorf("BundleMissRate: got %.1f%%, want ~33.3%%", missRate)
 	}
 }
 
@@ -318,10 +399,10 @@ func TestBundleMissRate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		included  int
-		missed    int
-		wantRate  float64
+		name     string
+		included int
+		missed   int
+		wantRate float64
 	}{
 		{"0 submitted", 0, 0, 0.0},
 		{"all included", 10, 0, 0.0},
@@ -350,6 +431,149 @@ func TestBundleMissRate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCalculateTipShare_UsesBundleMissRate(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// No history => returns last tip (90%) without adjusting.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 90.0 {
+		t.Fatalf("tip share with no history = %.1f, want 90.0", got)
+	}
+
+	// 0% inclusion (100% miss) => increase by 5%.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share after high miss rate = %.1f, want 95.0", got)
+	}
+
+	// No new feedback => gated, returns last tip (95%).
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should stay at 95.0 without new feedback, got %.1f", got)
+	}
+
+	// New miss feedback => tries to increase but capped at 95%.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should remain capped at 95.0, got %.1f", got)
+	}
+}
+
+func TestCalculateTipShare_DecreasesOnHighInclusion(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// 90% inclusion => decrease from 90% to 85%.
+	for i := 0; i < 9; i++ {
+		rm.RecordBundleResult(true)
+	}
+	rm.RecordBundleResult(false)
+
+	// First call after feedback triggers adjustment.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 85.0 {
+		t.Fatalf("tip share after high inclusion = %.1f, want 85.0", got)
+	}
+}
+
+func TestCalculateTipShare_RespectsConfiguredBounds(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.MinTipSharePct = 60.0
+	cfg.MaxTipSharePct = 80.0
+	rm := NewRiskManager(cfg)
+	profitWei := ethWei(t, 1)
+
+	// No feedback yet => returns initial clamped tip.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 80.0 {
+		t.Fatalf("initial clamped tip share = %.1f, want 80.0", got)
+	}
+
+	// 100% inclusion would reduce tip, but never below configured min.
+	// Each RecordBundleResult + CalculateTipShare = one adjustment step.
+	for i := 0; i < 20; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	// One more feedback to trigger final check.
+	rm.RecordBundleResult(true)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got < 60.0 {
+		t.Fatalf("tip share should not go below configured min 60.0, got %.1f", got)
+	}
+}
+
+func TestCalculateTipShare_ContinuesAfterWindowFills(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// Fill the window with 110 included bundles (> 100 window size).
+	for i := 0; i < 110; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	// Strategy should have decreased from 90% toward min due to high inclusion.
+	tipAfterFill := rm.CalculateTipShare(profitWei, 30.0)
+
+	// Record 60 misses — pushes inclusion below 50% low threshold in a 100-entry window.
+	for i := 0; i < 60; i++ {
+		rm.RecordBundleResult(false)
+	}
+
+	// Strategy must still respond — not frozen after window wrap.
+	tipAfterMisses := rm.CalculateTipShare(profitWei, 30.0)
+	if tipAfterMisses <= tipAfterFill {
+		t.Errorf("strategy frozen after window fill: tip did not increase after misses (before=%.1f, after=%.1f)", tipAfterFill, tipAfterMisses)
+	}
+}
+
+// TestCalculateTipShare_ConcurrentAccess exercises RecordBundleResult and
+// CalculateTipShare from multiple goroutines simultaneously. Run with
+// -race to validate mutex correctness.
+func TestCalculateTipShare_ConcurrentAccess(t *testing.T) {
+	rm := NewRiskManager(DefaultRiskConfig())
+	profit := ethWei(t, 1)
+
+	const goroutines = 10
+	const iters = 50
+
+	var wg sync.WaitGroup
+
+	// Writers: record bundle results concurrently.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				rm.RecordBundleResult(j%2 == 0)
+			}
+		}(i)
+	}
+
+	// Readers: calculate tip share concurrently with writes.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				tip := rm.CalculateTipShare(profit, 30.0)
+				if tip < DefaultRiskConfig().MinTipSharePct || tip > DefaultRiskConfig().MaxTipSharePct {
+					t.Errorf("tip share %.1f%% out of bounds [%.1f%%, %.1f%%]",
+						tip, DefaultRiskConfig().MinTipSharePct, DefaultRiskConfig().MaxTipSharePct)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestWeiToETH(t *testing.T) {

@@ -1,17 +1,21 @@
 circuit_breakers:
   max_gas_gwei: 300
-  consecutive_reverts_pause: 3
+  # Only bug reverts count toward this threshold (competitive/MEV reverts are excluded).
+  consecutive_reverts_pause: 10
   revert_window_minutes: 10
   daily_loss_halt_eth: 0.5
   min_eth_balance: 0.1
   max_node_latency_ms: 500
   bundle_miss_rate_alert_pct: 80
   bundle_miss_rate_window_minutes: 60
+  # Alert when competitive reverts exceed this % — indicates stale data / consistently slow.
+  competitive_revert_alert_pct: 90
 
 position_limits:
   max_single_trade_eth: 50.0
   max_daily_volume_eth: 500.0
   min_profit_eth: 0.001
+  min_tip_share_pct: 50
   max_tip_share_pct: 95
 
 system:

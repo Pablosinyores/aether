@@ -20,6 +20,11 @@ pub struct PriceEdge {
     pub protocol: ProtocolType,
     /// Available liquidity in the pool (for filtering low-liq edges).
     pub liquidity: U256,
+    /// Pool reserve on the input side (f64 approx). Zero when reserves are unknown
+    /// (e.g. V3 edges set via spot price, or placeholder edges).
+    pub reserve_in: f64,
+    /// Pool reserve on the output side (f64 approx). Zero when reserves are unknown.
+    pub reserve_out: f64,
 }
 
 /// Directed price graph for arbitrage detection.
@@ -82,6 +87,8 @@ impl PriceGraph {
             pool_address,
             protocol,
             liquidity,
+            reserve_in: 0.0,
+            reserve_out: 0.0,
         };
 
         // Try to update an existing edge with matching (from, to, pool_id).
@@ -134,11 +141,15 @@ impl PriceGraph {
             .find(|e| e.to == to && e.pool_id == pool_id)
         {
             existing.weight = -rate.ln();
+            existing.reserve_in = reserve_in;
+            existing.reserve_out = reserve_out;
             // Mirror the update in the flat edge list via O(1) index lookup.
             // Direct indexing: panics if the key is missing, which is correct —
             // the adjacency list found the edge, so edge_index must agree.
             let idx = self.edge_index[&(from, to, pool_id)];
             self.all_edges[idx].weight = existing.weight;
+            self.all_edges[idx].reserve_in = reserve_in;
+            self.all_edges[idx].reserve_out = reserve_out;
             self.dirty[idx] = true;
         }
     }

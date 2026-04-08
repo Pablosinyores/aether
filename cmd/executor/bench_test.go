@@ -14,7 +14,7 @@ import (
 func BenchmarkBuildBundle(b *testing.B) {
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 1)
 	coinbase := common.HexToAddress("0x0000000000000000000000000000000000000001")
 
 	calldata := []byte{0xab, 0xcd, 0xef, 0x01, 0x02, 0x03}
@@ -23,7 +23,7 @@ func BenchmarkBuildBundle(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _ = bundler.BuildBundle(calldata, "0x0000000000000000000000000000000000000000", profit, 200000, 18000000, coinbase)
+		_, _ = bundler.BuildBundle(calldata, "0x0000000000000000000000000000000000000000", profit, 200000, 18000000, coinbase, 90.0)
 	}
 }
 
@@ -80,15 +80,15 @@ func BenchmarkProcessArb(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_, _ = processArb(ctx, arb, rm, bundler, submitter, nil,
-			"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+			"0x0000000000000000000000000000000000000000", 0.5)
 	}
 }
 
 func BenchmarkSubmitToAll(b *testing.B) {
-	submitter := NewSubmitter(defaultBuilderConfigs())
+	submitter, _ := NewSubmitter(defaultBuilderConfigs(), "")
 	nm := NewNonceManager(0)
 	go_ := NewGasOracle(300.0)
-	bundler := NewBundleConstructor(nm, go_, nil, 90.0, 1)
+	bundler := NewBundleConstructor(nm, go_, nil, 1)
 	coinbase2 := common.HexToAddress("0x0000000000000000000000000000000000000001")
 
 	bundle, _ := bundler.BuildBundle(
@@ -98,6 +98,7 @@ func BenchmarkSubmitToAll(b *testing.B) {
 		200000,
 		18000000,
 		coinbase2,
+		90.0,
 	)
 	ctx := context.Background()
 

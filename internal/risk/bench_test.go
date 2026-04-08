@@ -51,13 +51,23 @@ func BenchmarkPreflightCheck_Concurrent(b *testing.B) {
 	})
 }
 
-func BenchmarkRecordRevert(b *testing.B) {
+func BenchmarkRecordRevert_Bug(b *testing.B) {
 	rm := NewRiskManager(DefaultRiskConfig())
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		rm.RecordRevert()
+		rm.RecordRevert(RevertBug)
+	}
+}
+
+func BenchmarkRecordRevert_Competitive(b *testing.B) {
+	rm := NewRiskManager(DefaultRiskConfig())
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		rm.RecordRevert(RevertCompetitive)
 	}
 }
 

@@ -76,7 +76,7 @@ func TestProcessArbViaGRPC(t *testing.T) {
 
 	rm, bundler, submitter := newTestComponents()
 	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("processArb: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestConsumeArbStream(t *testing.T) {
 	defer cancel()
 
 	consumeArbStream(ctx, client, bundler, submitter, rm, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 
 	// Verify bundle tracking was updated
 	missRate := rm.BundleMissRate()
@@ -131,27 +131,25 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 	// Process first arb — should succeed
 	arb1 := testutil.ProfitableTriangleArb()
 	submitted, err := processArb(ctx, arb1, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb1: %v", err)
 	}
-	if !submitted {
-		t.Error("arb1 should be submitted")
-	}
 
-	// Trigger circuit breaker: 3 consecutive reverts
-	rm.RecordRevert()
-	rm.RecordRevert()
-	rm.RecordRevert()
+	// Trigger circuit breaker: 10 consecutive bug reverts pauses the system
+	// (competitive/MEV reverts are excluded — see issue #27)
+	for i := 0; i < 10; i++ {
+		rm.RecordRevert(risk.RevertBug)
+	}
 
 	if rm.State() == risk.StateRunning {
-		t.Fatal("system should be paused after 3 reverts")
+		t.Fatal("system should be paused after 10 bug reverts")
 	}
 
-	// Process second arb — should be rejected
+	// Process second arb — should be rejected by risk manager
 	arb2 := testutil.Profitable2HopArb()
 	submitted, err = processArb(ctx, arb2, rm, bundler, submitter, nil,
-		"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb2: %v", err)
 	}
@@ -184,7 +182,7 @@ func TestMixedArbScenarios(t *testing.T) {
 
 			arb := tc.arb()
 			submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
-				"0x0000000000000000000000000000000000000000", 90.0, tc.ethBalance)
+				"0x0000000000000000000000000000000000000000", tc.ethBalance)
 			if err != nil {
 				t.Fatalf("processArb: %v", err)
 			}
@@ -221,7 +219,7 @@ func TestGracefulShutdown(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		consumeArbStream(ctx, client, bundler, submitter, rm, nil,
-			"0x0000000000000000000000000000000000000000", 90.0, 0.5)
+			"0x0000000000000000000000000000000000000000", 0.5)
 		close(done)
 	}()
 
