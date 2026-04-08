@@ -148,7 +148,9 @@ contract AetherExecutorForkTest is Test {
         mockAave = new ForkMockAavePool();
 
         // Deploy executor pointing at our mock Aave
-        executor = new AetherExecutor(address(mockAave));
+        // Balancer V2 Vault address on mainnet
+        address BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+        executor = new AetherExecutor(address(mockAave), BALANCER_VAULT);
 
         // Deploy and fund the mock return pool with enough WETH to make the arb profitable
         returnPool = new MockReturnV2Pool(WETH);
@@ -240,7 +242,7 @@ contract AetherExecutorForkTest is Test {
         // executeArb → mockAave.flashLoanSimple → executeOperation → _executeSwap ×2
         // The critical path under test: step[0] calls the real UniV3 pool which
         // calls back uniswapV3SwapCallback with real deltas.
-        executor.executeArb(steps, WETH, FLASH_AMOUNT);
+        executor.executeArb(steps, WETH, FLASH_AMOUNT, 0);
 
         // ── Assertions ───────────────────────────────────────────────────────
 
