@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+#[cfg(test)]
+use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -446,16 +448,16 @@ mod tests {
         let arb = ValidatedArb {
             id: "test-arb-001".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 200_000,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![],
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::new(),
             block_number: 18_000_000,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         let resp = svc
@@ -482,16 +484,16 @@ mod tests {
         let arb = ValidatedArb {
             id: "test-arb-paused".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![],
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::new(),
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         let resp = svc
@@ -517,16 +519,16 @@ mod tests {
         let arb = ValidatedArb {
             id: "test-arb-halted".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![],
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::new(),
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         let resp = svc
@@ -548,16 +550,16 @@ mod tests {
         let arb = ValidatedArb {
             id: "test-arb-nosub".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![],
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::new(),
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         let resp = svc
@@ -584,16 +586,16 @@ mod tests {
         let arb = ValidatedArb {
             id: "test-arb-degraded".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![],
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::new(),
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         let resp = svc
@@ -976,37 +978,37 @@ tier = "warm"
         let mut stream = resp.into_inner();
 
         // Publish an arb with 0.5 ETH profit (below threshold).
-        let low_profit_wei = 500_000_000_000_000_000u128.to_be_bytes().to_vec();
+        let low_profit_wei = Bytes::copy_from_slice(&500_000_000_000_000_000u128.to_be_bytes());
         let low_arb = ValidatedArb {
             id: "low-profit".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
+            gas_cost_wei: Bytes::new(),
             net_profit_wei: low_profit_wei,
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         // Publish an arb with 2.0 ETH profit (above threshold).
-        let high_profit_wei = 2_000_000_000_000_000_000u128.to_be_bytes().to_vec();
+        let high_profit_wei = Bytes::copy_from_slice(&2_000_000_000_000_000_000u128.to_be_bytes());
         let high_arb = ValidatedArb {
             id: "high-profit".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
+            gas_cost_wei: Bytes::new(),
             net_profit_wei: high_profit_wei,
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         // Send both arbs.
@@ -1045,16 +1047,16 @@ tier = "warm"
         let arb = ValidatedArb {
             id: "tiny-profit".into(),
             hops: vec![],
-            total_profit_wei: vec![],
+            total_profit_wei: Bytes::new(),
             total_gas: 0,
-            gas_cost_wei: vec![],
-            net_profit_wei: vec![0, 0, 1], // 1 wei
+            gas_cost_wei: Bytes::new(),
+            net_profit_wei: Bytes::from_static(&[0, 0, 1]), // 1 wei
             block_number: 0,
             timestamp_ns: 0,
-            flashloan_token: vec![],
-            flashloan_amount: vec![],
+            flashloan_token: Bytes::new(),
+            flashloan_amount: Bytes::new(),
             steps: vec![],
-            calldata: vec![],
+            calldata: Bytes::new(),
         };
 
         svc.arb_tx.send(arb).unwrap();

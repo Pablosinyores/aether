@@ -6,6 +6,7 @@
 //! `ValidatedArb` from an `ArbOpportunity` and `SimulationResult`.
 
 use alloy::primitives::{Address, U256};
+use bytes::Bytes;
 
 use aether_common::types::{
     ArbHop, ArbOpportunity, ProtocolType, SimulationResult, SwapStep, ValidatedArb,
@@ -16,14 +17,14 @@ use crate::service::aether_proto;
 // Address / U256 serialization helpers
 // ---------------------------------------------------------------------------
 
-/// Serialize an `Address` (20 bytes) to proto `bytes`.
-pub fn address_to_bytes(addr: &Address) -> Vec<u8> {
-    addr.as_slice().to_vec()
+/// Serialize an `Address` (20 bytes) to proto `Bytes` for efficient prost encoding.
+pub fn address_to_bytes(addr: &Address) -> Bytes {
+    Bytes::copy_from_slice(addr.as_slice())
 }
 
-/// Serialize a `U256` to big-endian proto `bytes` (32 bytes).
-pub fn u256_to_bytes(val: &U256) -> Vec<u8> {
-    val.to_be_bytes::<32>().to_vec()
+/// Serialize a `U256` to big-endian proto `Bytes` for efficient prost encoding.
+pub fn u256_to_bytes(val: &U256) -> Bytes {
+    Bytes::copy_from_slice(&val.to_be_bytes::<32>())
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +69,7 @@ pub fn swap_step_to_proto(step: &SwapStep) -> aether_proto::SwapStep {
         token_out: address_to_bytes(&step.token_out),
         amount_in: u256_to_bytes(&step.amount_in),
         min_amount_out: u256_to_bytes(&step.min_amount_out),
-        calldata: step.calldata.clone(),
+        calldata: Bytes::from(step.calldata.clone()),
     }
 }
 
@@ -87,7 +88,7 @@ pub fn validated_arb_to_proto(arb: &ValidatedArb) -> aether_proto::ValidatedArb 
         flashloan_token: address_to_bytes(&arb.flashloan_token),
         flashloan_amount: u256_to_bytes(&arb.flashloan_amount),
         steps: arb.steps.iter().map(swap_step_to_proto).collect(),
-        calldata: arb.calldata.clone(),
+        calldata: Bytes::from(arb.calldata.clone()),
     }
 }
 
@@ -137,7 +138,7 @@ pub fn build_validated_arb(
         flashloan_token: address_to_bytes(&flashloan_token),
         flashloan_amount: u256_to_bytes(&flashloan_amount),
         steps: steps.iter().map(swap_step_to_proto).collect(),
-        calldata,
+        calldata: Bytes::from(calldata),
     }
 }
 
@@ -271,7 +272,7 @@ mod tests {
 
         assert_eq!(proto.protocol, aether_proto::ProtocolType::UniswapV3 as i32);
         assert_eq!(proto.pool_address.len(), 20);
-        assert_eq!(proto.calldata, vec![0xAA, 0xBB, 0xCC]);
+        assert_eq!(proto.calldata, Bytes::from_static(&[0xAA, 0xBB, 0xCC]));
 
         // Verify amount round-trip.
         let reconstructed = U256::from_be_slice(&proto.amount_in);
@@ -321,7 +322,7 @@ mod tests {
         assert_eq!(proto.total_gas, 200_000);
         assert_eq!(proto.block_number, 18_500_000);
         assert_eq!(proto.timestamp_ns, 1_700_000_000_000_000_000);
-        assert_eq!(proto.calldata, vec![0xDE, 0xAD]);
+        assert_eq!(proto.calldata, Bytes::from_static(&[0xDE, 0xAD]));
 
         // Verify flashloan token address.
         assert_eq!(
