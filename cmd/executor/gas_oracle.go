@@ -158,6 +158,7 @@ func (go_ *GasOracle) UpdateLoop(ctx context.Context, interval time.Duration) {
 			if err != nil {
 				log.Printf("Gas oracle: RPC error (keeping last known): %v", err)
 			}
+			recordGasPrice(fees.GasPriceGwei)
 			log.Printf("Gas oracle: baseFee=%.4f gwei, maxFee=%.4f gwei, priorityFee=%.4f gwei",
 				weiToGwei(fees.BaseFee),
 				weiToGwei(fees.MaxFeePerGas),

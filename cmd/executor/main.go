@@ -182,6 +182,15 @@ func main() {
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
 
+	// Start ETH balance watcher
+	if ethClient != nil && txSigner != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			balanceWatchLoop(ctx, ethClient, txSigner.Address(), 30*time.Second)
+		}()
+	}
+
 	startMetricsServer()
 
 	if strings.HasPrefix(cfg.GRPCAddress, "unix:") {
@@ -255,6 +264,7 @@ func processArb(
 	// Submit to all builders
 	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
+	recordEndToEndLatency(arb.GetTimestampNs())
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 

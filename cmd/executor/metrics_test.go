@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -37,6 +38,10 @@ func TestMetricsEndpoint_ContainsRequiredMetrics(t *testing.T) {
 		"aether_executor_profit_wei_total",
 		"aether_executor_gas_spent_wei_total",
 		"aether_executor_risk_rejections_total",
+		"aether_end_to_end_latency_ms",
+		"aether_gas_price_gwei",
+		"aether_daily_pnl_eth",
+		"aether_eth_balance",
 	}
 
 	payload := string(body)
@@ -83,4 +88,40 @@ func TestMetricsCounters_Increment(t *testing.T) {
 	if gotRisk != baseRisk+1 {
 		t.Fatalf("risk_rejections: got %.0f, want %.0f", gotRisk, baseRisk+1)
 	}
+}
+
+func TestGasPriceGauge(t *testing.T) {
+	recordGasPrice(42.5)
+	got := testutil.ToFloat64(gasPriceGwei)
+	if got != 42.5 {
+		t.Fatalf("gas_price_gwei: got %f, want 42.5", got)
+	}
+}
+
+func TestDailyPnl(t *testing.T) {
+	// Reset PnL state
+	pnlMu.Lock()
+	pnlWei.SetInt64(0)
+	pnlDay = time.Now().UTC().Truncate(24 * time.Hour)
+	pnlMu.Unlock()
+
+	// Profit of 0.01 ETH, gas cost of 0.001 ETH
+	profit := new(big.Int).Mul(big.NewInt(10), new(big.Int).SetUint64(1e15)) // 0.01 ETH
+	gasCost := float64(1e15)                                                 // 0.001 ETH
+	addPnl(profit, gasCost)
+
+	got := testutil.ToFloat64(dailyPnlEth)
+	// 0.01 - 0.001 = 0.009 ETH
+	if got < 0.008 || got > 0.010 {
+		t.Fatalf("daily_pnl_eth: got %f, want ~0.009", got)
+	}
+}
+
+func TestEndToEndLatency(t *testing.T) {
+	// Record a latency from 100ms ago — just verify no panic
+	detectedAt := time.Now().Add(-100 * time.Millisecond).UnixNano()
+	recordEndToEndLatency(detectedAt)
+
+	// Zero timestamp should be a no-op
+	recordEndToEndLatency(0)
 }
