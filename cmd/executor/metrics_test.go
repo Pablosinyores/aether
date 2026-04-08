@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -111,9 +112,10 @@ func TestDailyPnl(t *testing.T) {
 	addPnl(profit, gasCost)
 
 	got := testutil.ToFloat64(dailyPnlEth)
-	// 0.01 - 0.001 = 0.009 ETH
-	if got < 0.008 || got > 0.010 {
-		t.Fatalf("daily_pnl_eth: got %f, want ~0.009", got)
+	// 0.01 - 0.001 = 0.009 ETH exactly
+	const want = 0.009
+	if math.Abs(got-want) > 1e-12 {
+		t.Fatalf("daily_pnl_eth: got %f, want %f", got, want)
 	}
 }
 
