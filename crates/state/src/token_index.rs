@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn test_bidirectional_consistency() {
         let mut idx = TokenIndex::new();
-        let addresses: Vec<Address> = (1..=10).map(|i| Address::repeat_byte(i)).collect();
+        let addresses: Vec<Address> = (1..=10).map(Address::repeat_byte).collect();
 
         for &addr in &addresses {
             idx.get_or_insert(addr);

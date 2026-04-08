@@ -2,6 +2,7 @@ package risk
 
 import (
 	"math/big"
+	"sync"
 	"testing"
 )
 
@@ -159,6 +160,24 @@ func TestPreflightCheck_TipShareTooHigh(t *testing.T) {
 
 	if result.Approved {
 		t.Error("expected rejected for tip share too high, got approved")
+	}
+}
+
+func TestPreflightCheck_TipShareTooLow(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+
+	result := rm.PreflightCheck(
+		fracETHWei(t, 1, 100),
+		ethWei(t, 10),
+		100.0,
+		49.0, // 49% — below 50% min
+		1.0,
+	)
+
+	if result.Approved {
+		t.Error("expected rejected for tip share too low, got approved")
 	}
 }
 
@@ -362,15 +381,17 @@ func TestRecordBundleResult(t *testing.T) {
 	rm.RecordBundleResult(false)
 
 	rm.mu.RLock()
-	submitted := rm.bundlesSubmitted
-	included := rm.bundlesIncluded
+	count := rm.bundleResultCount
 	rm.mu.RUnlock()
 
-	if submitted != 3 {
-		t.Errorf("bundlesSubmitted: got %d, want 3", submitted)
+	if count != 3 {
+		t.Errorf("bundleResultCount: got %d, want 3", count)
 	}
-	if included != 2 {
-		t.Errorf("bundlesIncluded: got %d, want 2", included)
+
+	// Miss rate should be ~33.3% (1 miss out of 3)
+	missRate := rm.BundleMissRate()
+	if missRate < 33.0 || missRate > 34.0 {
+		t.Errorf("BundleMissRate: got %.1f%%, want ~33.3%%", missRate)
 	}
 }
 
@@ -378,10 +399,10 @@ func TestBundleMissRate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		included  int
-		missed    int
-		wantRate  float64
+		name     string
+		included int
+		missed   int
+		wantRate float64
 	}{
 		{"0 submitted", 0, 0, 0.0},
 		{"all included", 10, 0, 0.0},
@@ -412,72 +433,147 @@ func TestBundleMissRate(t *testing.T) {
 	}
 }
 
-func TestCalculateTipShare_NoHistory(t *testing.T) {
+func TestCalculateTipShare_UsesBundleMissRate(t *testing.T) {
 	t.Parallel()
 
 	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
 
-	// With no bundle history, should return the 90% base.
-	got := rm.CalculateTipShare()
-	if got != 90.0 {
-		t.Errorf("CalculateTipShare with no history: got %.1f%%, want 90.0%%", got)
+	// No history => returns last tip (90%) without adjusting.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 90.0 {
+		t.Fatalf("tip share with no history = %.1f, want 90.0", got)
+	}
+
+	// 0% inclusion (100% miss) => increase by 5%.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share after high miss rate = %.1f, want 95.0", got)
+	}
+
+	// No new feedback => gated, returns last tip (95%).
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should stay at 95.0 without new feedback, got %.1f", got)
+	}
+
+	// New miss feedback => tries to increase but capped at 95%.
+	rm.RecordBundleResult(false)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 95.0 {
+		t.Fatalf("tip share should remain capped at 95.0, got %.1f", got)
 	}
 }
 
-func TestCalculateTipShare_Adaptive(t *testing.T) {
+func TestCalculateTipShare_DecreasesOnHighInclusion(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name     string
-		included int
-		missed   int
-		wantMin  float64
-		wantMax  float64
-	}{
-		{"all included — tip decreases", 10, 0, 70.0, 78.0},
-		{"all missed — tip increases toward max", 0, 10, 93.0, 95.0},
-		{"50% inclusion — base tip", 5, 5, 89.0, 91.0},
-		{"75% inclusion — below base", 15, 5, 77.0, 85.0},
-		{"25% inclusion — above base", 5, 15, 93.0, 95.0},
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// 90% inclusion => decrease from 90% to 85%.
+	for i := 0; i < 9; i++ {
+		rm.RecordBundleResult(true)
 	}
+	rm.RecordBundleResult(false)
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			rm := NewRiskManager(DefaultRiskConfig())
-			for i := 0; i < tc.included; i++ {
-				rm.RecordBundleResult(true)
-			}
-			for i := 0; i < tc.missed; i++ {
-				rm.RecordBundleResult(false)
-			}
-
-			got := rm.CalculateTipShare()
-			if got < tc.wantMin || got > tc.wantMax {
-				t.Errorf("CalculateTipShare: got %.1f%%, want in [%.1f%%, %.1f%%]",
-					got, tc.wantMin, tc.wantMax)
-			}
-		})
+	// First call after feedback triggers adjustment.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 85.0 {
+		t.Fatalf("tip share after high inclusion = %.1f, want 85.0", got)
 	}
 }
 
-func TestCalculateTipShare_ClampedToMax(t *testing.T) {
+func TestCalculateTipShare_RespectsConfiguredBounds(t *testing.T) {
 	t.Parallel()
 
 	cfg := DefaultRiskConfig()
-	cfg.MaxTipSharePct = 92.0
+	cfg.MinTipSharePct = 60.0
+	cfg.MaxTipSharePct = 80.0
 	rm := NewRiskManager(cfg)
+	profitWei := ethWei(t, 1)
 
-	// All misses should push tip up, but it must not exceed MaxTipSharePct.
+	// No feedback yet => returns initial clamped tip.
+	if got := rm.CalculateTipShare(profitWei, 30.0); got != 80.0 {
+		t.Fatalf("initial clamped tip share = %.1f, want 80.0", got)
+	}
+
+	// 100% inclusion would reduce tip, but never below configured min.
+	// Each RecordBundleResult + CalculateTipShare = one adjustment step.
 	for i := 0; i < 20; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	// One more feedback to trigger final check.
+	rm.RecordBundleResult(true)
+	if got := rm.CalculateTipShare(profitWei, 30.0); got < 60.0 {
+		t.Fatalf("tip share should not go below configured min 60.0, got %.1f", got)
+	}
+}
+
+func TestCalculateTipShare_ContinuesAfterWindowFills(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	profitWei := ethWei(t, 1)
+
+	// Fill the window with 110 included bundles (> 100 window size).
+	for i := 0; i < 110; i++ {
+		rm.RecordBundleResult(true)
+		_ = rm.CalculateTipShare(profitWei, 30.0)
+	}
+
+	// Strategy should have decreased from 90% toward min due to high inclusion.
+	tipAfterFill := rm.CalculateTipShare(profitWei, 30.0)
+
+	// Record 60 misses — pushes inclusion below 50% low threshold in a 100-entry window.
+	for i := 0; i < 60; i++ {
 		rm.RecordBundleResult(false)
 	}
 
-	got := rm.CalculateTipShare()
-	if got > cfg.MaxTipSharePct {
-		t.Errorf("CalculateTipShare exceeded max: got %.1f%%, max %.1f%%", got, cfg.MaxTipSharePct)
+	// Strategy must still respond — not frozen after window wrap.
+	tipAfterMisses := rm.CalculateTipShare(profitWei, 30.0)
+	if tipAfterMisses <= tipAfterFill {
+		t.Errorf("strategy frozen after window fill: tip did not increase after misses (before=%.1f, after=%.1f)", tipAfterFill, tipAfterMisses)
 	}
+}
+
+// TestCalculateTipShare_ConcurrentAccess exercises RecordBundleResult and
+// CalculateTipShare from multiple goroutines simultaneously. Run with
+// -race to validate mutex correctness.
+func TestCalculateTipShare_ConcurrentAccess(t *testing.T) {
+	rm := NewRiskManager(DefaultRiskConfig())
+	profit := ethWei(t, 1)
+
+	const goroutines = 10
+	const iters = 50
+
+	var wg sync.WaitGroup
+
+	// Writers: record bundle results concurrently.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				rm.RecordBundleResult(j%2 == 0)
+			}
+		}(i)
+	}
+
+	// Readers: calculate tip share concurrently with writes.
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iters; j++ {
+				tip := rm.CalculateTipShare(profit, 30.0)
+				if tip < DefaultRiskConfig().MinTipSharePct || tip > DefaultRiskConfig().MaxTipSharePct {
+					t.Errorf("tip share %.1f%% out of bounds [%.1f%%, %.1f%%]",
+						tip, DefaultRiskConfig().MinTipSharePct, DefaultRiskConfig().MaxTipSharePct)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestWeiToETH(t *testing.T) {

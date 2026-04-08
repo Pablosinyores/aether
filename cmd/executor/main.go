@@ -57,6 +57,8 @@ func loadConfig() Config {
 			builders = append(builders, BuilderConfig{
 				Name:      b.Name,
 				URL:       b.URL,
+				AuthType:  b.AuthType,
+				AuthKey:   b.AuthKey,
 				Enabled:   b.Enabled,
 				TimeoutMs: b.TimeoutMs,
 			})
@@ -92,20 +94,28 @@ func main() {
 
 	cfg := loadConfig()
 
-	// Load searcher private key for transaction signing.
-	var txSigner *TransactionSigner
+	// Load searcher private key for transaction signing and bundle submission.
 	searcherKey := os.Getenv("SEARCHER_KEY")
-	os.Unsetenv("SEARCHER_KEY")
+
+	// Create submitter BEFORE clearing the key — it needs the key for FlashbotsSigner.
+	submitter, err := NewSubmitter(cfg.BuilderConfigs, searcherKey)
+	if err != nil {
+		log.Fatalf("Failed to create submitter: %v", err)
+	}
+
+	var txSigner *TransactionSigner
 	if searcherKey != "" {
-		var err error
-		txSigner, err = NewTransactionSigner(searcherKey, cfg.ChainID)
-		if err != nil {
-			log.Fatalf("Failed to load SEARCHER_KEY: %v", err)
+		var signerErr error
+		txSigner, signerErr = NewTransactionSigner(searcherKey, cfg.ChainID)
+		if signerErr != nil {
+			log.Fatalf("Failed to load SEARCHER_KEY: %v", signerErr)
 		}
 		log.Printf("Searcher address: %s", txSigner.Address().Hex())
 	} else {
 		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
 	}
+
+	os.Unsetenv("SEARCHER_KEY")
 
 	// Connect to Ethereum node for nonce sync.
 	var ethClient *ethclient.Client
@@ -143,7 +153,13 @@ func main() {
 	}
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
-	submitter := NewSubmitter(cfg.BuilderConfigs)
+	if ethClient != nil {
+		gasOracle.SetClient(ethClient)
+		// Fetch real gas prices before first arb evaluation.
+		if _, err := gasOracle.FetchOnce(ctx); err != nil {
+			log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
+		}
+	}
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
 
@@ -165,6 +181,8 @@ func main() {
 		defer wg.Done()
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
+
+	startMetricsServer()
 
 	log.Printf("Executor service started, gRPC target: %s", cfg.GRPCAddress)
 	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
@@ -216,10 +234,11 @@ func processArb(
 
 	gasFees := bundler.gasOracle.CurrentFees()
 	gasGwei := gasFees.GasPriceGwei
-	tipSharePct := rm.CalculateTipShare()
+	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
 
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {
+		recordRiskRejection()
 		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
 		return false, nil
 	}
@@ -229,15 +248,22 @@ func processArb(
 		return false, fmt.Errorf("build bundle: %w", err)
 	}
 
+	// Submit to all builders
+	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
 	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
 
-	rm.RecordBundleResult(successes > 0)
+	// Record result for miss rate tracking
+	included := successes > 0
+	if included {
+		recordBundleIncluded(profitWei, gasGwei, arb.TotalGas)
+	}
+	rm.RecordBundleResult(included)
 
-	return successes > 0, nil
+	return included, nil
 }
 
 // recordSubmissionReverts classifies and records a single revert per arb

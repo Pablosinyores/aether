@@ -54,7 +54,6 @@ sudo systemctl start aether-go
 ### Service Dependencies
 
 ```
-aether-rust depends on: postgresql, redis
 aether-go depends on: aether-rust
 ```
 
@@ -255,13 +254,7 @@ curl -s http://localhost:9090/metrics | head -20
 # 4. Dashboard
 curl -s http://localhost:8080/ | head -5
 
-# 5. Database connectivity
-psql -h localhost -U aether -d aether -c "SELECT 1;"
-
-# 6. Redis connectivity
-redis-cli -h localhost ping
-
-# 7. Node connectivity
+# 5. Node connectivity
 curl -s -X POST -H "Content-Type: application/json" \
     -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
     http://localhost:8545
@@ -277,17 +270,6 @@ Logs are managed by journald. Configure retention:
 # /etc/systemd/journald.conf
 SystemMaxUse=2G
 MaxRetentionSec=7d
-```
-
-### Database Maintenance
-
-```bash
-# Vacuum trade ledger
-psql -h localhost -U aether -d aether -c "VACUUM ANALYZE;"
-
-# Archive old trades (older than 30 days)
-psql -h localhost -U aether -d aether -c \
-    "DELETE FROM trades WHERE created_at < NOW() - INTERVAL '30 days';"
 ```
 
 ### Profit Sweep

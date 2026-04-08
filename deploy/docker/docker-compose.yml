@@ -8,15 +8,21 @@ services:
     container_name: aether-rust
     ports:
       - "50051:50051"
+      - "9092:9092"
     volumes:
       - ../../config:/app/config:ro
+      - reth-ipc:/tmp
     environment:
       - RUST_LOG=info
       - AETHER_CONFIG_DIR=/app/config
+      - GRPC_ADDRESS=0.0.0.0:50051
+      - ETH_RPC_URL=${ETH_RPC_URL:-}
+      - AETHER_NODES_CONFIG=/app/config/nodes.yaml
+      - RUST_METRICS_PORT=9092
+    env_file:
+      - path: ../../.env
+        required: false
     restart: unless-stopped
-    depends_on:
-      - redis
-      - postgres
     networks:
       - aether-net
 
@@ -32,31 +38,12 @@ services:
       - GRPC_ADDRESS=aether-rust:50051
       - METRICS_PORT=9090
       - DASHBOARD_PORT=8080
+    env_file:
+      - path: ../../.env
+        required: false
     restart: unless-stopped
     depends_on:
       - aether-rust
-    networks:
-      - aether-net
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: aether-postgres
-    environment:
-      - POSTGRES_DB=aether
-      - POSTGRES_USER=aether
-      - POSTGRES_PASSWORD=aether_dev
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - aether-net
-
-  redis:
-    image: redis:7-alpine
-    container_name: aether-redis
-    ports:
-      - "6379:6379"
     networks:
       - aether-net
 
@@ -70,8 +57,48 @@ services:
     networks:
       - aether-net
 
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aether-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - aether-net
+
+  # Loki: deferred — logs available via `docker logs`, Loki planned for production deployment
+
+  # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
+  # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
+  reth:
+    image: ghcr.io/paradigmxyz/reth:latest
+    container_name: aether-reth
+    profiles:
+      - node
+    ports:
+      - "30303:30303"
+    volumes:
+      - reth-data:/root/.local/share/reth
+      - reth-ipc:/tmp
+    command: >
+      node
+      --ipcpath /tmp/reth.ipc
+    networks:
+      - aether-net
+
+
 volumes:
-  postgres-data:
+  grafana-data:
+  reth-data:
+  reth-ipc:
 
 networks:
   aether-net:

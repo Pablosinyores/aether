@@ -3,10 +3,13 @@ builders:
     url: "https://relay.flashbots.net"
     enabled: true
     timeout_ms: 2000
+    auth_type: "flashbots"
   - name: "titan"
     url: "https://rpc.titanbuilder.xyz"
     enabled: true
     timeout_ms: 2000
+    auth_type: "none"
+    # To use API key auth, set auth_type: "api_key" and auth_key: "${TITAN_API_KEY}"
 
 submission:
   fan_out: true

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func TestNonce_NextSequential(t *testing.T) {
@@ -185,5 +189,114 @@ func TestNonce_PendingCount(t *testing.T) {
 	nm.Next()
 	if got := nm.PendingCount(); got != 5 {
 		t.Errorf("after 5 Next: PendingCount=%d, want 5", got)
+	}
+}
+
+// --- Mock RPC tests ---
+
+// mockNonceProvider implements NonceProvider for testing.
+// Not concurrency-safe — use only in sequential test scenarios.
+type mockNonceProvider struct {
+	nonce uint64
+	err   error
+	calls int
+}
+
+func (m *mockNonceProvider) PendingNonceAt(_ context.Context, _ common.Address) (uint64, error) {
+	m.calls++
+	return m.nonce, m.err
+}
+
+func TestNonce_SyncFromChain_MockRPC(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockNonceProvider{nonce: 42}
+	addr := common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
+
+	nm := NewNonceManager(0)
+	nm.SetSyncSource(addr, mock)
+
+	if err := nm.SyncFromChain(context.Background()); err != nil {
+		t.Fatalf("SyncFromChain: %v", err)
+	}
+	if mock.calls != 1 {
+		t.Errorf("expected 1 RPC call, got %d", mock.calls)
+	}
+	if got := nm.Current(); got != 42 {
+		t.Errorf("nonce after sync: got %d, want 42", got)
+	}
+}
+
+func TestNonce_SyncFromChain_RPCError_KeepsNonce(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockNonceProvider{err: fmt.Errorf("connection refused")}
+	addr := common.HexToAddress("0x1234567890abcdef1234567890abcdef12345678")
+
+	nm := NewNonceManager(10)
+	nm.SetSyncSource(addr, mock)
+
+	err := nm.SyncFromChain(context.Background())
+	if err == nil {
+		t.Fatal("expected error from SyncFromChain")
+	}
+	// Nonce should remain at 10.
+	if got := nm.Current(); got != 10 {
+		t.Errorf("nonce after failed sync: got %d, want 10", got)
+	}
+}
+
+func TestNonce_SyncFromChain_NoClient(t *testing.T) {
+	t.Parallel()
+
+	nm := NewNonceManager(5)
+	// No client configured — should be a no-op.
+	if err := nm.SyncFromChain(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := nm.Current(); got != 5 {
+		t.Errorf("nonce without client: got %d, want 5", got)
+	}
+}
+
+func TestNonce_SyncFromChain_HigherNonceUpdates(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockNonceProvider{nonce: 100}
+	addr := common.HexToAddress("0xaaaa")
+
+	nm := NewNonceManager(50)
+	nm.SetSyncSource(addr, mock)
+
+	// Use some nonces locally.
+	nm.Next() // 50
+	nm.Next() // 51
+
+	if err := nm.SyncFromChain(context.Background()); err != nil {
+		t.Fatalf("SyncFromChain: %v", err)
+	}
+	if got := nm.Current(); got != 100 {
+		t.Errorf("nonce after sync to higher: got %d, want 100", got)
+	}
+	if got := nm.PendingCount(); got != 0 {
+		t.Errorf("pending count after sync: got %d, want 0", got)
+	}
+}
+
+func TestNonce_SyncFromChain_LowerNonceIgnored(t *testing.T) {
+	t.Parallel()
+
+	mock := &mockNonceProvider{nonce: 5}
+	addr := common.HexToAddress("0xbbbb")
+
+	nm := NewNonceManager(20)
+	nm.SetSyncSource(addr, mock)
+
+	if err := nm.SyncFromChain(context.Background()); err != nil {
+		t.Fatalf("SyncFromChain: %v", err)
+	}
+	// Lower on-chain nonce should not downgrade local nonce.
+	if got := nm.Current(); got != 20 {
+		t.Errorf("nonce after lower sync: got %d, want 20", got)
 	}
 }

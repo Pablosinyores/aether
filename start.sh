@@ -52,15 +52,9 @@ for port in 50051 9090 8080; do
 done
 
 # 1. Start Docker infra
-log "Starting infrastructure (Postgres, Redis, Prometheus)..."
-docker compose -f deploy/docker/docker-compose.yml up -d postgres redis prometheus 2>&1 | tail -1
+log "Starting infrastructure (Prometheus)..."
+docker compose -f deploy/docker/docker-compose.yml up -d prometheus 2>&1 | tail -1
 sleep 2
-
-# Verify containers
-if ! docker ps --format '{{.Names}}' | grep -q aether-postgres; then
-    err "PostgreSQL container failed to start"
-    exit 1
-fi
 log "Infrastructure is up"
 
 # 2. Build if needed
