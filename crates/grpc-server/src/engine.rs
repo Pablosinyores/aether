@@ -225,6 +225,12 @@ impl AetherEngine {
 
     /// Register a pool in the engine's pool registry and create placeholder
     /// edges in the price graph.
+    ///
+    /// # Concurrency
+    ///
+    /// This method is NOT safe for concurrent calls — multiple callers would
+    /// race on load-clone-modify-store of `token_index`. Currently safe because
+    /// it's only called from the single-threaded engine event loop.
     pub async fn register_pool(
         &self,
         pool_addr: Address,
@@ -666,9 +672,7 @@ impl AetherEngine {
                             r0,
                             fee,
                         );
-                        let block = self.current_block.load();
-                        self.snapshot_manager
-                            .publish(graph.clone(), block.number, block.timestamp as i64);
+                        // Snapshot is published once per detection cycle, not per event.
                     }
                 }
             }
@@ -710,9 +714,7 @@ impl AetherEngine {
                             meta.protocol,
                             liq,
                         );
-                        let block = self.current_block.load();
-                        self.snapshot_manager
-                            .publish(graph.clone(), block.number, block.timestamp as i64);
+                        // Snapshot is published once per detection cycle, not per event.
                     }
                 }
             }
@@ -725,11 +727,7 @@ impl AetherEngine {
                 // Default to UniswapV2 with 30 bps fee (most PairCreated events).
                 self.register_pool(pool, token0, token1, ProtocolType::UniswapV2, 30)
                     .await;
-                // Publish snapshot after registration so edges are visible to detection.
-                let graph = self.working_graph.lock().await;
-                let block = self.current_block.load();
-                self.snapshot_manager
-                    .publish(graph.clone(), block.number, block.timestamp as i64);
+                // Snapshot is published once per detection cycle, not per event.
             }
         }
     }
@@ -737,6 +735,22 @@ impl AetherEngine {
     /// Run a detection cycle: scan for negative cycles, simulate, publish.
     async fn run_detection_cycle(&self) {
         let t_cycle = Instant::now();
+
+        // Snapshot the current working graph for this detection cycle.
+        // This atomically captures all pending dirty edges and resets the
+        // working copy for the next cycle's event accumulation.
+        // Any events arriving during detection will set NEW dirty flags on
+        // working_graph, which will be picked up by the next cycle.
+        let (detection_graph, block_number, timestamp_ns) = {
+            let mut graph = self.working_graph.lock().await;
+            let snapshot_graph = graph.clone();
+            graph.clear_dirty();
+            let block = (**self.current_block.load()).clone();
+            (snapshot_graph, block.number, block.timestamp as i64)
+        };
+
+        self.snapshot_manager
+            .publish(detection_graph, block_number, timestamp_ns);
 
         // Phase 1: Detect cycles and extract candidate data from lock-free snapshot.
         let candidates = {
@@ -767,14 +781,6 @@ impl AetherEngine {
             self.metrics.inc_cycles_detected(cycles.len() as u64);
 
             if cycles.is_empty() {
-                // Clear dirty on working graph and publish clean snapshot.
-                let mut graph = self.working_graph.lock().await;
-                graph.clear_dirty();
-                self.snapshot_manager.publish(
-                    graph.clone(),
-                    snapshot.block_number,
-                    snapshot.timestamp_ns,
-                );
                 return;
             }
 
@@ -1122,11 +1128,6 @@ impl AetherEngine {
         let phase2_us = t_phase2.elapsed().as_micros();
         let total_cycle_us = t_cycle.elapsed().as_micros();
 
-        // Phase 3: Clear dirty flags on working graph and publish clean snapshot.
-        let mut graph = self.working_graph.lock().await;
-        graph.clear_dirty();
-        self.snapshot_manager.publish(graph.clone(), block_info.number, block_info.timestamp as i64);
-
         info!(
             total_cycle_us,
             phase1_us,
@@ -1459,11 +1460,10 @@ mod tests {
             .register_pool(pool, token0, token1, ProtocolType::UniswapV2, 30)
             .await;
 
-        // Clear dirty from registration.
+        // Clear dirty from registration on the working graph.
         {
             let mut graph = engine.working_graph.lock().await;
             graph.clear_dirty();
-            engine.snapshot_manager.publish(graph.clone(), 0, 0);
         }
 
         // Send a reserve update.
@@ -1475,9 +1475,11 @@ mod tests {
         };
         engine.handle_pool_update(event).await;
 
-        // Snapshot should be dirty after the update.
-        let snapshot = engine.snapshot_manager.load();
-        assert!(snapshot.graph.has_dirty_edges());
+        // Under the new model, event handlers mutate working_graph only.
+        // The snapshot is published at cycle start, not per-event.
+        // Dirty flags must be present on working_graph (not yet snapshotted).
+        let graph = engine.working_graph.lock().await;
+        assert!(graph.has_dirty_edges());
     }
 
     #[tokio::test]
@@ -1497,7 +1499,6 @@ mod tests {
         {
             let mut graph = engine.working_graph.lock().await;
             graph.clear_dirty();
-            engine.snapshot_manager.publish(graph.clone(), 0, 0);
         }
 
         // Send a V3 update with a realistic sqrt_price_x96.
@@ -1511,8 +1512,10 @@ mod tests {
         };
         engine.handle_pool_update(event).await;
 
-        let snapshot = engine.snapshot_manager.load();
-        assert!(snapshot.graph.has_dirty_edges());
+        // Under the new model, event handlers mutate working_graph only.
+        // Dirty flags must be present on working_graph (not yet snapshotted).
+        let graph = engine.working_graph.lock().await;
+        assert!(graph.has_dirty_edges());
     }
 
     #[tokio::test]
@@ -1621,9 +1624,11 @@ mod tests {
 
         // The EVM treats calls to Address::ZERO (no code) as a success,
         // so the simulation passes and the arb gets published.
-        // Check that dirty flags were cleared.
-        let snapshot = engine.snapshot_manager.load();
-        assert!(!snapshot.graph.has_dirty_edges());
+        // Check that dirty flags were cleared on the working graph.
+        // The published snapshot retains dirty flags (detection reads them),
+        // but working_graph is clean — ready for next cycle's event accumulation.
+        let graph = engine.working_graph.lock().await;
+        assert!(!graph.has_dirty_edges());
 
         // With zero gas cost and zero profit threshold, the profitable cycle
         // should be detected, simulated (success on empty account), and published.
