@@ -1,11 +1,129 @@
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::DynProvider;
+use alloy::providers::{DynProvider, Provider};
+use futures::future::join_all;
+use revm::bytecode::Bytecode;
 use revm::database::CacheDB;
 use revm::database_interface::EmptyDB;
 use revm::state::AccountInfo;
 use revm_database::{AlloyDB, BlockId, WrapDatabaseAsync};
-use tracing::debug;
+use tracing::{debug, warn};
+
+// ── CacheDB pre-warming ────────────────────────────────────────────
+
+/// Pre-fetched contract code and storage for the simulation hot path.
+///
+/// Built once per block cycle before parallel simulation is dispatched.
+/// Injected into each task's `RpcForkedState` cache so that per-task cold
+/// RPC fetches are eliminated — all simulations sharing the same block see
+/// the same contract state without redundant network round-trips.
+pub struct PrewarmedState {
+    accounts: Vec<(Address, AccountInfo)>,
+    /// (address, slot, value) — pre-fetched storage slots (e.g. V2 reserves).
+    storage: Vec<(Address, U256, U256)>,
+}
+
+impl PrewarmedState {
+    /// Inject pre-fetched data into an `RpcForkedState`'s in-memory cache.
+    /// Any subsequent read for these addresses is served locally; only truly
+    /// unknown state (untouched storage slots, etc.) falls back to RPC.
+    pub fn inject_into(&self, state: &mut RpcForkedState) {
+        for (addr, info) in &self.accounts {
+            state.db.insert_account_info(*addr, info.clone());
+        }
+        for &(addr, slot, value) in &self.storage {
+            if let Err(e) = state.db.insert_account_storage(addr, slot, value) {
+                warn!(%addr, %slot, error = %e, "pre-warm: failed to insert storage slot");
+            }
+        }
+    }
+}
+
+/// Fetch contract code and known storage slots for `code_addresses` and
+/// `v2_pool_addresses` at `block_number`, returning a `PrewarmedState` ready
+/// to be injected into parallel simulation tasks.
+///
+/// All RPC calls are issued concurrently via `join_all`. Errors on individual
+/// addresses are logged and skipped — pre-warming is best-effort; missing
+/// entries simply result in a per-task cache miss (lazy RPC fetch) rather
+/// than a hard failure.
+///
+/// **`v2_pool_addresses`**: UniswapV2 / SushiSwap pools whose packed-reserve
+/// slot (slot 8) is pre-fetched. This is the single most impactful storage
+/// slot to warm — `getReserves()` reads it on every V2 swap path.
+pub async fn prewarm_state(
+    provider: &DynProvider<Ethereum>,
+    block_number: u64,
+    code_addresses: &[Address],
+    v2_pool_addresses: &[Address],
+) -> PrewarmedState {
+    let block_id = BlockId::from(block_number);
+
+    // Fetch contract code for every address in parallel.
+    let code_futs = code_addresses.iter().map(|&addr| {
+        let p = provider.clone();
+        async move {
+            match p.get_code_at(addr).block_id(block_id).await {
+                Ok(code) if !code.is_empty() => {
+                    let code_hash = alloy::primitives::keccak256(&code);
+                    let bytecode = Bytecode::new_raw(
+                        revm::primitives::Bytes::copy_from_slice(&code),
+                    );
+                    let info = AccountInfo {
+                        balance: U256::ZERO,
+                        nonce: 0,
+                        code_hash,
+                        code: Some(bytecode),
+                        ..Default::default()
+                    };
+                    Some((addr, info))
+                }
+                Ok(_) => None, // empty bytecode (EOA)
+                Err(e) => {
+                    warn!(%addr, error = %e, "pre-warm: failed to fetch contract code");
+                    None
+                }
+            }
+        }
+    });
+
+    // Fetch slot 8 (packed reserves: reserve0 | reserve1 | blockTimestampLast)
+    // for UniswapV2 / SushiSwap pools in parallel.
+    const V2_RESERVES_SLOT: u64 = 8;
+    let storage_futs = v2_pool_addresses.iter().map(|&addr| {
+        let p = provider.clone();
+        async move {
+            match p
+                .get_storage_at(addr, U256::from(V2_RESERVES_SLOT))
+                .block_id(block_id)
+                .await
+            {
+                Ok(value) if value != U256::ZERO => {
+                    Some((addr, U256::from(V2_RESERVES_SLOT), value))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    warn!(%addr, error = %e, "pre-warm: failed to fetch V2 reserve slot");
+                    None
+                }
+            }
+        }
+    });
+
+    let (code_results, storage_results) =
+        tokio::join!(join_all(code_futs), join_all(storage_futs));
+
+    debug!(
+        code_warmed = code_results.iter().filter(|r| r.is_some()).count(),
+        storage_warmed = storage_results.iter().filter(|r| r.is_some()).count(),
+        "Block pre-warm complete"
+    );
+
+    PrewarmedState {
+        accounts: code_results.into_iter().flatten().collect(),
+        storage: storage_results.into_iter().flatten().collect(),
+    }
+}
 
 // ── RPC-backed forked state (AlloyDB) ──────────────────────────────
 
