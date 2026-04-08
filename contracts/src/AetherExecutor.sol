@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IWETH {
     function withdraw(uint256 wad) external;
@@ -11,11 +12,12 @@ interface IWETH {
 /// @title AetherExecutor - Flash loan arbitrage executor
 /// @notice Executes cross-DEX arbitrage using Aave V3 flash loans
 /// @dev All swap steps must be profitable after gas + flash loan premium
-contract AetherExecutor {
+contract AetherExecutor is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     address public owner;
     address public immutable aavePool;
+    address public immutable balancerVault;
 
     /// @dev Canonical WETH address on Ethereum mainnet
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
@@ -69,9 +71,12 @@ contract AetherExecutor {
     address private _pendingV3TokenIn;
     uint256 private _pendingV3AmountIn;
 
-    constructor(address _aavePool) {
+    constructor(address _aavePool, address _balancerVault) {
+        require(_aavePool != address(0), "Zero aavePool");
+        require(_balancerVault != address(0), "Zero balancerVault");
         owner = msg.sender;
         aavePool = _aavePool;
+        balancerVault = _balancerVault;
     }
 
     /// @notice Entry point - initiates flash loan and arb execution
@@ -115,7 +120,7 @@ contract AetherExecutor {
         uint256 premium,
         address initiator,
         bytes calldata params
-    ) external returns (bool) {
+    ) external nonReentrant returns (bool) {
         if (msg.sender != aavePool) revert NotAavePool();
         if (initiator != address(this)) revert InvalidInitiator();
 
@@ -287,12 +292,12 @@ contract AetherExecutor {
         IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
-    /// @dev Balancer: approve Vault to pull tokens, call swap, reset approval
+    /// @dev Balancer V2: approve the single Vault (not the pool) to pull tokens
     function _swapBalancer(SwapStep memory step, uint256 index) internal {
-        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
-        (bool success,) = step.pool.call(step.data);
+        IERC20(step.tokenIn).forceApprove(balancerVault, step.amountIn);
+        (bool success,) = balancerVault.call(step.data);
         if (!success) revert SwapFailed(index);
-        IERC20(step.tokenIn).forceApprove(step.pool, 0);
+        IERC20(step.tokenIn).forceApprove(balancerVault, 0);
     }
 
     /// @dev Bancor: approve router to pull tokens, call trade, reset approval

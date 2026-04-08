@@ -43,6 +43,7 @@ pub const ANVIL_ACCOUNT0: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffF
 pub const ANVIL_ACCOUNT0_KEY: &str =
     "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub const AAVE_V3_POOL: Address = address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+pub const BALANCER_V2_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
 pub const WETH_BALANCE_SLOT: u64 = 3;
 
 // Aave-flashloanable tokens
@@ -518,6 +519,7 @@ pub fn deploy_executor(anvil_url: &str) -> Result<Address, String> {
             "src/AetherExecutor.sol:AetherExecutor",
             "--constructor-args",
             &format!("{}", AAVE_V3_POOL),
+            &format!("{}", BALANCER_V2_VAULT),
         ])
         .output()
         .map_err(|e| format!("forge create failed to run: {e}"))?;

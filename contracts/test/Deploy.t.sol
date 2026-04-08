@@ -9,21 +9,21 @@ contract DeployTest is Test {
     DeployAetherExecutor deployer;
 
     address constant DEFAULT_AAVE_POOL = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
+    address constant DEFAULT_BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
 
     function setUp() public {
         deployer = new DeployAetherExecutor();
     }
 
     function test_deploy_defaultAavePool() public {
-        AetherExecutor executor = deployer.runWithAavePool(DEFAULT_AAVE_POOL);
-        assertEq(executor.aavePool(), 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2);
-        // vm.startBroadcast() without args defaults to tx.origin
+        AetherExecutor executor = deployer.runWithParams(DEFAULT_AAVE_POOL, DEFAULT_BALANCER_VAULT);
+        assertEq(executor.aavePool(), DEFAULT_AAVE_POOL);
+        assertEq(executor.balancerVault(), DEFAULT_BALANCER_VAULT);
         assertEq(executor.owner(), tx.origin);
     }
 
     function test_deploy_ownerIsDeployer() public {
-        AetherExecutor executor = deployer.runWithAavePool(DEFAULT_AAVE_POOL);
-        // vm.startBroadcast() without args uses tx.origin as the broadcast sender
+        AetherExecutor executor = deployer.runWithParams(DEFAULT_AAVE_POOL, DEFAULT_BALANCER_VAULT);
         assertEq(executor.owner(), tx.origin);
         assertTrue(executor.owner() != address(0));
     }
@@ -33,13 +33,15 @@ contract DeployCustomPoolTest is Test {
     DeployAetherExecutor deployer;
 
     address constant CUSTOM_POOL = address(0xBEEF);
+    address constant CUSTOM_VAULT = address(0xCAFE);
 
     function setUp() public {
         deployer = new DeployAetherExecutor();
     }
 
     function test_deploy_customAavePool() public {
-        AetherExecutor executor = deployer.runWithAavePool(CUSTOM_POOL);
+        AetherExecutor executor = deployer.runWithParams(CUSTOM_POOL, CUSTOM_VAULT);
         assertEq(executor.aavePool(), CUSTOM_POOL);
+        assertEq(executor.balancerVault(), CUSTOM_VAULT);
     }
 }
