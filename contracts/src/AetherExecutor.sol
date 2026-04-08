@@ -4,6 +4,10 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+interface IWETH {
+    function withdraw(uint256 wad) external;
+}
+
 /// @title AetherExecutor - Flash loan arbitrage executor
 /// @notice Executes cross-DEX arbitrage using Aave V3 flash loans
 /// @dev All swap steps must be profitable after gas + flash loan premium
@@ -12,6 +16,9 @@ contract AetherExecutor {
 
     address public owner;
     address public immutable aavePool;
+
+    /// @dev Canonical WETH address on Ethereum mainnet
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     // Protocol constants matching ProtocolType enum in crates/common/src/types.rs
     uint8 constant UNISWAP_V2 = 1;
@@ -35,6 +42,7 @@ contract AetherExecutor {
         address indexed flashloanToken,
         uint256 flashloanAmount,
         uint256 profit,
+        uint256 tipAmount,
         uint256 gasUsed
     );
 
@@ -47,6 +55,8 @@ contract AetherExecutor {
     error ZeroAddress();
     error ArrayLengthMismatch();
     error SwapFailed(uint256 stepIndex);
+    error TipBpsTooHigh();
+    error CoinbaseTipFailed();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -62,15 +72,19 @@ contract AetherExecutor {
     /// @param steps Array of swap steps to execute
     /// @param flashloanToken Token to borrow
     /// @param flashloanAmount Amount to borrow
+    /// @param tipBps Tip to block.coinbase in basis points (e.g. 9000 = 90%)
     function executeArb(
         SwapStep[] calldata steps,
         address flashloanToken,
-        uint256 flashloanAmount
+        uint256 flashloanAmount,
+        uint256 tipBps
     ) external onlyOwner {
+        if (tipBps > 10_000) revert TipBpsTooHigh();
+
         uint256 gasStart = gasleft();
 
-        // Encode steps for callback
-        bytes memory params = abi.encode(steps, gasStart);
+        // Encode steps, gas snapshot, and tip config for callback
+        bytes memory params = abi.encode(steps, gasStart, tipBps);
 
         // Initiate flash loan - Aave V3 IPool.flashLoanSimple
         // function flashLoanSimple(address receiverAddress, address asset, uint256 amount, bytes calldata params, uint16 referralCode)
@@ -99,7 +113,8 @@ contract AetherExecutor {
         if (msg.sender != aavePool) revert NotAavePool();
         if (initiator != address(this)) revert InvalidInitiator();
 
-        (SwapStep[] memory steps, uint256 gasStart) = abi.decode(params, (SwapStep[], uint256));
+        (SwapStep[] memory steps, uint256 gasStart, uint256 tipBps) =
+            abi.decode(params, (SwapStep[], uint256, uint256));
 
         // Execute all swap steps
         uint256 len = steps.length;
@@ -109,7 +124,24 @@ contract AetherExecutor {
             unchecked { ++i; }
         }
 
-        // Repay flash loan (amount + premium)
+        // Repay flash loan and distribute profit
+        (uint256 profit, uint256 tipAmount) = _repayAndDistribute(asset, amount, premium, tipBps);
+
+        uint256 gasUsed = gasStart - gasleft();
+        emit ArbExecuted(asset, amount, profit, tipAmount, gasUsed);
+
+        return true;
+    }
+
+    /// @dev Repay flash loan, split profit between coinbase tip and owner
+    /// @return profit Total profit before tip/owner split
+    /// @return tipAmount Amount sent to block.coinbase
+    function _repayAndDistribute(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        uint256 tipBps
+    ) internal returns (uint256 profit, uint256 tipAmount) {
         uint256 totalDebt = amount + premium;
 
         // Fallback: ensure Aave pool has sufficient allowance for repayment.
@@ -118,18 +150,30 @@ contract AetherExecutor {
             IERC20(asset).forceApprove(aavePool, type(uint256).max);
         }
 
-        // Calculate and transfer profit
         uint256 balance = IERC20(asset).balanceOf(address(this));
         if (balance <= totalDebt) revert InsufficientProfit();
-        uint256 profit = balance - totalDebt;
+        profit = balance - totalDebt;
 
-        // Transfer profit to owner
-        IERC20(asset).safeTransfer(owner, profit);
+        // tipBps validated in executeArb (<=10000), so multiplication is safe
+        tipAmount = (profit * tipBps) / 10_000;
+        // Safe: tipAmount <= profit because tipBps <= 10000
+        uint256 ownerProfit;
+        unchecked { ownerProfit = profit - tipAmount; }
 
-        uint256 gasUsed = gasStart - gasleft();
-        emit ArbExecuted(asset, amount, profit, gasUsed);
-
-        return true;
+        if (tipAmount > 0) {
+            if (asset == WETH) {
+                // Unwrap WETH to native ETH so builders recognize the coinbase tip
+                IWETH(asset).withdraw(tipAmount);
+                (bool sent,) = block.coinbase.call{value: tipAmount}("");
+                if (!sent) revert CoinbaseTipFailed();
+            } else {
+                // Non-WETH fallback: ERC-20 transfer (builders won't prioritize)
+                IERC20(asset).safeTransfer(block.coinbase, tipAmount);
+            }
+        }
+        if (ownerProfit > 0) {
+            IERC20(asset).safeTransfer(owner, ownerProfit);
+        }
     }
 
     /// @notice Pre-approve spenders to save gas during arb execution

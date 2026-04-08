@@ -75,7 +75,7 @@ func TestProcessArbViaGRPC(t *testing.T) {
 	}
 
 	rm, bundler, submitter := newTestComponents()
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
+	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("processArb: %v", err)
@@ -112,7 +112,7 @@ func TestConsumeArbStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	consumeArbStream(ctx, client, bundler, submitter, rm, nil,
+	consumeArbStream(ctx, client, bundler, submitter, rm,
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	// Verify bundle tracking was updated
@@ -130,7 +130,7 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 
 	// Process first arb — should succeed
 	arb1 := testutil.ProfitableTriangleArb()
-	submitted, err := processArb(ctx, arb1, rm, bundler, submitter, nil,
+	submitted, err := processArb(ctx, arb1, rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb1: %v", err)
@@ -148,7 +148,7 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 
 	// Process second arb — should be rejected by risk manager
 	arb2 := testutil.Profitable2HopArb()
-	submitted, err = processArb(ctx, arb2, rm, bundler, submitter, nil,
+	submitted, err = processArb(ctx, arb2, rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb2: %v", err)
@@ -181,7 +181,7 @@ func TestMixedArbScenarios(t *testing.T) {
 			ctx := context.Background()
 
 			arb := tc.arb()
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, nil,
+			submitted, err := processArb(ctx, arb, rm, bundler, submitter,
 				"0x0000000000000000000000000000000000000000", tc.ethBalance)
 			if err != nil {
 				t.Fatalf("processArb: %v", err)
@@ -218,7 +218,7 @@ func TestGracefulShutdown(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		consumeArbStream(ctx, client, bundler, submitter, rm, nil,
+		consumeArbStream(ctx, client, bundler, submitter, rm,
 			"0x0000000000000000000000000000000000000000", 0.5)
 		close(done)
 	}()
@@ -260,11 +260,11 @@ func TestConfigToRiskManager(t *testing.T) {
 
 	// Should approve a normal arb
 	result := rm.PreflightCheck(
-		ethToWei(0.01),  // profit
-		ethToWei(5.0),   // trade size
-		30.0,            // gas gwei
-		90.0,            // tip share
-		0.5,             // ETH balance
+		ethToWei(0.01), // profit
+		ethToWei(5.0),  // trade size
+		30.0,           // gas gwei
+		90.0,           // tip share
+		0.5,            // ETH balance
 	)
 	if !result.Approved {
 		t.Errorf("normal arb rejected: %s", result.Reason)

@@ -19,7 +19,8 @@ sol! {
     function executeArb(
         SolSwapStep[] steps,
         address flashloanToken,
-        uint256 flashloanAmount
+        uint256 flashloanAmount,
+        uint256 tipBps
     );
 }
 
@@ -28,6 +29,7 @@ pub fn build_execute_arb_calldata(
     steps: &[SwapStep],
     flashloan_token: Address,
     flashloan_amount: U256,
+    tip_bps: U256,
 ) -> Vec<u8> {
     let sol_steps: Vec<SolSwapStep> = steps
         .iter()
@@ -46,12 +48,14 @@ pub fn build_execute_arb_calldata(
         steps: sol_steps,
         flashloanToken: flashloan_token,
         flashloanAmount: flashloan_amount,
+        tipBps: tip_bps,
     };
 
     debug!(
         num_steps = steps.len(),
         %flashloan_token,
         %flashloan_amount,
+        %tip_bps,
         "Built executeArb calldata"
     );
 
@@ -133,7 +137,12 @@ mod tests {
         let flashloan_token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let flashloan_amount = U256::from(1_000_000_000_000_000_000u128);
 
-        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount);
+        let calldata = build_execute_arb_calldata(
+            &steps,
+            flashloan_token,
+            flashloan_amount,
+            U256::from(9000u64),
+        );
 
         // Should have the function selector (4 bytes) + encoded data
         assert!(!calldata.is_empty());
@@ -171,7 +180,8 @@ mod tests {
         let flashloan_token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let flashloan_amount = U256::from(1_000_000_000_000_000_000u128);
 
-        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount);
+        let tip_bps = U256::from(9000u64);
+        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount, tip_bps);
 
         assert!(!calldata.is_empty());
         // Multi-step calldata should be larger than single-step
@@ -179,6 +189,7 @@ mod tests {
             &steps[..1],
             flashloan_token,
             flashloan_amount,
+            tip_bps,
         );
         assert!(calldata.len() > single_step_calldata.len());
     }
@@ -189,7 +200,7 @@ mod tests {
         let flashloan_token = Address::ZERO;
         let flashloan_amount = U256::ZERO;
 
-        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount);
+        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount, U256::ZERO);
 
         // Should still produce valid ABI-encoded calldata even with empty steps
         assert!(!calldata.is_empty());
@@ -291,12 +302,39 @@ mod tests {
             calldata: vec![0x01, 0x02],
         }];
 
+        let tip_bps = U256::from(9000u64);
         let calldata1 =
-            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000));
+            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), tip_bps);
         let calldata2 =
-            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000));
+            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), tip_bps);
 
         // Same inputs must produce identical calldata (deterministic)
         assert_eq!(calldata1, calldata2);
+    }
+
+    #[test]
+    fn test_build_execute_arb_calldata_tip_bps_encoding() {
+        let steps: Vec<SwapStep> = vec![];
+        let flashloan_token = Address::ZERO;
+        let flashloan_amount = U256::ZERO;
+
+        // Different tip_bps values should produce different calldata
+        let calldata_9000 = build_execute_arb_calldata(
+            &steps, flashloan_token, flashloan_amount, U256::from(9000u64),
+        );
+        let calldata_5000 = build_execute_arb_calldata(
+            &steps, flashloan_token, flashloan_amount, U256::from(5000u64),
+        );
+        let calldata_0 = build_execute_arb_calldata(
+            &steps, flashloan_token, flashloan_amount, U256::ZERO,
+        );
+
+        assert_ne!(calldata_9000, calldata_5000);
+        assert_ne!(calldata_9000, calldata_0);
+        assert_ne!(calldata_5000, calldata_0);
+
+        // All should have the same function selector
+        assert_eq!(&calldata_9000[0..4], &calldata_5000[0..4]);
+        assert_eq!(&calldata_9000[0..4], &calldata_0[0..4]);
     }
 }

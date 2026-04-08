@@ -333,7 +333,12 @@ async fn run_single_e2e_inner(
     )
     .ok_or("Route build failed")?;
 
-    let calldata = build_execute_arb_calldata(&final_steps, flashloan_token, optimal_input);
+    let calldata = build_execute_arb_calldata(
+        &final_steps,
+        flashloan_token,
+        optimal_input,
+        U256::from(9000u64),
+    );
 
     // Simulate
     let bn = provider.get_block_number().await.map_err(|e| format!("{e}"))?;
