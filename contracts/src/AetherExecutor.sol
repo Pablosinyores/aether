@@ -43,7 +43,9 @@ contract AetherExecutor {
     error InvalidInitiator();
     error FlashLoanFailed();
     error InsufficientProfit();
+    error InsufficientOutput(uint256 stepIndex, uint256 actual, uint256 expected);
     error ZeroAddress();
+    error ArrayLengthMismatch();
     error SwapFailed(uint256 stepIndex);
 
     modifier onlyOwner() {
@@ -107,8 +109,14 @@ contract AetherExecutor {
             unchecked { ++i; }
         }
 
-        // Repay flash loan (amount + premium); approvals must be pre-set via setApprovals()
+        // Repay flash loan (amount + premium)
         uint256 totalDebt = amount + premium;
+
+        // Fallback: ensure Aave pool has sufficient allowance for repayment.
+        // Pre-set via setApprovals() for gas savings; this covers new tokens.
+        if (IERC20(asset).allowance(address(this), aavePool) < totalDebt) {
+            IERC20(asset).forceApprove(aavePool, type(uint256).max);
+        }
 
         // Calculate and transfer profit
         uint256 balance = IERC20(asset).balanceOf(address(this));
@@ -130,8 +138,10 @@ contract AetherExecutor {
     /// @param tokens ERC20 token addresses to approve
     /// @param spenders Corresponding spender addresses (must be same length as tokens)
     function setApprovals(address[] calldata tokens, address[] calldata spenders) external onlyOwner {
+        if (tokens.length != spenders.length) revert ArrayLengthMismatch();
         uint256 len = tokens.length;
         for (uint256 i = 0; i < len;) {
+            if (spenders[i] == address(0)) revert ZeroAddress();
             IERC20(tokens[i]).forceApprove(spenders[i], type(uint256).max);
             // Safe: i < len, so i+1 cannot overflow
             unchecked { ++i; }
@@ -139,11 +149,12 @@ contract AetherExecutor {
     }
 
     /// @dev Execute a single swap step based on protocol.
-    ///      Final profit validation in executeOperation ensures no net loss;
-    ///      per-step balanceOf checks are omitted to save ~5.2K gas per hop.
+    ///      Per-step slippage protection via minAmountOut enforced after each swap.
     function _executeSwap(SwapStep memory step, uint256 index) internal {
         // Transfer tokens to pool (for protocols that require it)
         IERC20(step.tokenIn).safeTransfer(step.pool, step.amountIn);
+
+        uint256 balanceBefore = IERC20(step.tokenOut).balanceOf(address(this));
 
         // Hot-path first: UniV2 and UniV3 are by far the most common protocols
         if (step.protocol == UNISWAP_V2) {
@@ -160,6 +171,12 @@ contract AetherExecutor {
             _swapBancor(step, index);
         } else {
             revert SwapFailed(index);
+        }
+
+        // Per-step slippage protection: verify minimum output received
+        uint256 amountOut = IERC20(step.tokenOut).balanceOf(address(this)) - balanceBefore;
+        if (amountOut < step.minAmountOut) {
+            revert InsufficientOutput(index, amountOut, step.minAmountOut);
         }
     }
 

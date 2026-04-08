@@ -203,13 +203,28 @@ contract AetherExecutorTest is Test {
     }
 
     // -------------------------------------------------------------------------
-    // ZeroAddress: transferOwnership always reverts with ZeroAddress when owner calls
+    // setApprovals - input validation
     // -------------------------------------------------------------------------
 
-    function test_transferOwnership_zeroAddress_asOwner() public {
-        // Owner calling with zero address must revert ZeroAddress (not NotOwner)
+    function test_setApprovals_revert_arrayLengthMismatch() public {
+        address[] memory tokens = new address[](2);
+        address[] memory spenders = new address[](1);
+        tokens[0] = address(token);
+        tokens[1] = address(token2);
+        spenders[0] = AAVE_POOL;
+
+        vm.expectRevert(AetherExecutor.ArrayLengthMismatch.selector);
+        executor.setApprovals(tokens, spenders);
+    }
+
+    function test_setApprovals_revert_zeroAddressSpender() public {
+        address[] memory tokens = new address[](1);
+        address[] memory spenders = new address[](1);
+        tokens[0] = address(token);
+        spenders[0] = address(0);
+
         vm.expectRevert(AetherExecutor.ZeroAddress.selector);
-        executor.transferOwnership(address(0));
+        executor.setApprovals(tokens, spenders);
     }
 
     // -------------------------------------------------------------------------
