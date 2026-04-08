@@ -178,11 +178,15 @@ func main() {
 
 	startMetricsServer()
 
-	log.Printf("Executor service started, gRPC target: %s", cfg.GRPCAddress)
+	if strings.HasPrefix(cfg.GRPCAddress, "unix://") {
+		log.Printf("Executor service started, gRPC target: %s (UDS)", cfg.GRPCAddress)
+	} else {
+		log.Printf("Executor service started, gRPC target: %s (TCP)", cfg.GRPCAddress)
+	}
 	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
 
 	// Connect to Rust engine gRPC server.
-	// grpc.NewClient is lazy — the TCP connection is established on first RPC,
+	// grpc.NewClient is lazy — the connection is established on first RPC,
 	// so this call returns immediately even if the Rust server is not running.
 	grpcClient, err := aethergrpc.Dial(cfg.GRPCAddress)
 	if err != nil {

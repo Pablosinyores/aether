@@ -5,6 +5,11 @@ use tonic::transport::Server;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio_stream::wrappers::UnixListenerStream;
+
 mod engine;
 mod metrics;
 mod pipeline;
@@ -109,25 +114,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read the listen address from the environment so the systemd unit and
     // the binary always agree.  Default to localhost TCP for development.
+    //
+    // Production (UDS): GRPC_ADDRESS=unix:///var/run/aether/engine.sock
+    // Development (TCP): GRPC_ADDRESS=[::1]:50051  (default)
     let addr_str =
         std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
-    let addr = tokio::net::lookup_host(&addr_str)
-        .await?
-        .next()
-        .ok_or_else(|| format!("could not resolve GRPC_ADDRESS: {addr_str}"))?;
-    info!(%addr, "gRPC server listening");
 
-    // Run the gRPC server. When it exits (e.g. ctrl-c), signal engine shutdown.
-    let server_result = Server::builder()
+    let server = Server::builder()
         .add_service(ArbServiceServer::new(arb_service))
         .add_service(HealthServiceServer::new(health_service))
-        .add_service(ControlServiceServer::new(control_service))
-        .serve(addr)
-        .await
-        .map_err(|e| {
+        .add_service(ControlServiceServer::new(control_service));
+
+    let server_result = if let Some(uds_path) = addr_str.strip_prefix("unix://") {
+        // Unix Domain Socket transport for production.
+        #[cfg(unix)]
+        {
+            // Remove stale socket file if it exists from a previous run.
+            match std::fs::remove_file(uds_path) {
+                Ok(()) => info!(path = %uds_path, "Removed stale UDS socket"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(path = %uds_path, error = %e, "Failed to remove stale UDS socket"),
+            }
+
+            // Ensure parent directory exists.
+            if let Some(parent) = std::path::Path::new(uds_path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let uds = UnixListener::bind(uds_path)?;
+            info!(path = %uds_path, "gRPC server listening on UDS");
+            let stream = UnixListenerStream::new(uds);
+            server.serve_with_incoming(stream).await.map_err(|e| {
+                error!(error = %e, "gRPC server failed");
+                e
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(format!(
+                "UDS transport (unix://) is not supported on this platform: {addr_str}"
+            )
+            .into());
+        }
+    } else {
+        // TCP transport for development / non-UDS configs.
+        let addr = tokio::net::lookup_host(&addr_str)
+            .await?
+            .next()
+            .ok_or_else(|| format!("could not resolve GRPC_ADDRESS: {addr_str}"))?;
+        info!(%addr, "gRPC server listening on TCP");
+        server.serve(addr).await.map_err(|e| {
             error!(error = %e, "gRPC server failed");
             e
-        });
+        })
+    };
+
+    // Clean up UDS socket file on shutdown.
+    #[cfg(unix)]
+    if let Some(uds_path) = addr_str.strip_prefix("unix://") {
+        let _ = std::fs::remove_file(uds_path);
+    }
 
     // Signal the engine and provider to shut down.
     let _ = shutdown_tx.send(true);
