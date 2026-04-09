@@ -148,9 +148,10 @@ contract AetherExecutorForkTest is Test {
         mockAave = new ForkMockAavePool();
 
         // Deploy executor pointing at our mock Aave
-        // Balancer V2 Vault address on mainnet
+        // Balancer V2 Vault and Bancor V3 BancorNetwork addresses on mainnet
         address BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
-        executor = new AetherExecutor(address(mockAave), BALANCER_VAULT);
+        address BANCOR_NETWORK = 0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB;
+        executor = new AetherExecutor(address(mockAave), BALANCER_VAULT, BANCOR_NETWORK);
 
         // Deploy and fund the mock return pool with enough WETH to make the arb profitable
         returnPool = new MockReturnV2Pool(WETH);
