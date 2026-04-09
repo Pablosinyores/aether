@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -17,6 +18,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Naming convention:
+//   aether_executor_* — executor-process-specific counters (bundle ops, risk)
+//   aether_*          — system-level spec metrics shared across processes
+//                       (latency, gas price, PnL, ETH balance)
 var (
 	bundlesSubmitted = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aether_executor_bundles_submitted_total",
@@ -41,7 +46,7 @@ var (
 	endToEndLatencyMs = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "aether_end_to_end_latency_ms",
 		Help:    "End-to-end latency from arb detection to bundle submission in ms",
-		Buckets: []float64{10, 50, 100, 250, 500, 1000, 2000, 5000},
+		Buckets: []float64{10, 50, 75, 100, 250, 500, 1000, 2000, 5000},
 	})
 	gasPriceGwei = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "aether_gas_price_gwei",
@@ -139,12 +144,15 @@ func addGasSpent(gasGwei float64, gasUsed uint64) {
 
 // --- End-to-end latency ---
 
-func recordEndToEndLatency(detectedAtNs int64) {
-	if detectedAtNs <= 0 {
+// recordEndToEndLatency observes the time elapsed since receivedAt (the
+// Go-side wall clock stamped when the arb arrived from the gRPC stream).
+// Using a Go-side timestamp avoids cross-process clock skew that would
+// corrupt measurements against the p99 > 100ms alert threshold.
+func recordEndToEndLatency(receivedAt time.Time) {
+	if receivedAt.IsZero() {
 		return
 	}
-	detectedAt := time.Unix(0, detectedAtNs)
-	latencyMs := float64(time.Since(detectedAt).Nanoseconds()) / 1e6
+	latencyMs := float64(time.Since(receivedAt).Nanoseconds()) / 1e6
 	if latencyMs >= 0 {
 		endToEndLatencyMs.Observe(latencyMs)
 	}
@@ -177,7 +185,7 @@ func addPnl(profitWei *big.Int, gasCostWei float64) {
 	if profitWei != nil {
 		pnlWei.Add(pnlWei, profitWei)
 	}
-	if gasCostWei > 0 && gasCostWei == gasCostWei { // NaN != NaN
+	if gasCostWei > 0 && !math.IsNaN(gasCostWei) {
 		gasCost := new(big.Int).SetUint64(uint64(gasCostWei))
 		pnlWei.Sub(pnlWei, gasCost)
 	}
@@ -199,7 +207,9 @@ func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			bal, err := client.BalanceAt(ctx, addr, nil)
+			fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			bal, err := client.BalanceAt(fetchCtx, addr, nil)
+			cancel()
 			if err != nil {
 				log.Printf("WARNING: eth_getBalance failed: %v", err)
 				continue

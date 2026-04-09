@@ -75,7 +75,7 @@ func TestProcessArbViaGRPC(t *testing.T) {
 	}
 
 	rm, bundler, submitter := newTestComponents()
-	submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("processArb: %v", err)
@@ -130,7 +130,7 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 
 	// Process first arb — should succeed
 	arb1 := testutil.ProfitableTriangleArb()
-	submitted, err := processArb(ctx, arb1, rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb1, time.Now(), rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb1: %v", err)
@@ -148,7 +148,7 @@ func TestCircuitBreakerAcrossArbs(t *testing.T) {
 
 	// Process second arb — should be rejected by risk manager
 	arb2 := testutil.Profitable2HopArb()
-	submitted, err = processArb(ctx, arb2, rm, bundler, submitter,
+	submitted, err = processArb(ctx, arb2, time.Now(), rm, bundler, submitter,
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("arb2: %v", err)
@@ -181,7 +181,7 @@ func TestMixedArbScenarios(t *testing.T) {
 			ctx := context.Background()
 
 			arb := tc.arb()
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter,
+			submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
 				"0x0000000000000000000000000000000000000000", tc.ethBalance)
 			if err != nil {
 				t.Fatalf("processArb: %v", err)
