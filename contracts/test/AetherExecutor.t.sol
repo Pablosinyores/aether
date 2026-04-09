@@ -300,7 +300,8 @@ contract AetherExecutorTest is Test {
     function setUp() public {
         owner = address(this);
         aavePool = new MockAavePool();
-        executor = new AetherExecutor(address(aavePool), address(0xBA12));
+        // address(0xBA12) = placeholder balancerVault, address(0xBAAC) = placeholder bancorNetwork
+        executor = new AetherExecutor(address(aavePool), address(0xBA12), address(0xBAAC));
         token = new MockERC20();
         token2 = new MockERC20();
     }
@@ -375,7 +376,7 @@ contract AetherExecutorTest is Test {
     function test_executeArb_revert_flashLoanFailed() public {
         // Deploy an executor backed by a pool that always reverts
         RevertingAavePool badPool = new RevertingAavePool();
-        AetherExecutor executorWithBadPool = new AetherExecutor(address(badPool), address(0xBA12));
+        AetherExecutor executorWithBadPool = new AetherExecutor(address(badPool), address(0xBA12), address(0xBAAC));
 
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.expectRevert(AetherExecutor.FlashLoanFailed.selector);
@@ -468,7 +469,7 @@ contract AetherExecutorTest is Test {
         executor.executeArb(steps, address(token), 1000, 10001);
         // 10000 does NOT revert with TipBpsTooHigh (call proceeds past the check)
         // Use an EOA-backed executor so the flashLoan call succeeds silently
-        AetherExecutor eoaExecutor = new AetherExecutor(address(0xAA), address(0xBA12));
+        AetherExecutor eoaExecutor = new AetherExecutor(address(0xAA), address(0xBA12), address(0xBAAC));
         eoaExecutor.executeArb(steps, address(token), 1000, 10000);
     }
 
@@ -482,7 +483,7 @@ contract AetherExecutorTest is Test {
     function test_executeArb_inlineTip() public {
         // Deploy mock Aave pool and create executor bound to it
         MockAavePool mockPool = new MockAavePool();
-        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
 
         // Deploy two mock tokens (same token used for in/out to keep it simple)
         MockERC20 arbToken = new MockERC20();
@@ -546,7 +547,7 @@ contract AetherExecutorTest is Test {
 
     function test_executeArb_tipBpsZero_allProfitToOwner() public {
         MockAavePool mockPool = new MockAavePool();
-        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
         MockERC20 arbToken = new MockERC20();
 
         uint256 flashloanAmount = 100_000;
@@ -581,7 +582,7 @@ contract AetherExecutorTest is Test {
 
     function test_executeArb_tipBps10000_allProfitToCoinbase() public {
         MockAavePool mockPool = new MockAavePool();
-        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
         MockERC20 arbToken = new MockERC20();
 
         uint256 flashloanAmount = 100_000;
@@ -667,7 +668,7 @@ contract AetherExecutorTest is Test {
     function test_executeArb_nonWeth_sendsErc20Tip() public {
         // Verify that non-WETH assets still use ERC-20 transfer (no native ETH sent)
         MockAavePool mockPool = new MockAavePool();
-        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        AetherExecutor tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
         MockERC20 arbToken = new MockERC20();
 
         uint256 flashloanAmount = 100_000;
@@ -710,7 +711,7 @@ contract AetherExecutorTest is Test {
         returns (AetherExecutor tipExecutor, MockERC20 arbToken)
     {
         MockAavePool mockPool = new MockAavePool();
-        tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        tipExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
         arbToken = new MockERC20();
         // Swap pool output = totalDebt + targetProfit
         uint256 swapOut = 100_000 + (100_000 * 5) / 10000 + targetProfit;
@@ -754,7 +755,7 @@ contract AetherExecutorTest is Test {
         returns (AetherExecutor wethExecutor, AetherExecutor.SwapStep[] memory steps)
     {
         MockAavePool mockPool = new MockAavePool();
-        wethExecutor = new AetherExecutor(address(mockPool), address(0xBA12));
+        wethExecutor = new AetherExecutor(address(mockPool), address(0xBA12), address(0xBAAC));
 
         uint256 swapOut = 100_000 + (100_000 * 5) / 10000 + targetProfit;
         MockSwapPool swapPool = new MockSwapPool(wethAddr, swapOut);
@@ -1091,7 +1092,7 @@ contract AetherExecutorTest is Test {
         // Create Balancer Vault and deploy executor pointing at it
         MockBalancerVault vault = new MockBalancerVault(tokenIn, tokenOut, swapOut);
         tokenOut.mint(address(vault), swapOut);
-        AetherExecutor balExecutor = new AetherExecutor(address(aavePool), address(vault));
+        AetherExecutor balExecutor = new AetherExecutor(address(aavePool), address(vault), address(0xBAAC));
 
         // Return pool
         uint256 returnAmount = flashAmount + premium + 10;
@@ -1156,9 +1157,13 @@ contract AetherExecutorTest is Test {
         uint256 swapOut = 1100;
         uint256 premium = flashAmount * 5 / 10000;
 
-        // Create Bancor router
-        MockBancorRouter bancor = new MockBancorRouter(tokenIn, tokenOut, swapOut);
-        tokenOut.mint(address(bancor), swapOut);
+        // Deploy MockBancorRouter as the bancorNetwork — all Bancor trades route through
+        // this single contract address, NOT through individual pool contracts.
+        MockBancorRouter bancorNet = new MockBancorRouter(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(bancorNet), swapOut);
+
+        // Deploy executor with bancorNetwork pointing at the mock router
+        AetherExecutor bancorExecutor = new AetherExecutor(address(aavePool), address(0xBA12), address(bancorNet));
 
         // Return pool
         uint256 returnAmount = flashAmount + premium + 10;
@@ -1172,20 +1177,20 @@ contract AetherExecutorTest is Test {
             flashAmount,
             swapOut,
             uint256(block.timestamp + 3600),
-            address(executor)
+            address(bancorExecutor)
         );
         bytes memory returnData = abi.encodeWithSignature(
             "swap(uint256,uint256,address,bytes)",
             uint256(0),
             returnAmount,
-            address(executor),
+            address(bancorExecutor),
             ""
         );
 
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
         steps[0] = AetherExecutor.SwapStep({
             protocol: BANCOR_V3,
-            pool: address(bancor),
+            pool: address(bancorNet), // individual pool address (unused by _swapBancor — only data matters)
             tokenIn: address(tokenIn),
             tokenOut: address(tokenOut),
             amountIn: flashAmount,
@@ -1202,12 +1207,12 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        bancorExecutor.executeArb(steps, address(tokenIn), flashAmount, 0);
 
-        // Bancor pulled tokens via transferFrom
-        assertEq(tokenIn.balanceOf(address(bancor)), flashAmount);
-        // Approval reset to 0
-        assertEq(tokenIn.allowance(address(executor), address(bancor)), 0);
+        // BancorNetwork (not individual pool) pulled tokens via transferFrom
+        assertEq(tokenIn.balanceOf(address(bancorNet)), flashAmount);
+        // Approval to bancorNetwork reset to 0 after swap
+        assertEq(tokenIn.allowance(address(bancorExecutor), address(bancorNet)), 0);
         // Owner received profit
         assertGt(tokenIn.balanceOf(owner), 0);
     }

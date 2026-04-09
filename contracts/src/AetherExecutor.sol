@@ -18,6 +18,7 @@ contract AetherExecutor is ReentrancyGuard {
     address public owner;
     address public immutable aavePool;
     address public immutable balancerVault;
+    address public immutable bancorNetwork;
 
     /// @dev Canonical WETH address on Ethereum mainnet
     address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
@@ -71,12 +72,14 @@ contract AetherExecutor is ReentrancyGuard {
     address private _pendingV3TokenIn;
     uint256 private _pendingV3AmountIn;
 
-    constructor(address _aavePool, address _balancerVault) {
+    constructor(address _aavePool, address _balancerVault, address _bancorNetwork) {
         require(_aavePool != address(0), "Zero aavePool");
         require(_balancerVault != address(0), "Zero balancerVault");
+        require(_bancorNetwork != address(0), "Zero bancorNetwork");
         owner = msg.sender;
         aavePool = _aavePool;
         balancerVault = _balancerVault;
+        bancorNetwork = _bancorNetwork;
     }
 
     /// @notice Entry point - initiates flash loan and arb execution
@@ -300,12 +303,14 @@ contract AetherExecutor is ReentrancyGuard {
         IERC20(step.tokenIn).forceApprove(balancerVault, 0);
     }
 
-    /// @dev Bancor: approve router to pull tokens, call trade, reset approval
+    /// @dev Bancor V3: approve the BancorNetwork contract (not the individual pool) to pull tokens
+    /// @dev Individual Bancor pool contracts do not implement tradeBySourceAmount — all trades
+    ///      must go through the single BancorNetwork router at the immutable bancorNetwork address.
     function _swapBancor(SwapStep memory step, uint256 index) internal {
-        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
-        (bool success,) = step.pool.call(step.data);
+        IERC20(step.tokenIn).forceApprove(bancorNetwork, step.amountIn);
+        (bool success,) = bancorNetwork.call(step.data);
         if (!success) revert SwapFailed(index);
-        IERC20(step.tokenIn).forceApprove(step.pool, 0);
+        IERC20(step.tokenIn).forceApprove(bancorNetwork, 0);
     }
 
     /// @notice Emergency token rescue - owner only
