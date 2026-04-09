@@ -322,8 +322,6 @@ impl EvmSimulator {
 mod tests {
     use super::*;
     use alloy::primitives::address;
-    use revm::bytecode::Bytecode;
-    use revm::primitives::Bytes;
 
     /// Helper: create a basic ForkedState with a funded caller
     fn setup_state_with_caller(caller: Address) -> ForkedState {
