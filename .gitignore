@@ -22,3 +22,7 @@ contracts/cache/
 # Build artifacts (top-level)
 cache/
 out/
+
+/build/bin
+
+/contracts/broadcast
