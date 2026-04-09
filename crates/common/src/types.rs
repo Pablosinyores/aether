@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn test_protocol_type_base_gas() {
         assert_eq!(ProtocolType::UniswapV2.base_gas(), 60_000);
-        assert_eq!(ProtocolType::UniswapV3.base_gas(), 200_000);
+        assert_eq!(ProtocolType::UniswapV3.base_gas(), 180_000);
         assert_eq!(ProtocolType::SushiSwap.base_gas(), 60_000);
         assert_eq!(ProtocolType::Curve.base_gas(), 130_000);
         assert_eq!(ProtocolType::BalancerV2.base_gas(), 120_000);
