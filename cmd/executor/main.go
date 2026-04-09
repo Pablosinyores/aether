@@ -233,9 +233,12 @@ func main() {
 
 // processArb handles a single validated arb through the full pipeline:
 // parse -> preflight -> bundle -> submit -> record result.
+// receivedAt is the Go-side wall clock when the arb arrived from the gRPC
+// stream — used for end-to-end latency to avoid cross-process clock skew.
 func processArb(
 	ctx context.Context,
 	arb *pb.ValidatedArb,
+	receivedAt time.Time,
 	rm *risk.RiskManager,
 	bundler *BundleConstructor,
 	submitter *Submitter,
@@ -262,7 +265,7 @@ func processArb(
 	}
 
 	// Submit to all builders
-	recordEndToEndLatency(arb.GetTimestampNs())
+	recordEndToEndLatency(receivedAt)
 	recordBundleSubmitted()
 	results := submitter.SubmitToAll(ctx, bundle)
 	recordSubmissionReverts(rm, results)
@@ -360,11 +363,12 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 				log.Printf("Arb stream recv error: %v, reconnecting...", err)
 				break
 			}
+			receivedAt := time.Now() // Go-side clock avoids cross-process skew
 
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, rm, bundler, submitter, executorAddr, ethBalance)
+			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, ethBalance)
 			if err != nil {
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
 			}

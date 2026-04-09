@@ -121,9 +121,9 @@ func TestDailyPnl(t *testing.T) {
 
 func TestEndToEndLatency(t *testing.T) {
 	// Record a latency from 100ms ago — just verify no panic
-	detectedAt := time.Now().Add(-100 * time.Millisecond).UnixNano()
-	recordEndToEndLatency(detectedAt)
+	receivedAt := time.Now().Add(-100 * time.Millisecond)
+	recordEndToEndLatency(receivedAt)
 
-	// Zero timestamp should be a no-op
-	recordEndToEndLatency(0)
+	// Zero time should be a no-op
+	recordEndToEndLatency(time.Time{})
 }
