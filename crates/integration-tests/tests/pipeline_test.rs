@@ -180,7 +180,13 @@ fn test_gas_estimation_multi_hop() {
     ];
     let tick_counts = vec![0, 5, 0];
     let total = gas::estimate_total_gas(&protocols, &tick_counts);
-    let expected = 21_000 + 80_000 + 30_000 + 60_000 + (180_000 + 5 * 5_000) + 130_000;
+    use aether_common::types::gas as gas_consts;
+    let expected = gas_consts::TX_BASE_GAS
+        + gas_consts::FLASHLOAN_BASE_GAS
+        + gas_consts::EXECUTOR_OVERHEAD_GAS
+        + ProtocolType::UniswapV2.base_gas()
+        + (ProtocolType::UniswapV3.base_gas() + 5 * gas_consts::UNIV3_PER_TICK_GAS)
+        + ProtocolType::Curve.base_gas();
     assert_eq!(total, expected);
 }
 
