@@ -406,10 +406,13 @@ async fn run_flash_loan_test(anvil_url: &str) -> Result<(), String> {
         },
     ];
 
+    let deadline = U256::from(u64::MAX);
     let execute_arb_calldata = build_execute_arb_calldata(
         &steps,
         WETH,
         flashloan_amount,
+        deadline,
+        U256::ZERO,
         U256::from(9000u64),
     );
 

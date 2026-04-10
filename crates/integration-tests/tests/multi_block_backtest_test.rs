@@ -333,10 +333,13 @@ async fn run_single_e2e_inner(
     )
     .ok_or("Route build failed")?;
 
+    let deadline = U256::from(u64::MAX);
     let calldata = build_execute_arb_calldata(
         &final_steps,
         flashloan_token,
         optimal_input,
+        deadline,
+        U256::ZERO,
         U256::from(9000u64),
     );
 

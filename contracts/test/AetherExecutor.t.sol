@@ -366,7 +366,7 @@ contract AetherExecutorTest is Test {
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.prank(address(0x456));
         vm.expectRevert(AetherExecutor.NotOwner.selector);
-        executor.executeArb(steps, address(token), 1000, 9000);
+        executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 9000);
     }
 
     // -------------------------------------------------------------------------
@@ -380,7 +380,7 @@ contract AetherExecutorTest is Test {
 
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.expectRevert(AetherExecutor.FlashLoanFailed.selector);
-        executorWithBadPool.executeArb(steps, address(token), 1000, 9000);
+        executorWithBadPool.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 9000);
     }
 
     // -------------------------------------------------------------------------
@@ -457,7 +457,7 @@ contract AetherExecutorTest is Test {
     function test_tipBps_tooHigh() public {
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.expectRevert(AetherExecutor.TipBpsTooHigh.selector);
-        executor.executeArb(steps, address(token), 1000, 10001);
+        executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 10001);
     }
 
     function test_tipBps_boundary_10000_accepted() public {
@@ -466,18 +466,18 @@ contract AetherExecutorTest is Test {
         // Here we just confirm 10001 reverts and 10000 does not trigger TipBpsTooHigh
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.expectRevert(AetherExecutor.TipBpsTooHigh.selector);
-        executor.executeArb(steps, address(token), 1000, 10001);
+        executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 10001);
         // 10000 does NOT revert with TipBpsTooHigh (call proceeds past the check)
         // Use an EOA-backed executor so the flashLoan call succeeds silently
         AetherExecutor eoaExecutor = new AetherExecutor(address(0xAA), address(0xBA12), address(0xBAAC));
-        eoaExecutor.executeArb(steps, address(token), 1000, 10000);
+        eoaExecutor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 10000);
     }
 
     function testFuzz_tipBps_tooHigh(uint256 tipBps) public {
         vm.assume(tipBps > 10000);
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.expectRevert(AetherExecutor.TipBpsTooHigh.selector);
-        executor.executeArb(steps, address(token), 1000, tipBps);
+        executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, tipBps);
     }
 
     function test_executeArb_inlineTip() public {
@@ -535,7 +535,7 @@ contract AetherExecutorTest is Test {
         );
 
         // Execute
-        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, tipBps);
+        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, block.timestamp + 1000, 0, tipBps);
 
         // Verify tip went to coinbase
         assertEq(arbToken.balanceOf(coinbase), expectedTip, "coinbase tip incorrect");
@@ -573,7 +573,7 @@ contract AetherExecutorTest is Test {
         vm.coinbase(coinbase);
 
         // tipBps = 0: all profit goes to owner
-        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, 0);
+        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, block.timestamp + 1000, 0, 0);
 
         assertEq(arbToken.balanceOf(coinbase), 0, "coinbase should get nothing");
         assertEq(arbToken.balanceOf(address(this)), targetProfit, "owner should get all profit");
@@ -608,7 +608,7 @@ contract AetherExecutorTest is Test {
         vm.coinbase(coinbase);
 
         // tipBps = 10000: all profit goes to coinbase
-        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, 10000);
+        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, block.timestamp + 1000, 0, 10000);
 
         assertEq(arbToken.balanceOf(coinbase), targetProfit, "coinbase should get all profit");
         assertEq(arbToken.balanceOf(address(this)), 0, "owner should get nothing");
@@ -623,7 +623,7 @@ contract AetherExecutorTest is Test {
         address coinbase = address(0xC01B);
         vm.coinbase(coinbase);
 
-        tipExecutor.executeArb(_buildSingleStep(arbToken, 10_000), address(arbToken), 100_000, tipBps);
+        tipExecutor.executeArb(_buildSingleStep(arbToken, 10_000), address(arbToken), 100_000, block.timestamp + 1000, 0, tipBps);
 
         uint256 expectedTip = (10_000 * tipBps) / 10000;
         assertEq(arbToken.balanceOf(coinbase), expectedTip, "coinbase tip incorrect");
@@ -654,7 +654,7 @@ contract AetherExecutorTest is Test {
         vm.deal(WETH_ADDR, 10_000);
 
         // tipBps=9000 -> tip=900, ownerProfit=100
-        wethExecutor.executeArb(steps, WETH_ADDR, 100_000, 9000);
+        wethExecutor.executeArb(steps, WETH_ADDR, 100_000, block.timestamp + 1000, 0, 9000);
 
         // Coinbase received native ETH, not WETH tokens
         assertEq(coinbase.balance, 900, "coinbase should receive native ETH tip");
@@ -696,7 +696,7 @@ contract AetherExecutorTest is Test {
         uint256 tipBps = 9000;
         uint256 expectedTip = (targetProfit * tipBps) / 10000;
 
-        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, tipBps);
+        tipExecutor.executeArb(steps, address(arbToken), flashloanAmount, block.timestamp + 1000, 0, tipBps);
 
         // Coinbase received ERC-20, not native ETH
         assertEq(arbToken.balanceOf(coinbase), expectedTip, "coinbase should receive ERC-20 tip");
@@ -876,7 +876,7 @@ contract AetherExecutorTest is Test {
 
         // Verify: pool should receive tokens via transfer (not transferFrom)
         // Before the swap, pool has 0 tokenIn; after, it has flashAmount
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // Check pool received tokenIn via direct transfer
         assertEq(tokenIn.balanceOf(address(pool)), flashAmount);
@@ -943,7 +943,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // V3 pool received tokens via callback (not pre-transfer)
         assertEq(tokenIn.balanceOf(address(v3Pool)), flashAmount);
@@ -1004,7 +1004,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // Malicious pool only received flashAmount (not 2x) despite calling back twice
         assertEq(tokenIn.balanceOf(address(malPool)), flashAmount, "double-call should not drain extra tokens");
@@ -1067,7 +1067,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // Curve pool pulled tokens via transferFrom (approve+pull pattern)
         assertEq(tokenIn.balanceOf(address(curvePool)), flashAmount);
@@ -1135,7 +1135,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        balExecutor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        balExecutor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // Vault pulled tokens via transferFrom (now through balancerVault immutable)
         assertEq(tokenIn.balanceOf(address(vault)), flashAmount);
@@ -1207,7 +1207,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        bancorExecutor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        bancorExecutor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // BancorNetwork (not individual pool) pulled tokens via transferFrom
         assertEq(tokenIn.balanceOf(address(bancorNet)), flashAmount);
@@ -1265,7 +1265,7 @@ contract AetherExecutorTest is Test {
             data: returnData
         });
 
-        executor.executeArb(steps, address(tokenIn), flashAmount, 0);
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
 
         // Pool received tokens via direct transfer (same as UniV2)
         assertEq(tokenIn.balanceOf(address(pool)), flashAmount);

@@ -243,7 +243,7 @@ contract AetherExecutorForkTest is Test {
         // executeArb → mockAave.flashLoanSimple → executeOperation → _executeSwap ×2
         // The critical path under test: step[0] calls the real UniV3 pool which
         // calls back uniswapV3SwapCallback with real deltas.
-        executor.executeArb(steps, WETH, FLASH_AMOUNT, 0);
+        executor.executeArb(steps, WETH, FLASH_AMOUNT, block.timestamp + 1000, 0, 0);
 
         // ── Assertions ───────────────────────────────────────────────────────
 

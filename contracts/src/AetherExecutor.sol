@@ -54,7 +54,8 @@ contract AetherExecutor is ReentrancyGuard {
     error InvalidInitiator();
     error FlashLoanFailed();
     error NotPendingV3Pool();
-    error InsufficientProfit();
+    error DeadlineExpired();
+    error InsufficientProfit(uint256 actual, uint256 required);
     error InsufficientOutput(uint256 stepIndex, uint256 actual, uint256 expected);
     error ZeroAddress();
     error ArrayLengthMismatch();
@@ -86,19 +87,24 @@ contract AetherExecutor is ReentrancyGuard {
     /// @param steps Array of swap steps to execute
     /// @param flashloanToken Token to borrow
     /// @param flashloanAmount Amount to borrow
+    /// @param deadline Unix timestamp after which the transaction reverts
+    /// @param minProfitOut Minimum profit required after flash loan repayment (slippage backstop)
     /// @param tipBps Tip to block.coinbase in basis points (e.g. 9000 = 90%)
     function executeArb(
         SwapStep[] calldata steps,
         address flashloanToken,
         uint256 flashloanAmount,
+        uint256 deadline,
+        uint256 minProfitOut,
         uint256 tipBps
-    ) external onlyOwner {
+    ) external onlyOwner nonReentrant {
+        if (block.timestamp > deadline) revert DeadlineExpired();
         if (tipBps > 10_000) revert TipBpsTooHigh();
 
         uint256 gasStart = gasleft();
 
-        // Encode steps, gas snapshot, and tip config for callback
-        bytes memory params = abi.encode(steps, gasStart, tipBps);
+        // Encode steps, gas snapshot, tip config, and profit floor for callback
+        bytes memory params = abi.encode(steps, gasStart, tipBps, minProfitOut);
 
         // Initiate flash loan - Aave V3 IPool.flashLoanSimple
         // function flashLoanSimple(address receiverAddress, address asset, uint256 amount, bytes calldata params, uint16 referralCode)
@@ -116,19 +122,28 @@ contract AetherExecutor is ReentrancyGuard {
     }
 
     /// @notice Aave V3 flash loan callback
-    /// @dev Called by Aave pool after sending the borrowed funds
+    /// @dev Called by Aave pool after sending the borrowed funds.
+    ///      nonReentrant is intentionally NOT applied here — this function is
+    ///      called by Aave within the same tx initiated by executeArb(), and
+    ///      the reentrancy guard on executeArb() would deadlock if applied here.
+    /// @param asset The borrowed token address
+    /// @param amount The borrowed amount
+    /// @param premium The flash loan fee
+    /// @param initiator The address that initiated the flash loan (must be this contract)
+    /// @param params Encoded swap steps, gas tracking, tip config, and profit floor
+    /// @return True on success
     function executeOperation(
         address asset,
         uint256 amount,
         uint256 premium,
         address initiator,
         bytes calldata params
-    ) external nonReentrant returns (bool) {
+    ) external returns (bool) {
         if (msg.sender != aavePool) revert NotAavePool();
         if (initiator != address(this)) revert InvalidInitiator();
 
-        (SwapStep[] memory steps, uint256 gasStart, uint256 tipBps) =
-            abi.decode(params, (SwapStep[], uint256, uint256));
+        (SwapStep[] memory steps, uint256 gasStart, uint256 tipBps, uint256 minProfitOut) =
+            abi.decode(params, (SwapStep[], uint256, uint256, uint256));
 
         // Execute all swap steps
         uint256 len = steps.length;
@@ -139,7 +154,7 @@ contract AetherExecutor is ReentrancyGuard {
         }
 
         // Repay flash loan and distribute profit
-        (uint256 profit, uint256 tipAmount) = _repayAndDistribute(asset, amount, premium, tipBps);
+        (uint256 profit, uint256 tipAmount) = _repayAndDistribute(asset, amount, premium, tipBps, minProfitOut);
 
         uint256 gasUsed = gasStart - gasleft();
         emit ArbExecuted(asset, amount, profit, tipAmount, gasUsed);
@@ -147,14 +162,15 @@ contract AetherExecutor is ReentrancyGuard {
         return true;
     }
 
-    /// @dev Repay flash loan, split profit between coinbase tip and owner
+    /// @dev Repay flash loan, enforce profit floor, split profit between coinbase tip and owner
     /// @return profit Total profit before tip/owner split
     /// @return tipAmount Amount sent to block.coinbase
     function _repayAndDistribute(
         address asset,
         uint256 amount,
         uint256 premium,
-        uint256 tipBps
+        uint256 tipBps,
+        uint256 minProfitOut
     ) internal returns (uint256 profit, uint256 tipAmount) {
         uint256 totalDebt = amount + premium;
 
@@ -165,8 +181,11 @@ contract AetherExecutor is ReentrancyGuard {
         }
 
         uint256 balance = IERC20(asset).balanceOf(address(this));
-        if (balance <= totalDebt) revert InsufficientProfit();
+        if (balance <= totalDebt) revert InsufficientProfit(0, minProfitOut);
         profit = balance - totalDebt;
+
+        // Enforce minimum profit floor
+        if (profit < minProfitOut) revert InsufficientProfit(profit, minProfitOut);
 
         // tipBps validated in executeArb (<=10000), so multiplication is safe
         tipAmount = (profit * tipBps) / 10_000;
@@ -191,7 +210,7 @@ contract AetherExecutor is ReentrancyGuard {
     }
 
     /// @notice Pre-approve spenders to save gas during arb execution
-    /// @dev Call once per token/spender pair (e.g., flashloan token → Aave pool).
+    /// @dev Call once per token/spender pair (e.g., flashloan token -> Aave pool).
     ///      Uses max approval so executeOperation never needs to re-approve.
     /// @param tokens ERC20 token addresses to approve
     /// @param spenders Corresponding spender addresses (must be same length as tokens)
@@ -327,6 +346,6 @@ contract AetherExecutor is ReentrancyGuard {
         owner = newOwner;
     }
 
-    /// @notice Accept ETH
+    /// @notice Accept ETH (needed for WETH unwrap during coinbase tip)
     receive() external payable {}
 }

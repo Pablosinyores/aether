@@ -20,6 +20,8 @@ sol! {
         SolSwapStep[] steps,
         address flashloanToken,
         uint256 flashloanAmount,
+        uint256 deadline,
+        uint256 minProfitOut,
         uint256 tipBps
     );
 }
@@ -29,6 +31,8 @@ pub fn build_execute_arb_calldata(
     steps: &[SwapStep],
     flashloan_token: Address,
     flashloan_amount: U256,
+    deadline: U256,
+    min_profit_out: U256,
     tip_bps: U256,
 ) -> Vec<u8> {
     let sol_steps: Vec<SolSwapStep> = steps
@@ -48,6 +52,8 @@ pub fn build_execute_arb_calldata(
         steps: sol_steps,
         flashloanToken: flashloan_token,
         flashloanAmount: flashloan_amount,
+        deadline,
+        minProfitOut: min_profit_out,
         tipBps: tip_bps,
     };
 
@@ -55,6 +61,7 @@ pub fn build_execute_arb_calldata(
         num_steps = steps.len(),
         %flashloan_token,
         %flashloan_amount,
+        %deadline,
         %tip_bps,
         "Built executeArb calldata"
     );
@@ -137,10 +144,13 @@ mod tests {
         let flashloan_token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let flashloan_amount = U256::from(1_000_000_000_000_000_000u128);
 
+        let deadline = U256::from(1_700_000_000u64 + 120);
         let calldata = build_execute_arb_calldata(
             &steps,
             flashloan_token,
             flashloan_amount,
+            deadline,
+            U256::ZERO,
             U256::from(9000u64),
         );
 
@@ -180,8 +190,16 @@ mod tests {
         let flashloan_token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let flashloan_amount = U256::from(1_000_000_000_000_000_000u128);
 
+        let deadline = U256::from(1_700_000_000u64 + 120);
         let tip_bps = U256::from(9000u64);
-        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount, tip_bps);
+        let calldata = build_execute_arb_calldata(
+            &steps,
+            flashloan_token,
+            flashloan_amount,
+            deadline,
+            U256::ZERO,
+            tip_bps,
+        );
 
         assert!(!calldata.is_empty());
         // Multi-step calldata should be larger than single-step
@@ -189,6 +207,8 @@ mod tests {
             &steps[..1],
             flashloan_token,
             flashloan_amount,
+            deadline,
+            U256::ZERO,
             tip_bps,
         );
         assert!(calldata.len() > single_step_calldata.len());
@@ -200,7 +220,15 @@ mod tests {
         let flashloan_token = Address::ZERO;
         let flashloan_amount = U256::ZERO;
 
-        let calldata = build_execute_arb_calldata(&steps, flashloan_token, flashloan_amount, U256::ZERO);
+        let deadline = U256::from(1_700_000_000u64 + 120);
+        let calldata = build_execute_arb_calldata(
+            &steps,
+            flashloan_token,
+            flashloan_amount,
+            deadline,
+            U256::ZERO,
+            U256::ZERO,
+        );
 
         // Should still produce valid ABI-encoded calldata even with empty steps
         assert!(!calldata.is_empty());
@@ -302,11 +330,12 @@ mod tests {
             calldata: vec![0x01, 0x02],
         }];
 
+        let deadline = U256::from(1_700_000_000u64 + 120);
         let tip_bps = U256::from(9000u64);
         let calldata1 =
-            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), tip_bps);
+            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), deadline, U256::ZERO, tip_bps);
         let calldata2 =
-            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), tip_bps);
+            build_execute_arb_calldata(&steps, Address::ZERO, U256::from(1000), deadline, U256::ZERO, tip_bps);
 
         // Same inputs must produce identical calldata (deterministic)
         assert_eq!(calldata1, calldata2);
@@ -317,16 +346,17 @@ mod tests {
         let steps: Vec<SwapStep> = vec![];
         let flashloan_token = Address::ZERO;
         let flashloan_amount = U256::ZERO;
+        let deadline = U256::from(u64::MAX);
 
         // Different tip_bps values should produce different calldata
         let calldata_9000 = build_execute_arb_calldata(
-            &steps, flashloan_token, flashloan_amount, U256::from(9000u64),
+            &steps, flashloan_token, flashloan_amount, deadline, U256::ZERO, U256::from(9000u64),
         );
         let calldata_5000 = build_execute_arb_calldata(
-            &steps, flashloan_token, flashloan_amount, U256::from(5000u64),
+            &steps, flashloan_token, flashloan_amount, deadline, U256::ZERO, U256::from(5000u64),
         );
         let calldata_0 = build_execute_arb_calldata(
-            &steps, flashloan_token, flashloan_amount, U256::ZERO,
+            &steps, flashloan_token, flashloan_amount, deadline, U256::ZERO, U256::ZERO,
         );
 
         assert_ne!(calldata_9000, calldata_5000);
