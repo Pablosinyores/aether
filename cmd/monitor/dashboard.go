@@ -56,8 +56,10 @@ h1{color:#58a6ff;margin-bottom:4px;font-size:22px}
 
 <div class="section">Latency</div>
 <div class="grid">
-  <div class="card"><div class="label">E2E Latency (avg ms)</div><div class="value">{{.E2ELatency}}</div></div>
-  <div class="card"><div class="label">Sim Latency (avg ms)</div><div class="value">{{.SimLatency}}</div></div>
+  <div class="card"><div class="label">Detection (avg ms)</div><div class="value">{{.DetectLatency}}</div></div>
+  <div class="card"><div class="label">Simulation (avg ms)</div><div class="value">{{.SimLatency}}</div></div>
+  <div class="card"><div class="label">Executor (avg ms)</div><div class="value">{{.E2ELatency}}</div></div>
+  <div class="card"><div class="label">Total Pipeline (avg ms)</div><div class="value green">{{.TotalLatency}}</div></div>
 </div>
 </body></html>`
 
@@ -145,6 +147,29 @@ func parseOrZero(s string) float64 {
 	return f
 }
 
+// histogramAvg computes the average from a Prometheus histogram's _sum and _count.
+// Returns -1 if the metric is missing or has zero count.
+func histogramAvg(m map[string]string, name string) float64 {
+	cnt := m[name+"_count"]
+	if cnt == "" || cnt == "0" {
+		return -1
+	}
+	sum, e1 := strconv.ParseFloat(m[name+"_sum"], 64)
+	count, e2 := strconv.ParseFloat(cnt, 64)
+	if e1 != nil || e2 != nil || count <= 0 {
+		return -1
+	}
+	return sum / count
+}
+
+// fmtAvg formats a histogram average as a string, or returns "—" if negative (missing).
+func fmtAvg(v float64) string {
+	if v < 0 {
+		return "\u2014"
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
 // ServeDashboard starts the dashboard HTTP server.
 func (d *Dashboard) ServeDashboard(addr string) error {
 	mux := http.NewServeMux()
@@ -159,38 +184,33 @@ func (d *Dashboard) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	m := d.scrapeAll()
 
 	// Compute averages from histogram sum/count
-	e2eLatency := "\u2014"
-	if cnt := m["aether_end_to_end_latency_ms_count"]; cnt != "" && cnt != "0" {
-		sum, e1 := strconv.ParseFloat(m["aether_end_to_end_latency_ms_sum"], 64)
-		count, e2 := strconv.ParseFloat(cnt, 64)
-		if e1 == nil && e2 == nil && count > 0 {
-			e2eLatency = fmt.Sprintf("%.2f", sum/count)
-		}
-	}
-	simLatency := "\u2014"
-	if cnt := m["aether_simulation_latency_ms_count"]; cnt != "" && cnt != "0" {
-		sum, e1 := strconv.ParseFloat(m["aether_simulation_latency_ms_sum"], 64)
-		count, e2 := strconv.ParseFloat(cnt, 64)
-		if e1 == nil && e2 == nil && count > 0 {
-			simLatency = fmt.Sprintf("%.2f", sum/count)
-		}
+	detectAvg := histogramAvg(m, "aether_detection_latency_ms")
+	simAvg := histogramAvg(m, "aether_simulation_latency_ms")
+	e2eAvg := histogramAvg(m, "aether_end_to_end_latency_ms")
+
+	// Total pipeline = detection + simulation + executor processing
+	totalLatency := "\u2014"
+	if detectAvg >= 0 && simAvg >= 0 && e2eAvg >= 0 {
+		totalLatency = fmt.Sprintf("%.2f", detectAvg+simAvg+e2eAvg)
 	}
 
 	data := map[string]string{
-		"RustPort":   d.rustPort,
-		"GoPort":     d.goPort,
-		"Blocks":     fmtFloat(m["aether_blocks_processed_total"]),
-		"Cycles":     fmtFloat(m["aether_cycles_detected_total"]),
-		"Sims":       fmtFloat(m["aether_simulations_run_total"]),
-		"Arbs":       fmtFloat(m["aether_arbs_published_total"]),
-		"BundlesSub": fmtFloat(m["aether_executor_bundles_submitted_total"]),
-		"BundlesInc": fmtFloat(m["aether_executor_bundles_included_total"]),
-		"Rejected":   fmtFloat(m["aether_executor_risk_rejections_total"]),
-		"DailyPnL":   fmtFloat(m["aether_daily_pnl_eth"]),
-		"GasPrice":   fmtFloat(m["aether_gas_price_gwei"]),
-		"EthBalance": fmtFloat(m["aether_eth_balance"]),
-		"E2ELatency": e2eLatency,
-		"SimLatency": simLatency,
+		"RustPort":      d.rustPort,
+		"GoPort":        d.goPort,
+		"Blocks":        fmtFloat(m["aether_blocks_processed_total"]),
+		"Cycles":        fmtFloat(m["aether_cycles_detected_total"]),
+		"Sims":          fmtFloat(m["aether_simulations_run_total"]),
+		"Arbs":          fmtFloat(m["aether_arbs_published_total"]),
+		"BundlesSub":    fmtFloat(m["aether_executor_bundles_submitted_total"]),
+		"BundlesInc":    fmtFloat(m["aether_executor_bundles_included_total"]),
+		"Rejected":      fmtFloat(m["aether_executor_risk_rejections_total"]),
+		"DailyPnL":      fmtFloat(m["aether_daily_pnl_eth"]),
+		"GasPrice":      fmtFloat(m["aether_gas_price_gwei"]),
+		"EthBalance":    fmtFloat(m["aether_eth_balance"]),
+		"DetectLatency": fmtAvg(detectAvg),
+		"SimLatency":    fmtAvg(simAvg),
+		"E2ELatency":    fmtAvg(e2eAvg),
+		"TotalLatency":  totalLatency,
 	}
 
 	d.tmpl.Execute(w, data)
