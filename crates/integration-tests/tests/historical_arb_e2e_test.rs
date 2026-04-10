@@ -117,7 +117,7 @@ async fn run_historical_arb_inner(
         .ok_or("block not found")?;
 
     let timestamp = block.header.timestamp;
-    let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64;
+    let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000);
 
     eprintln!(
         "  Fork block: {}  Timestamp: {}  BaseFee: {} gwei",
@@ -335,10 +335,15 @@ async fn run_historical_arb_inner(
     )
     .ok_or("Failed to build final route with executor address")?;
 
+    // Use a realistic deadline (block timestamp + 24s) to exercise the on-chain check
+    let deadline = U256::from(timestamp + 24);
+    let min_profit_out = U256::ZERO; // Integration test: don't enforce min profit
     let calldata = build_execute_arb_calldata(
         &final_steps,
         flashloan_token,
         optimal_input,
+        deadline,
+        min_profit_out,
         U256::from(9000u64),
     );
     latencies.push(("build calldata", t7.elapsed().as_millis()));
@@ -357,7 +362,7 @@ async fn run_historical_arb_inner(
         .ok_or("block not found")?;
     let current_ts = current_block_data.header.timestamp;
     let current_base_fee =
-        current_block_data.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64;
+        current_block_data.header.base_fee_per_gas.unwrap_or(30_000_000_000);
 
     let sim_parsed: url::Url = anvil_url.parse().expect("valid URL");
     let sim_provider = ProviderBuilder::new().connect_http(sim_parsed);

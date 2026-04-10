@@ -1055,10 +1055,15 @@ impl AetherEngine {
                     })
                     .collect();
 
+                // Deadline: block timestamp + 24s (~2 blocks) for MEV bundle window
+                let deadline = U256::from(block_info.timestamp + 24);
+                let min_profit_out = U256::ZERO; // Enforced off-chain via net_profit check
                 let calldata = build_execute_arb_calldata(
                     &steps,
                     candidate.flashloan_token,
                     input_amount,
+                    deadline,
+                    min_profit_out,
                     tip_bps,
                 );
 
