@@ -134,10 +134,10 @@ Emergency withdrawal of tokens stuck in the contract. Only callable by the owner
 ### `setApprovals()`
 
 ```solidity
-function setApprovals(address token, address spender, uint256 amount) external onlyOwner
+function setApprovals(address[] calldata tokens, address[] calldata spenders) external onlyOwner
 ```
 
-Sets ERC20 approvals for DEX routers. Pre-approving common tokens reduces gas costs per swap.
+Batch-sets max ERC20 approvals for DEX routers and the Aave pool. Both arrays must be the same length. Pre-approving common tokens eliminates per-swap approval overhead. Uses `forceApprove` with `type(uint256).max`.
 
 ## Security Model
 

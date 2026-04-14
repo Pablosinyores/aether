@@ -156,18 +156,14 @@ sysctl -w kernel.sched_rt_runtime_us=-1
 
 ## Ansible Provisioning
 
-Server provisioning playbooks are in `deploy/ansible/`:
+Server provisioning is managed via `deploy/ansible/`:
 
 ```bash
-# Provision a new server
-ansible-playbook -i inventory deploy/ansible/provision.yml
-
-# Deploy application
-ansible-playbook -i inventory deploy/ansible/deploy.yml
-
-# Update configuration only
-ansible-playbook -i inventory deploy/ansible/configure.yml
+# Run the provisioning and deployment playbook
+ansible-playbook -i deploy/ansible/inventory.yml deploy/ansible/playbook.yml
 ```
+
+The inventory file (`deploy/ansible/inventory.yml`) defines target hosts. The playbook (`deploy/ansible/playbook.yml`) handles server setup and application deployment.
 
 ## Network Security
 

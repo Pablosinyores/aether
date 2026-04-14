@@ -219,28 +219,31 @@ curl -s -X POST -H "Content-Type: application/json" \
 
 ### Key Metrics to Watch
 
-| Metric | Normal Range | Action if Abnormal |
-|---|---|---|
-| `aether_opportunities_detected_total` rate | >10/min | Check node connectivity |
-| `aether_bundles_included_total` rate | >20% inclusion | Check builder endpoints |
-| `aether_detection_latency_ms` p99 | <10ms | Check CPU load, price graph size |
-| `aether_simulation_latency_ms` p99 | <50ms | Check RPC latency |
-| `aether_end_to_end_latency_ms` p99 | <100ms | Check all components |
-| `aether_gas_price_gwei` | <100 gwei | System auto-halts at 300 |
-| `aether_daily_pnl_eth` | >0 | Review strategy |
-| `aether_eth_balance` | >0.1 ETH | Top up searcher wallet |
+| Metric | Source | Normal Range | Action if Abnormal |
+|---|---|---|---|
+| `aether_arbs_published_total` rate | Rust `:9092` | >10/min | Check node connectivity |
+| `aether_executor_bundles_included_total` rate | Go `:9090` | >20% inclusion | Check builder endpoints |
+| `aether_detection_latency_ms` avg | Rust `:9092` | <10ms | Check CPU load, graph size |
+| `aether_simulation_latency_ms` avg | Rust `:9092` | <50ms | Check RPC latency |
+| `aether_end_to_end_latency_ms` p99 | Go `:9090` | <100ms | Check all components |
+| `aether_gas_price_gwei` | Go `:9090` | <100 gwei | System auto-halts at 300 |
+| `aether_daily_pnl_eth` | Go `:9090` | >0 | Review strategy |
+| `aether_eth_balance` | Go `:9090` | >0.1 ETH | Top up searcher wallet |
 
 ### Useful PromQL Queries
 
 ```txt
-# Opportunity detection rate (5min window)
-rate(aether_opportunities_detected_total[5m])
+# Arbs published per minute (Rust engine)
+rate(aether_arbs_published_total[5m]) * 60
 
-# Bundle inclusion rate
-rate(aether_bundles_included_total[5m]) / rate(aether_bundles_submitted_total[5m])
+# Bundle inclusion rate (Go executor)
+rate(aether_executor_bundles_included_total[5m]) / rate(aether_executor_bundles_submitted_total[5m])
 
-# Detection latency p99
-histogram_quantile(0.99, rate(aether_detection_latency_ms_bucket[5m]))
+# Detection latency average (Rust histogram)
+rate(aether_detection_latency_ms_sum[5m]) / rate(aether_detection_latency_ms_count[5m])
+
+# End-to-end latency p99 (Go histogram)
+histogram_quantile(0.99, rate(aether_end_to_end_latency_ms_bucket[5m]))
 
 # Daily PnL
 aether_daily_pnl_eth

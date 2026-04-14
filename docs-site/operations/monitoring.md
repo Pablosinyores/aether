@@ -1,18 +1,19 @@
 # Monitoring
 
-Aether exposes comprehensive metrics via Prometheus and provides built-in alerting through PagerDuty, Telegram, and Discord.
+Aether exposes metrics from two processes. The Rust engine serves histograms and counters on `:9092/metrics`. The Go executor serves metrics on `:9090/metrics` via the Prometheus client library. The Go monitor also serves simplified gauge-style metrics and an HTML dashboard.
 
 ## Prometheus Setup
 
-Metrics are exposed by the Go monitor service on `:9090/metrics`. Prometheus scrapes this endpoint at a 15-second interval.
-
-### Prometheus Configuration
-
-The included Prometheus config is at `deploy/docker/prometheus.yml`:
+Prometheus needs to scrape **both** endpoints:
 
 ```yaml
 scrape_configs:
-  - job_name: 'aether'
+  - job_name: 'aether-rust'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9092']
+
+  - job_name: 'aether-go'
     scrape_interval: 15s
     static_configs:
       - targets: ['localhost:9090']
@@ -30,71 +31,69 @@ open http://localhost:9090
 
 ## Key Metrics
 
-### Counters
+### From Rust Engine (`:9092`)
 
-| Metric | Description | Alert Threshold |
+| Metric | Type | Description |
 |---|---|---|
-| `aether_opportunities_detected_total` | Arbitrage opportunities found | <10/min → warn |
-| `aether_bundles_submitted_total` | Bundles sent to builders | — |
-| `aether_bundles_included_total` | Bundles included on-chain | Inclusion rate <20% → alert |
+| `aether_detection_latency_ms` | Histogram | Bellman-Ford detection latency |
+| `aether_simulation_latency_ms` | Histogram | EVM simulation latency |
+| `aether_cycles_detected_total` | Counter | Negative cycles found |
+| `aether_simulations_run_total` | Counter | EVM simulations executed |
+| `aether_arbs_published_total` | Counter | Validated arbs sent to Go |
+| `aether_blocks_processed_total` | Counter | Blocks processed |
 
-### Histograms
+### From Go Executor (`:9090`)
 
-| Metric | Description | Alert Threshold |
+| Metric | Type | Description |
 |---|---|---|
-| `aether_detection_latency_ms` | Detection pipeline latency | p99 >10ms → warn |
-| `aether_simulation_latency_ms` | EVM simulation latency | p99 >50ms → warn |
-| `aether_end_to_end_latency_ms` | Full pipeline latency | p99 >100ms → alert |
+| `aether_executor_bundles_submitted_total` | Counter | Bundles submitted to builders |
+| `aether_executor_bundles_included_total` | Counter | Bundles accepted by builders |
+| `aether_executor_profit_wei_total` | Counter | Cumulative net profit (wei) |
+| `aether_executor_gas_spent_wei_total` | Counter | Cumulative gas spent (wei) |
+| `aether_executor_risk_rejections_total` | Counter | Arbs rejected by risk checks |
+| `aether_end_to_end_latency_ms` | Histogram | Detection to submission latency |
+| `aether_gas_price_gwei` | Gauge | Current gas price |
+| `aether_daily_pnl_eth` | Gauge | Daily profit/loss in ETH |
+| `aether_eth_balance` | Gauge | Searcher wallet balance |
 
-### Gauges
+### From Go Monitor (`:9090`)
 
-| Metric | Description | Alert Threshold |
+| Metric | Type | Description |
 |---|---|---|
-| `aether_gas_price_gwei` | Current gas price | >300 → halt |
-| `aether_daily_pnl_eth` | Daily profit/loss in ETH | <-0.5 ETH → halt |
-| `aether_eth_balance` | Searcher wallet balance | <0.1 ETH → halt |
-| `aether_pools_monitored` | Active pool count | — |
-| `aether_node_healthy_count` | Healthy node connections | <2 → degrade |
+| `aether_reverts_total{type="bug"}` | Counter | Bug-caused reverts |
+| `aether_reverts_total{type="competitive"}` | Counter | MEV competition reverts |
+
+See [Metrics Reference](/reference/metrics) for the complete list with bucket values and query examples.
 
 ## PromQL Queries
 
-### Opportunity Detection Rate
+### Detection Latency (from Rust histograms on `:9092`)
 
 ```txt
-rate(aether_opportunities_detected_total[5m])
-```
-
-### Bundle Inclusion Rate
-
-```txt
-rate(aether_bundles_included_total[5m]) / rate(aether_bundles_submitted_total[5m])
-```
-
-### Detection Latency (p50, p99)
-
-```txt
-# p50
-histogram_quantile(0.5, rate(aether_detection_latency_ms_bucket[5m]))
+# Average
+rate(aether_detection_latency_ms_sum[5m]) / rate(aether_detection_latency_ms_count[5m])
 
 # p99
 histogram_quantile(0.99, rate(aether_detection_latency_ms_bucket[5m]))
 ```
 
-### End-to-End Latency p99
+### End-to-End Latency (from Go histogram on `:9090`)
 
 ```txt
+# p99
 histogram_quantile(0.99, rate(aether_end_to_end_latency_ms_bucket[5m]))
 ```
 
-### Daily PnL
+### Bundle Inclusion Rate
+
+```txt
+rate(aether_executor_bundles_included_total[5m]) / rate(aether_executor_bundles_submitted_total[5m]) * 100
+```
+
+### Daily PnL and Gas
 
 ```txt
 aether_daily_pnl_eth
-```
-
-### Gas Price Trend
-
-```txt
 aether_gas_price_gwei
 ```
 
@@ -102,37 +101,35 @@ aether_gas_price_gwei
 
 Grafana connects to Prometheus as a data source. Recommended dashboard panels:
 
-1. **System Overview** — Current state (Running/Degraded/Paused/Halted), uptime, active pools
-2. **Latency** — Detection, simulation, and end-to-end latency percentiles over time
-3. **Profitability** — Daily PnL, cumulative PnL, profit per trade
-4. **Bundles** — Submission rate, inclusion rate, miss rate
+1. **System Overview** — Current state, uptime, blocks processed
+2. **Latency** — Detection and simulation percentiles over time (source: Rust `:9092` histograms)
+3. **Profitability** — Daily PnL, cumulative profit, gas costs
+4. **Bundles** — Submission rate, inclusion rate, risk rejections
 5. **Gas** — Gas price trend, gas cost per trade
-6. **Infrastructure** — ETH balance, node health, CPU/memory usage
+6. **Infrastructure** — ETH balance, revert breakdown (bug vs competitive)
 
 ## Alerting
 
 ### Alert Rules
 
-Alerts are triggered by the Go monitor service based on metric thresholds:
+Alerts are triggered by the Go monitor/risk manager based on metric thresholds. See [Risk Parameters](/reference/risk-parameters) for the complete list.
 
 | Condition | Severity | Action |
 |---|---|---|
 | Gas price >300 gwei | SEV2 | System auto-halts |
-| 10+ consecutive reverts in 10 min | SEV3 | System auto-pauses |
+| 10+ bug reverts in 10 min | SEV3 | System auto-pauses |
 | Daily loss >0.5 ETH | SEV2 | System auto-halts |
 | ETH balance <0.1 ETH | SEV2 | System auto-halts |
 | Node latency >500ms | SEV3 | System degrades |
 | Bundle miss rate >80% in 1h | SEV3 | Alert dispatched |
-| Detection latency p99 >10ms | SEV3 | Alert dispatched |
-| Opportunities <10/min | SEV3 | Alert dispatched |
 
 ### Alert Channels
 
 | Channel | Used For | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml → alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml → alerting.telegram` |
-| Discord | All severities | `config/risk.yaml → alerting.discord` |
+| PagerDuty | SEV1, SEV2 | `config/risk.yaml` → `alerting.pagerduty` |
+| Telegram | SEV2, SEV3 | `config/risk.yaml` → `alerting.telegram` |
+| Discord | All severities | `config/risk.yaml` → `alerting.discord` |
 
 ## Log Aggregation
 
@@ -156,15 +153,12 @@ journalctl -u aether-rust --since "1 hour ago" | grep -i "reconnect\|disconnect\
 
 ## Dashboard
 
-The built-in HTTP dashboard runs on `:8080`:
+The built-in HTML dashboard runs on `:8080`, auto-refreshes every 5 seconds, and shows:
+
+- Pipeline stats (blocks, cycles, simulations, arbs, bundles)
+- Financials (daily PnL, gas price, ETH balance)
+- Latency (detection, simulation, executor, total pipeline)
 
 ```bash
-# Check dashboard is up
 curl -s http://localhost:8080/ | head -5
 ```
-
-Provides at-a-glance view of:
-- System state and health
-- Recent opportunities and executions
-- Key performance metrics
-- Circuit breaker status
