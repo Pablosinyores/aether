@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"os"
 	"os/signal"
@@ -48,7 +48,7 @@ func loadConfig() Config {
 	buildersPath := config.ConfigPath("builders.yaml")
 	bc, err := config.LoadBuildersConfig(buildersPath)
 	if err != nil {
-		log.Printf("Config: builders.yaml not loaded (%v), using defaults", err)
+		slog.Warn("builders.yaml not loaded, using defaults", "path", buildersPath, "err", err)
 	} else {
 		builders := make([]BuilderConfig, 0, len(bc.Builders))
 		for _, b := range bc.Builders {
@@ -62,13 +62,13 @@ func loadConfig() Config {
 			})
 		}
 		cfg.BuilderConfigs = builders
-		log.Printf("Config: loaded %d builders from %s", len(builders), buildersPath)
+		slog.Info("builders loaded", "count", len(builders), "path", buildersPath)
 	}
 
 	// Override gRPC address from environment if set.
 	if addr := os.Getenv("GRPC_ADDRESS"); addr != "" {
 		cfg.GRPCAddress = addr
-		log.Printf("Config: GRPC_ADDRESS=%s (from env)", addr)
+		slog.Info("grpc address overridden from env", "addr", addr)
 	}
 
 	return cfg
@@ -80,14 +80,16 @@ func loadRiskConfig() risk.RiskConfig {
 	riskPath := config.ConfigPath("risk.yaml")
 	rc, err := risk.LoadRiskConfig(riskPath)
 	if err != nil {
-		log.Printf("Config: risk.yaml not loaded (%v), using defaults", err)
+		slog.Warn("risk.yaml not loaded, using defaults", "path", riskPath, "err", err)
 		return risk.DefaultRiskConfig()
 	}
-	log.Printf("Config: loaded risk config from %s", riskPath)
+	slog.Info("risk config loaded", "path", riskPath)
 	return rc
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	fmt.Println("aether-executor: bundle construction and submission service")
 
 	cfg := loadConfig()
@@ -102,25 +104,26 @@ func main() {
 	execPath := config.ConfigPath("executor.yaml")
 	execCfg, err := config.LoadExecutorConfig(execPath)
 	if err != nil {
-		log.Fatalf("FATAL: executor config (%s) missing or invalid: %v", execPath, err)
+		slog.Error("executor config missing or invalid", "path", execPath, "err", err)
+		os.Exit(1)
 	}
-	log.Printf("Config: executor_address=%s expected_chain_id=%d",
-		execCfg.ExecutorAddress, execCfg.ExpectedChainID)
+	slog.Info("executor config loaded", "executor_address", execCfg.ExecutorAddress, "expected_chain_id", execCfg.ExpectedChainID)
 
 	// ETH_RPC_URL is now required — the chain-ID check, bytecode check, and
 	// live balance polling all need a node connection.
 	rpcURL := os.Getenv("ETH_RPC_URL")
 	if rpcURL == "" {
-		log.Fatalf("FATAL: ETH_RPC_URL not set — required for chain-id / bytecode / balance checks")
+		slog.Error("ETH_RPC_URL not set — required for chain-id / bytecode / balance checks")
+		os.Exit(1)
 	}
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dialCancel()
 	ethClient, err := ethclient.DialContext(dialCtx, rpcURL)
 	if err != nil {
-		log.Fatalf("FATAL: failed to connect to ETH_RPC_URL (%s): %v",
-			redactRPCURL(rpcURL), redactRPCError(err, rpcURL))
+		slog.Error("failed to connect to ETH_RPC_URL", "url", redactRPCURL(rpcURL), "err", redactRPCError(err, rpcURL))
+		os.Exit(1)
 	}
-	log.Printf("Connected to Ethereum node")
+	slog.Info("connected to ethereum node")
 
 	// Cross-check chain ID: the node must agree with the expected chain in
 	// executor.yaml. A mismatch here typically means someone pointed a
@@ -129,13 +132,14 @@ func main() {
 	defer chainCancel()
 	chainID, err := ethClient.ChainID(chainCtx)
 	if err != nil {
-		log.Fatalf("FATAL: eth_chainId failed: %v", redactRPCError(err, rpcURL))
+		slog.Error("eth_chainId failed", "err", redactRPCError(err, rpcURL))
+		os.Exit(1)
 	}
 	if chainID.Int64() != execCfg.ExpectedChainID {
-		log.Fatalf("FATAL: chain-id mismatch — node reports %d, config expects %d",
-			chainID.Int64(), execCfg.ExpectedChainID)
+		slog.Error("chain-id mismatch", "node_chain_id", chainID.Int64(), "config_chain_id", execCfg.ExpectedChainID)
+		os.Exit(1)
 	}
-	log.Printf("Chain ID verified: %d", chainID.Int64())
+	slog.Info("chain ID verified", "chain_id", chainID.Int64())
 
 	// Verify the configured executor contract actually exists on-chain. A
 	// zero-bytecode result means we'd be sending bundles to a non-contract.
@@ -143,23 +147,23 @@ func main() {
 	defer codeCancel()
 	code, err := ethClient.CodeAt(codeCtx, common.HexToAddress(execCfg.ExecutorAddress), nil)
 	if err != nil {
-		log.Fatalf("FATAL: eth_getCode(%s) failed: %v",
-			execCfg.ExecutorAddress, redactRPCError(err, rpcURL))
+		slog.Error("eth_getCode failed", "executor_address", execCfg.ExecutorAddress, "err", redactRPCError(err, rpcURL))
+		os.Exit(1)
 	}
 	if len(code) == 0 {
-		log.Fatalf("FATAL: executor address %s has no bytecode on chain %d",
-			execCfg.ExecutorAddress, chainID.Int64())
+		slog.Error("executor address has no bytecode on chain", "executor_address", execCfg.ExecutorAddress, "chain_id", chainID.Int64())
+		os.Exit(1)
 	}
-	log.Printf("Executor contract verified on-chain: %s (%d bytes of code)",
-		execCfg.ExecutorAddress, len(code))
+	slog.Info("executor contract verified on-chain", "executor_address", execCfg.ExecutorAddress, "code_bytes", len(code))
 
 	// Load searcher private key for transaction signing and bundle submission.
 	searcherKey := os.Getenv("SEARCHER_KEY")
 
-	// Create submitter BEFORE clearing the key — it needs the key for FlashbotsSigner.
+	// Create submitter BEFORE clearing the key - it needs the key for FlashbotsSigner.
 	submitter, err := NewSubmitter(cfg.BuilderConfigs, searcherKey)
 	if err != nil {
-		log.Fatalf("Failed to create submitter: %v", err)
+		slog.Error("failed to create submitter", "err", err)
+		os.Exit(1)
 	}
 
 	var txSigner *TransactionSigner
@@ -167,11 +171,12 @@ func main() {
 		var signerErr error
 		txSigner, signerErr = NewTransactionSigner(searcherKey, chainID.Int64())
 		if signerErr != nil {
-			log.Fatalf("Failed to load SEARCHER_KEY: %v", signerErr)
+			slog.Error("failed to load SEARCHER_KEY", "err", signerErr)
+			os.Exit(1)
 		}
-		log.Printf("Searcher address: %s", txSigner.Address().Hex())
+		slog.Info("searcher signer loaded", "addr", txSigner.Address().Hex())
 	} else {
-		log.Println("WARNING: SEARCHER_KEY not set — transactions will not be signed")
+		slog.Warn("SEARCHER_KEY not set, transactions will not be signed")
 	}
 
 	os.Unsetenv("SEARCHER_KEY")
@@ -185,16 +190,17 @@ func main() {
 	if txSigner != nil {
 		nonceManager.SetSyncSource(txSigner.Address(), ethClient)
 		if err := nonceManager.SyncFromChain(ctx); err != nil {
-			log.Printf("WARNING: failed to sync nonce for %s: %v", txSigner.Address().Hex(), err)
+			slog.Warn("failed to sync nonce", "addr", txSigner.Address().Hex(), "err", err)
 		}
 	} else {
-		log.Printf("WARNING: SEARCHER_KEY not set — nonce manager will use initial nonce 0")
+		slog.Warn("SEARCHER_KEY not set, nonce manager will use initial nonce 0")
 	}
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
 	gasOracle.SetClient(ethClient)
+	// Fetch real gas prices before first arb evaluation.
 	if _, err := gasOracle.FetchOnce(ctx); err != nil {
-		log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
+		slog.Warn("initial gas oracle fetch failed", "err", err)
 	}
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, chainID.Int64())
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
@@ -234,8 +240,8 @@ func main() {
 	// and bytecode checks.
 	if txSigner != nil {
 		if err := fetchAndStoreBalance(ctx, ethClient, txSigner.Address(), liveBalance); err != nil {
-			log.Fatalf("FATAL: initial eth_getBalance(%s) failed: %v",
-				txSigner.Address().Hex(), redactRPCError(err, rpcURL))
+			slog.Error("initial eth_getBalance failed", "addr", txSigner.Address().Hex(), "err", redactRPCError(err, rpcURL))
+			os.Exit(1)
 		}
 		wg.Add(1)
 		go func() {
@@ -246,20 +252,19 @@ func main() {
 
 	startMetricsServer()
 
+	transport := "TCP"
 	if strings.HasPrefix(cfg.GRPCAddress, "unix:") {
-		log.Printf("Executor service started, gRPC target: %s (UDS)", cfg.GRPCAddress)
-	} else {
-		log.Printf("Executor service started, gRPC target: %s (TCP)", cfg.GRPCAddress)
+		transport = "UDS"
 	}
-	log.Printf("Configured %d builders", len(cfg.BuilderConfigs))
+	slog.Info("executor service started", "grpc_target", cfg.GRPCAddress, "transport", transport)
+	slog.Info("builders configured", "count", len(cfg.BuilderConfigs))
 
 	// Connect to Rust engine gRPC server.
 	// grpc.NewClient is lazy — the connection is established on first RPC,
 	// so this call returns immediately even if the Rust server is not running.
 	grpcClient, err := aethergrpc.Dial(cfg.GRPCAddress)
 	if err != nil {
-		log.Printf("WARNING: could not create gRPC client for %s: %v", cfg.GRPCAddress, err)
-		log.Printf("Executor will start without arb stream")
+		slog.Warn("could not create gRPC client, executor will start without arb stream", "addr", cfg.GRPCAddress, "err", err)
 	} else {
 		defer grpcClient.Close()
 
@@ -274,14 +279,14 @@ func main() {
 	// Wait for shutdown signal
 	select {
 	case sig := <-sigCh:
-		log.Printf("Received signal %v, shutting down...", sig)
+		slog.Info("received signal, shutting down", "signal", sig.String())
 		cancel()
 	case <-ctx.Done():
 	}
 
 	// Wait for goroutines
 	wg.Wait()
-	log.Println("Executor service stopped")
+	slog.Info("executor service stopped")
 }
 
 // processArb handles a single validated arb through the full pipeline:
@@ -308,7 +313,7 @@ func processArb(
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
 	if !result.Approved {
 		recordRiskRejection()
-		log.Printf("Arb %s rejected by preflight: %s", arb.Id, result.Reason)
+		slog.InfoContext(ctx, "arb rejected by preflight", "arb_id", arb.Id, "reason", result.Reason)
 		return false, nil
 	}
 
@@ -324,7 +329,7 @@ func processArb(
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
-	log.Printf("Arb %s: submitted to %d builders, %d accepted", arb.Id, len(results), successes)
+	slog.InfoContext(ctx, "arb submitted", "arb_id", arb.Id, "builders", len(results), "accepted", successes)
 
 	// Record result for miss rate tracking
 	included := successes > 0
@@ -399,7 +404,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 
 		stream, err := client.StreamArbs(ctx, minProfitETH)
 		if err != nil {
-			log.Printf("StreamArbs connect error: %v, retrying in %v...", err, reconnectDelay)
+			slog.WarnContext(ctx, "StreamArbs connect error, will retry", "err", err, "retry_in", reconnectDelay.String())
 			select {
 			case <-ctx.Done():
 				return
@@ -408,25 +413,24 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			}
 		}
 
-		log.Println("Connected to Rust engine arb stream")
+		slog.InfoContext(ctx, "connected to rust engine arb stream")
 
 		for {
 			arb, err := stream.Recv()
 			if err != nil {
-				log.Printf("Arb stream recv error: %v, reconnecting...", err)
+				slog.WarnContext(ctx, "arb stream recv error, reconnecting", "err", err)
 				break
 			}
 			receivedAt := time.Now() // Go-side clock avoids cross-process skew
 
-			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
-				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
+			slog.InfoContext(ctx, "arb received", "arb_id", arb.Id, "hops", len(arb.Hops), "gas", arb.TotalGas, "block", arb.BlockNumber)
 
 			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, liveBalance.Get())
 			switch {
 			case err != nil:
-				log.Printf("Error processing arb %s: %v", arb.Id, err)
+				slog.ErrorContext(ctx, "error processing arb", "arb_id", arb.Id, "err", err)
 			case !submitted:
-				log.Printf("Skipped arb %s (risk-manager veto or below threshold)", arb.Id)
+				slog.InfoContext(ctx, "arb skipped", "arb_id", arb.Id, "reason", "risk-manager veto or below threshold")
 			}
 		}
 	}
