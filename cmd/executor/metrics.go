@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -199,7 +200,52 @@ func addPnl(profitWei *big.Int, gasCostWei float64) {
 
 // --- ETH balance watcher ---
 
-func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration) {
+// LiveBalance holds the most recent searcher ETH balance in a lock-free
+// readable form. balanceWatchLoop writes it on every successful poll;
+// processArb reads it on every inbound arb to feed the risk manager.
+//
+// Stored as the IEEE-754 bit representation of a float64 inside an
+// atomic.Uint64 so Get/Set are single atomic ops with no mutex contention on
+// the hot path.
+type LiveBalance struct {
+	bits atomic.Uint64
+}
+
+func NewLiveBalance() *LiveBalance {
+	return &LiveBalance{}
+}
+
+func (b *LiveBalance) Get() float64 {
+	return math.Float64frombits(b.bits.Load())
+}
+
+func (b *LiveBalance) Set(v float64) {
+	b.bits.Store(math.Float64bits(v))
+}
+
+// fetchAndStoreBalance does a single eth_getBalance call, updates both the
+// Prometheus gauge and the shared LiveBalance, and returns any error from
+// the RPC. Used at startup to seed the balance before the first arb and
+// inside balanceWatchLoop to refresh it periodically.
+func fetchAndStoreBalance(ctx context.Context, client *ethclient.Client, addr common.Address, live *LiveBalance) error {
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	bal, err := client.BalanceAt(fetchCtx, addr, nil)
+	if err != nil {
+		return err
+	}
+	ethVal, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(bal),
+		new(big.Float).SetFloat64(1e18),
+	).Float64()
+	ethBalanceGauge.Set(ethVal)
+	if live != nil {
+		live.Set(ethVal)
+	}
+	return nil
+}
+
+func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration, live *LiveBalance) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -207,18 +253,9 @@ func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			bal, err := client.BalanceAt(fetchCtx, addr, nil)
-			cancel()
-			if err != nil {
+			if err := fetchAndStoreBalance(ctx, client, addr, live); err != nil {
 				log.Printf("WARNING: eth_getBalance failed: %v", err)
-				continue
 			}
-			ethVal, _ := new(big.Float).Quo(
-				new(big.Float).SetInt(bal),
-				new(big.Float).SetFloat64(1e18),
-			).Float64()
-			ethBalanceGauge.Set(ethVal)
 		}
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/aether-arb/aether/internal/config"
@@ -21,23 +22,20 @@ import (
 )
 
 // Config holds executor service configuration.
+// ChainID, ExecutorAddr, and the live ETH balance are no longer carried here —
+// they are resolved against the connected node at startup (see main) and the
+// balance is updated continuously by balanceWatchLoop.
 type Config struct {
 	GRPCAddress    string
 	BuilderConfigs []BuilderConfig
-	ChainID        int64
 	MaxGasGwei     float64
-	ExecutorAddr   string  // On-chain AetherExecutor contract address
-	EthBalance     float64 // Current ETH balance of searcher wallet (simulated)
 }
 
 func defaultConfig() Config {
 	return Config{
 		GRPCAddress:    "localhost:50051",
 		BuilderConfigs: defaultBuilderConfigs(),
-		ChainID:        1,
 		MaxGasGwei:     300.0,
-		ExecutorAddr:   "0x0000000000000000000000000000000000000000",
-		EthBalance:     0.5,
 	}
 }
 
@@ -94,6 +92,70 @@ func main() {
 
 	cfg := loadConfig()
 
+	// Executor on-chain parameters (contract address, expected chain ID) are
+	// required: the service refuses to start without them. This prevents the
+	// old fail-open behaviour where a zero-address stub silently routed
+	// bundles to nowhere.
+	execPath := config.ConfigPath("executor.yaml")
+	execCfg, err := config.LoadExecutorConfig(execPath)
+	if err != nil {
+		log.Fatalf("FATAL: executor config (%s) missing or invalid: %v", execPath, err)
+	}
+	// AETHER_EXECUTOR_ADDRESS env var overrides the yaml value so deployments
+	// can inject the deployed address without editing the file in-tree.
+	if envAddr := os.Getenv("AETHER_EXECUTOR_ADDRESS"); envAddr != "" {
+		execCfg.ExecutorAddress = envAddr
+	}
+	if err := config.ValidateExecutorConfig(execCfg); err != nil {
+		log.Fatalf("FATAL: executor config invalid after env override: %v", err)
+	}
+	log.Printf("Config: executor_address=%s expected_chain_id=%d",
+		execCfg.ExecutorAddress, execCfg.ExpectedChainID)
+
+	// ETH_RPC_URL is now required — the chain-ID check, bytecode check, and
+	// live balance polling all need a node connection.
+	rpcURL := os.Getenv("ETH_RPC_URL")
+	if rpcURL == "" {
+		log.Fatalf("FATAL: ETH_RPC_URL not set — required for chain-id / bytecode / balance checks")
+	}
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ethClient, err := ethclient.DialContext(dialCtx, rpcURL)
+	dialCancel()
+	if err != nil {
+		log.Fatalf("FATAL: failed to connect to ETH_RPC_URL: %v", err)
+	}
+	log.Printf("Connected to Ethereum node")
+
+	// Cross-check chain ID: the node must agree with the expected chain in
+	// executor.yaml. A mismatch here typically means someone pointed a
+	// mainnet config at a testnet RPC (or vice versa) — refuse to start.
+	chainCtx, chainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	chainID, err := ethClient.ChainID(chainCtx)
+	chainCancel()
+	if err != nil {
+		log.Fatalf("FATAL: eth_chainId failed: %v", err)
+	}
+	if chainID.Int64() != execCfg.ExpectedChainID {
+		log.Fatalf("FATAL: chain-id mismatch — node reports %d, config expects %d",
+			chainID.Int64(), execCfg.ExpectedChainID)
+	}
+	log.Printf("Chain ID verified: %d", chainID.Int64())
+
+	// Verify the configured executor contract actually exists on-chain. A
+	// zero-bytecode result means we'd be sending bundles to a non-contract.
+	codeCtx, codeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	code, err := ethClient.CodeAt(codeCtx, common.HexToAddress(execCfg.ExecutorAddress), nil)
+	codeCancel()
+	if err != nil {
+		log.Fatalf("FATAL: eth_getCode(%s) failed: %v", execCfg.ExecutorAddress, err)
+	}
+	if len(code) == 0 {
+		log.Fatalf("FATAL: executor address %s has no bytecode on chain %d",
+			execCfg.ExecutorAddress, chainID.Int64())
+	}
+	log.Printf("Executor contract verified on-chain: %s (%d bytes of code)",
+		execCfg.ExecutorAddress, len(code))
+
 	// Load searcher private key for transaction signing and bundle submission.
 	searcherKey := os.Getenv("SEARCHER_KEY")
 
@@ -106,7 +168,7 @@ func main() {
 	var txSigner *TransactionSigner
 	if searcherKey != "" {
 		var signerErr error
-		txSigner, signerErr = NewTransactionSigner(searcherKey, cfg.ChainID)
+		txSigner, signerErr = NewTransactionSigner(searcherKey, chainID.Int64())
 		if signerErr != nil {
 			log.Fatalf("Failed to load SEARCHER_KEY: %v", signerErr)
 		}
@@ -117,22 +179,6 @@ func main() {
 
 	os.Unsetenv("SEARCHER_KEY")
 
-	// Connect to Ethereum node for nonce sync.
-	var ethClient *ethclient.Client
-	if rpcURL := os.Getenv("ETH_RPC_URL"); rpcURL != "" {
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer dialCancel()
-		var err error
-		ethClient, err = ethclient.DialContext(dialCtx, rpcURL)
-		if err != nil {
-			log.Printf("WARNING: failed to connect to ETH_RPC_URL: %v", err)
-		} else {
-			log.Printf("Connected to Ethereum node for nonce sync")
-		}
-	} else {
-		log.Println("WARNING: ETH_RPC_URL not set — nonce manager will not sync on-chain nonce")
-	}
-
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -141,27 +187,27 @@ func main() {
 	nonceManager := NewNonceManager(0)
 	if txSigner != nil {
 		nonceManager.SetSyncSource(txSigner.Address(), ethClient)
-		if ethClient != nil {
-			if err := nonceManager.SyncFromChain(ctx); err != nil {
-				log.Printf("WARNING: failed to sync nonce for %s: %v", txSigner.Address().Hex(), err)
-			}
-		} else {
-			log.Printf("WARNING: ETH_RPC_URL not set — nonce manager will not sync on-chain nonce for %s", txSigner.Address().Hex())
+		if err := nonceManager.SyncFromChain(ctx); err != nil {
+			log.Printf("WARNING: failed to sync nonce for %s: %v", txSigner.Address().Hex(), err)
 		}
 	} else {
 		log.Printf("WARNING: SEARCHER_KEY not set — nonce manager will use initial nonce 0")
 	}
 
 	gasOracle := NewGasOracle(cfg.MaxGasGwei)
-	if ethClient != nil {
-		gasOracle.SetClient(ethClient)
-		// Fetch real gas prices before first arb evaluation.
-		if _, err := gasOracle.FetchOnce(ctx); err != nil {
-			log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
-		}
+	gasOracle.SetClient(ethClient)
+	if _, err := gasOracle.FetchOnce(ctx); err != nil {
+		log.Printf("WARNING: initial gas oracle fetch failed: %v", err)
 	}
-	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, cfg.ChainID)
+	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, chainID.Int64())
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
+
+	// Live searcher ETH balance, written by balanceWatchLoop and read by
+	// consumeArbStream → processArb → risk.PreflightCheck. When no searcher
+	// key is configured there is no address to query, so the live balance
+	// stays at zero and preflight will reject every arb — correct behaviour
+	// for a misconfigured deployment.
+	liveBalance := NewLiveBalance()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -182,12 +228,16 @@ func main() {
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
 
-	// Start ETH balance watcher
-	if ethClient != nil && txSigner != nil {
+	// Start ETH balance watcher. Perform one synchronous fetch first so the
+	// first arb does not see a zero balance and get rejected incorrectly.
+	if txSigner != nil {
+		if err := fetchAndStoreBalance(ctx, ethClient, txSigner.Address(), liveBalance); err != nil {
+			log.Printf("WARNING: initial eth_getBalance failed: %v", err)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			balanceWatchLoop(ctx, ethClient, txSigner.Address(), 30*time.Second)
+			balanceWatchLoop(ctx, ethClient, txSigner.Address(), 30*time.Second, liveBalance)
 		}()
 	}
 
@@ -214,7 +264,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, cfg.ExecutorAddr, cfg.EthBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, execCfg.ExecutorAddress, liveBalance)
 		}()
 	}
 
@@ -331,7 +381,7 @@ func looksLikeRevert(errMsg string) bool {
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, ethBalance float64) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, liveBalance *LiveBalance) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -368,7 +418,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 			log.Printf("Received arb: id=%s hops=%d gas=%d block=%d",
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, ethBalance)
+			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, liveBalance.Get())
 			switch {
 			case err != nil:
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
