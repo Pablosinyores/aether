@@ -20,6 +20,8 @@ services:
       - ETH_RPC_URL=${ETH_RPC_URL:-}
       - AETHER_NODES_CONFIG=/app/config/nodes.yaml
       - RUST_METRICS_PORT=9092
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_SERVICE_NAME=aether-rust
     env_file:
       - path: ../../.env
         required: false
@@ -39,6 +41,8 @@ services:
       - GRPC_ADDRESS=aether-rust:50051
       - METRICS_PORT=9090
       - DASHBOARD_PORT=8080
+      - OTEL_EXPORTER_OTLP_ENDPOINT=tempo:4317
+      - OTEL_SERVICE_NAME=aether-go
     env_file:
       - path: ../../.env
         required: false
@@ -137,6 +141,36 @@ services:
     networks:
       - aether-net
 
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: aether-tempo
+    command: -config.file=/etc/tempo/tempo-config.yml
+    ports:
+      - "3200:3200"   # HTTP API (Grafana datasource)
+      - "4317:4317"   # OTLP gRPC
+    volumes:
+      - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+    networks:
+      - aether-net
+
+  canary:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/canary.Dockerfile
+    container_name: aether-canary
+    environment:
+      - CANARY_TARGETS=aether-rust:9092/metrics,aether-go:9090/metrics,aether-go:8080/api/stats
+      - ALERTMANAGER_URL=http://alertmanager:9093
+      - PROBE_INTERVAL_SEC=60
+      - STALE_AFTER_SEC=180
+    depends_on:
+      - alertmanager
+    restart: unless-stopped
+    networks:
+      - aether-net
+
   # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
   # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
   reth:
@@ -161,6 +195,7 @@ volumes:
   alertmanager-data:
   loki-data:
   promtail-data:
+  tempo-data:
   reth-data:
   reth-ipc:
 
