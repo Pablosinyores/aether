@@ -277,7 +277,10 @@ func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, 
 		BundleHash string `json:"bundleHash"`
 	}
 	if rpcResp.Result != nil {
-		_ = json.Unmarshal(rpcResp.Result, &result)
+		if err := json.Unmarshal(rpcResp.Result, &result); err != nil {
+			log.Printf("warn: builder %s returned unparseable result (%v): %s",
+				builder.Name, err, string(rpcResp.Result))
+		}
 	}
 
 	bundleHash := result.BundleHash
