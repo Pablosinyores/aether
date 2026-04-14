@@ -738,6 +738,7 @@ impl AetherEngine {
     }
 
     /// Run a detection cycle: scan for negative cycles, simulate, publish.
+    #[tracing::instrument(skip_all, name = "engine.detection_cycle")]
     async fn run_detection_cycle(&self) {
         let t_cycle = Instant::now();
 
@@ -770,11 +771,16 @@ impl AetherEngine {
             let affected = graph.affected_vertices();
 
             let t_detect = Instant::now();
-            let cycles = if affected.is_empty() {
-                // Full scan (e.g., on first run).
-                self.detector.detect_negative_cycles(graph)
-            } else {
-                self.detector.detect_from_affected(graph, &affected)
+            let detect_span =
+                tracing::info_span!("detect", affected = affected.len(), block_number);
+            let cycles = {
+                let _entered = detect_span.enter();
+                if affected.is_empty() {
+                    // Full scan (e.g., on first run).
+                    self.detector.detect_negative_cycles(graph)
+                } else {
+                    self.detector.detect_from_affected(graph, &affected)
+                }
             };
             let detect_us = t_detect.elapsed().as_micros();
             self.metrics.observe_detection_latency_us(detect_us);
@@ -1258,6 +1264,13 @@ impl AetherEngine {
                 input.calldata,
             );
 
+            let publish_span = tracing::info_span!(
+                "arb.publish",
+                arb_id = %input.opp.id,
+                net_profit_wei = input.net_profit,
+                sim_us,
+            );
+            let _entered = publish_span.enter();
             if let Err(e) = self.arb_tx.send(proto_arb) {
                 debug!(error = %e, "No arb subscribers connected");
             } else {
