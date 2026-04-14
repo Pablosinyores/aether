@@ -74,7 +74,7 @@ sudo iptables -I OUTPUT -d 127.0.0.1 -j ACCEPT
 
 ## SEV2: All Ethereum Nodes Down
 
-**Detection:** `aether_node_healthy_count` = 0, system enters HALTED state.
+**Detection:** All node connections enter `Failed` state, system enters HALTED state.
 
 **Actions:**
 
@@ -165,7 +165,7 @@ sudo iptables -I OUTPUT -d 127.0.0.1 -j ACCEPT
    ```
 2. Check price graph size:
    ```bash
-   curl -s http://localhost:9090/metrics | grep aether_pools_monitored
+   curl -s http://localhost:9092/metrics | grep aether_blocks_processed_total
    ```
 3. If graph is too large, prune cold pools:
    ```bash

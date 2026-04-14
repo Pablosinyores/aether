@@ -5,6 +5,7 @@ export default withMermaid(
   defineConfig({
     title: 'Aether',
     description: 'Production-grade cross-DEX arbitrage engine for Ethereum Mainnet',
+    base: '/aether/',
 
     head: [
       ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
@@ -85,7 +86,7 @@ export default withMermaid(
       },
 
       socialLinks: [
-        { icon: 'github', link: 'https://github.com/aether-arb/aether' },
+        { icon: 'github', link: 'https://github.com/Pablosinyores/aether' },
       ],
 
       search: {
@@ -93,7 +94,7 @@ export default withMermaid(
       },
 
       editLink: {
-        pattern: 'https://github.com/aether-arb/aether/edit/main/docs-site/:path',
+        pattern: 'https://github.com/Pablosinyores/aether/edit/main/docs-site/:path',
         text: 'Edit this page on GitHub',
       },
 
