@@ -13,9 +13,10 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 
 mod engine;
-mod metrics;
 mod pipeline;
 mod service;
+
+use aether_grpc_server::metrics;
 
 use aether_grpc_server::provider::{ProviderConfig, RpcProvider};
 use engine::{AetherEngine, EngineConfig};
@@ -92,10 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if provider_config.nodes_config_path.is_some() {
         info!("AETHER_NODES_CONFIG set — provider will use multi-node pool");
     }
-    let provider = Arc::new(RpcProvider::new(
-        provider_config,
-        Arc::clone(engine.event_channels()),
-    ));
+    let provider = Arc::new(
+        RpcProvider::new(provider_config, Arc::clone(engine.event_channels()))
+            .with_metrics(Arc::clone(&metrics)),
+    );
 
     // Shutdown coordination via watch channel.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
