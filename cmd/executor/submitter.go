@@ -333,6 +333,8 @@ func (s *Submitter) recordMetrics(builder string, result SubmissionResult) {
 	latencyUs := result.Latency.Microseconds()
 	m.LastLatency.Store(latencyUs)
 	m.TotalLatency.Add(latencyUs)
+
+	recordBuilderResult(builder, result.Success, result.Latency)
 }
 
 // Metrics returns a snapshot of per-builder metrics.
