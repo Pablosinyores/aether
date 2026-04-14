@@ -16,6 +16,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = 1
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
