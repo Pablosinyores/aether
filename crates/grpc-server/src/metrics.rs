@@ -145,6 +145,12 @@ impl EngineMetrics {
     }
 }
 
+impl Default for EngineMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn start_metrics_server(metrics: Arc<EngineMetrics>) {
     let addr = metrics_addr();
 
