@@ -54,6 +54,34 @@ services:
       - "9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      - alertmanager
+    networks:
+      - aether-net
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: aether-alertmanager
+    ports:
+      - "9093:9093"
+    environment:
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml.tpl:ro
+      - alertmanager-data:/alertmanager
+    # Substitute the webhook URL from the environment at startup so the
+    # secret never lands in the committed config file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed "s|__SLACK_WEBHOOK_URL__|${SLACK_WEBHOOK_URL}|g" \
+          /etc/alertmanager/alertmanager.yml.tpl > /tmp/alertmanager.yml
+        exec /bin/alertmanager \
+          --config.file=/tmp/alertmanager.yml \
+          --storage.path=/alertmanager
+    restart: unless-stopped
     networks:
       - aether-net
 
@@ -69,6 +97,7 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     networks:
@@ -97,6 +126,7 @@ services:
 
 volumes:
   grafana-data:
+  alertmanager-data:
   reth-data:
   reth-ipc:
 
