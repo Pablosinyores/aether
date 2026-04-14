@@ -266,7 +266,7 @@ mod tests {
             token_in: addresses::WETH,
             token_out: addresses::USDC,
             amount_in: U256::from(1_000_000_000_000_000_000u64), // 1 ETH
-            expected_out: U256::from(2000_000_000u64),            // 2000 USDC
+            expected_out: U256::from(2_000_000_000u64),           // 2000 USDC
             estimated_gas: 60_000,
         };
         assert_eq!(hop.protocol, ProtocolType::UniswapV2);
@@ -281,7 +281,7 @@ mod tests {
             token_in: addresses::WETH,
             token_out: addresses::USDC,
             amount_in: U256::from(1_000_000_000_000_000_000u64),
-            min_amount_out: U256::from(1980_000_000u64), // 1% slippage
+            min_amount_out: U256::from(1_980_000_000u64), // 1% slippage
             calldata: vec![0x01, 0x02, 0x03],
         };
         assert_eq!(step.protocol, ProtocolType::UniswapV3);

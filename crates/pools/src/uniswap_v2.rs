@@ -118,15 +118,15 @@ mod tests {
         let eth_amount = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
         let usdc_out = pool.get_amount_out(pool.token1, eth_amount).unwrap();
         // Should get roughly 2000 USDC (at 2000 USDC/ETH rate)
-        assert!(usdc_out > U256::from(1990_000_000u64)); // > 1990 USDC
-        assert!(usdc_out < U256::from(2000_000_000u64)); // < 2000 USDC (fee + slippage)
+        assert!(usdc_out > U256::from(1_990_000_000u64)); // > 1990 USDC
+        assert!(usdc_out < U256::from(2_000_000_000u64)); // < 2000 USDC (fee + slippage)
     }
 
     #[test]
     fn test_get_amount_in() {
         let pool = setup_pool();
         // How much ETH to get 1000 USDC
-        let usdc_amount = U256::from(1000_000_000u64); // 1000 USDC
+        let usdc_amount = U256::from(1_000_000_000u64); // 1000 USDC
         let eth_in = pool.get_amount_in(pool.token0, usdc_amount).unwrap();
         // Should need roughly 0.5 ETH
         assert!(eth_in > U256::from(499_000_000_000_000_000u64)); // > 0.499 ETH

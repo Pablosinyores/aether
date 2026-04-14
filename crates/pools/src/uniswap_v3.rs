@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn test_v3_get_amount_out_token0() {
         let pool = setup_v3_pool();
-        let usdc_in = U256::from(1000_000_000u64); // 1000 USDC
+        let usdc_in = U256::from(1_000_000_000u64); // 1000 USDC
         let result = pool.get_amount_out(pool.token0, usdc_in);
         assert!(result.is_some());
         assert!(!result.unwrap().is_zero());
