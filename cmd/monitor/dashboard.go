@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -176,7 +176,7 @@ func (d *Dashboard) ServeDashboard(addr string) error {
 	mux.HandleFunc("/", d.handleDashboard)
 	mux.HandleFunc("/api/stats", d.handleStats)
 
-	log.Printf("Dashboard server listening on %s", addr)
+	slog.Info("dashboard server listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
 }
 

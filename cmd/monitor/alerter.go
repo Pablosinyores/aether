@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -77,11 +77,26 @@ func (a *Alerter) dispatch(channel AlertChannel, alert Alert) {
 	// In production, this would call the actual API for each channel
 	switch channel {
 	case ChannelPagerDuty:
-		log.Printf("[PagerDuty] [%s] %s: %s", alert.Severity, alert.Title, alert.Message)
+		slog.Info("alert dispatched",
+			"channel", "pagerduty",
+			"severity", alert.Severity,
+			"title", alert.Title,
+			"message", alert.Message,
+		)
 	case ChannelTelegram:
-		log.Printf("[Telegram] [%s] %s: %s", alert.Severity, alert.Title, alert.Message)
+		slog.Info("alert dispatched",
+			"channel", "telegram",
+			"severity", alert.Severity,
+			"title", alert.Title,
+			"message", alert.Message,
+		)
 	case ChannelDiscord:
-		log.Printf("[Discord] [%s] %s: %s", alert.Severity, alert.Title, alert.Message)
+		slog.Info("alert dispatched",
+			"channel", "discord",
+			"severity", alert.Severity,
+			"title", alert.Title,
+			"message", alert.Message,
+		)
 	}
 }
 
