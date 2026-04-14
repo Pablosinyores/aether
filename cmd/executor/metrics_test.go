@@ -220,3 +220,81 @@ func TestEndToEndLatency(t *testing.T) {
 	// Zero time should be a no-op
 	recordEndToEndLatency(time.Time{})
 }
+
+func TestRecordBuilderResult_ScrapeLabels(t *testing.T) {
+	recordBuilderResult("flashbots", true, 42*time.Millisecond)
+	recordBuilderResult("titan", false, 123*time.Millisecond)
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+	payload := string(body)
+
+	required := []string{
+		`aether_executor_builder_submissions_total{builder="flashbots",result="success"}`,
+		`aether_executor_builder_submissions_total{builder="titan",result="failure"}`,
+		`aether_executor_builder_latency_ms_count{builder="flashbots"}`,
+		`aether_executor_builder_latency_ms_count{builder="titan"}`,
+	}
+	for _, want := range required {
+		if !strings.Contains(payload, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+func TestSetSystemState_LastWriteWins(t *testing.T) {
+	setSystemState(2)
+	setSystemState(3)
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+
+	if !strings.Contains(string(body), "aether_system_state 3") {
+		t.Fatalf("expected 'aether_system_state 3' in payload, got: %s", string(body))
+	}
+}
+
+func TestRecordCircuitBreakerTrip(t *testing.T) {
+	recordCircuitBreakerTrip("daily_loss_exceeded")
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+
+	want := `aether_circuit_breaker_trips_total{reason="daily_loss_exceeded"}`
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("metrics output missing %q", want)
+	}
+}

@@ -96,6 +96,14 @@ type PreflightResult struct {
 	Reason   string
 }
 
+// MetricsObserver is notified on state changes and breaker trips. Optional;
+// nil observer is a no-op. Implementations must be goroutine-safe. Called
+// under rm.mu — keep callbacks non-blocking (Prometheus primitives are fine).
+type MetricsObserver interface {
+	OnStateChange(state SystemState)
+	OnCircuitBreakerTrip(reason string)
+}
+
 // RiskManager implements circuit breakers and position limits.
 type RiskManager struct {
 	mu                  sync.RWMutex
@@ -119,6 +127,32 @@ type RiskManager struct {
 
 	// Rate-limit: last time the competitive-rate alert was emitted.
 	lastCompAlertTime time.Time
+
+	// Decoupled from Prometheus: executor wraps its own metrics as an observer.
+	metricsObs MetricsObserver
+}
+
+// SetMetricsObserver installs an observer and immediately emits OnStateChange
+// so the metrics layer sees the initial state. Call once at startup.
+func (rm *RiskManager) SetMetricsObserver(obs MetricsObserver) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.metricsObs = obs
+	if obs != nil {
+		obs.OnStateChange(rm.state.Current())
+	}
+}
+
+// notifyTrip transitions state and notifies the observer. Caller holds rm.mu.
+func (rm *RiskManager) notifyTrip(reason string, newState SystemState) {
+	if err := rm.state.Transition(newState); err != nil {
+		log.Printf("CIRCUIT BREAKER: transition to %s failed: %v", newState, err)
+		return
+	}
+	if rm.metricsObs != nil {
+		rm.metricsObs.OnCircuitBreakerTrip(reason)
+		rm.metricsObs.OnStateChange(newState)
+	}
 }
 
 // NewRiskManager creates a new risk manager.
@@ -278,7 +312,7 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 	if len(rm.recentBugReverts) >= rm.config.ConsecutiveRevertsPause {
 		log.Printf("CIRCUIT BREAKER: %d bug reverts in %d minutes, pausing",
 			len(rm.recentBugReverts), rm.config.RevertWindowMinutes)
-		rm.state.Transition(StatePaused)
+		rm.notifyTrip("consecutive_bug_reverts", StatePaused)
 	}
 
 	// --- Competitive-revert stale-data alert (rate-limited: once per window) ---
@@ -308,7 +342,7 @@ func (rm *RiskManager) RecordTrade(volumeWei *big.Int, pnlWei *big.Int) {
 	if lossETH > rm.config.DailyLossHaltETH {
 		log.Printf("CIRCUIT BREAKER: daily loss %.4f ETH exceeds threshold %.4f ETH, halting",
 			lossETH, rm.config.DailyLossHaltETH)
-		rm.state.Transition(StateHalted)
+		rm.notifyTrip("daily_loss_exceeded", StateHalted)
 	}
 }
 

@@ -61,6 +61,23 @@ var (
 		Name: "aether_eth_balance",
 		Help: "Current ETH balance of the searcher wallet",
 	})
+	builderSubmissionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aether_executor_builder_submissions_total",
+		Help: "Per-builder bundle submission attempts by result",
+	}, []string{"builder", "result"})
+	builderLatencyMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "aether_executor_builder_latency_ms",
+		Help:    "Per-builder submission round-trip latency in ms",
+		Buckets: []float64{10, 25, 50, 100, 250, 500, 1000, 2000, 5000},
+	}, []string{"builder"})
+	systemStateGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aether_system_state",
+		Help: "Current system state (0=Running, 1=Degraded, 2=Paused, 3=Halted)",
+	})
+	circuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aether_circuit_breaker_trips_total",
+		Help: "Circuit breaker trip count by reason",
+	}, []string{"reason"})
 )
 
 func init() {
@@ -74,6 +91,10 @@ func init() {
 		gasPriceGwei,
 		dailyPnlEth,
 		ethBalanceGauge,
+		builderSubmissionsTotal,
+		builderLatencyMs,
+		systemStateGauge,
+		circuitBreakerTripsTotal,
 	)
 }
 
@@ -118,6 +139,23 @@ func recordBundleIncluded(profitWei *big.Int, gasGwei float64, gasUsed uint64) {
 
 func recordRiskRejection() {
 	riskRejections.Inc()
+}
+
+func recordBuilderResult(builder string, success bool, latency time.Duration) {
+	result := "failure"
+	if success {
+		result = "success"
+	}
+	builderSubmissionsTotal.WithLabelValues(builder, result).Inc()
+	builderLatencyMs.WithLabelValues(builder).Observe(float64(latency.Milliseconds()))
+}
+
+func setSystemState(s int) {
+	systemStateGauge.Set(float64(s))
+}
+
+func recordCircuitBreakerTrip(reason string) {
+	circuitBreakerTripsTotal.WithLabelValues(reason).Inc()
 }
 
 func addBigIntCounter(counter prometheus.Counter, value *big.Int) {

@@ -198,6 +198,7 @@ func main() {
 	}
 	bundler := NewBundleConstructor(nonceManager, gasOracle, txSigner, chainID.Int64())
 	riskMgr := risk.NewRiskManager(loadRiskConfig())
+	riskMgr.SetMetricsObserver(executorMetricsObserver{})
 
 	// Live searcher ETH balance, written by balanceWatchLoop and read by
 	// consumeArbStream → processArb → risk.PreflightCheck. When no searcher
@@ -428,5 +429,35 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 				log.Printf("Skipped arb %s (risk-manager veto or below threshold)", arb.Id)
 			}
 		}
+	}
+}
+
+// executorMetricsObserver adapts risk-layer state events to Prometheus.
+// Kept as a struct so cmd/executor keeps the Prometheus dependency and
+// internal/risk stays pure.
+type executorMetricsObserver struct{}
+
+func (executorMetricsObserver) OnStateChange(s risk.SystemState) {
+	setSystemState(stateToInt(s))
+}
+
+func (executorMetricsObserver) OnCircuitBreakerTrip(reason string) {
+	recordCircuitBreakerTrip(reason)
+}
+
+// stateToInt maps system states to a numeric gauge value. -1 surfaces an
+// anomaly on dashboards if a new state is added without updating this mapping.
+func stateToInt(s risk.SystemState) int {
+	switch s {
+	case risk.StateRunning:
+		return 0
+	case risk.StateDegraded:
+		return 1
+	case risk.StatePaused:
+		return 2
+	case risk.StateHalted:
+		return 3
+	default:
+		return -1
 	}
 }
