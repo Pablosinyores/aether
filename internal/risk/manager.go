@@ -2,7 +2,7 @@ package risk
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -146,7 +146,7 @@ func (rm *RiskManager) SetMetricsObserver(obs MetricsObserver) {
 // notifyTrip transitions state and notifies the observer. Caller holds rm.mu.
 func (rm *RiskManager) notifyTrip(reason string, newState SystemState) {
 	if err := rm.state.Transition(newState); err != nil {
-		log.Printf("CIRCUIT BREAKER: transition to %s failed: %v", newState, err)
+		slog.Error("circuit breaker transition failed", "new_state", newState, "err", err)
 		return
 	}
 	if rm.metricsObs != nil {
@@ -206,8 +206,13 @@ func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) fl
 
 	tipShare = clampTip(tipShare, rm.config.MinTipSharePct, rm.config.MaxTipSharePct)
 	if tipShare != rm.lastTipSharePct {
-		log.Printf("TIP STRATEGY: tip share adjusted %.1f%% -> %.1f%% (inclusion %.1f%%, miss %.1f%%, gas %.1f gwei)",
-			rm.lastTipSharePct, tipShare, inclusionRate, missRate, gasGwei)
+		slog.Info("tip strategy adjusted",
+			"from_pct", rm.lastTipSharePct,
+			"to_pct", tipShare,
+			"inclusion_pct", inclusionRate,
+			"miss_pct", missRate,
+			"gas_gwei", gasGwei,
+		)
 	}
 
 	rm.lastAdjustedAtIdx = rm.bundleResultIdx
@@ -310,8 +315,10 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 
 	// --- Bug-revert circuit breaker ---
 	if len(rm.recentBugReverts) >= rm.config.ConsecutiveRevertsPause {
-		log.Printf("CIRCUIT BREAKER: %d bug reverts in %d minutes, pausing",
-			len(rm.recentBugReverts), rm.config.RevertWindowMinutes)
+		slog.Error("circuit breaker: consecutive bug reverts, pausing",
+			"count", len(rm.recentBugReverts),
+			"window_min", rm.config.RevertWindowMinutes,
+		)
 		rm.notifyTrip("consecutive_bug_reverts", StatePaused)
 	}
 
@@ -321,8 +328,11 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 	if totalReverts > 0 && now.Sub(rm.lastCompAlertTime) >= window {
 		compPct := float64(len(rm.recentCompReverts)) / float64(totalReverts) * 100
 		if compPct >= rm.config.CompetitiveRevertAlertPct {
-			log.Printf("ALERT: competitive revert rate %.0f%% (>= %.0f%%) in last %d min — possible stale data",
-				compPct, rm.config.CompetitiveRevertAlertPct, rm.config.RevertWindowMinutes)
+			slog.Warn("high competitive revert rate, possible stale data",
+				"comp_pct", compPct,
+				"threshold_pct", rm.config.CompetitiveRevertAlertPct,
+				"window_min", rm.config.RevertWindowMinutes,
+			)
 			rm.lastCompAlertTime = now
 		}
 	}
@@ -340,8 +350,10 @@ func (rm *RiskManager) RecordTrade(volumeWei *big.Int, pnlWei *big.Int) {
 	// Check daily loss halt
 	lossETH := WeiToETH(new(big.Int).Neg(rm.dailyPnL))
 	if lossETH > rm.config.DailyLossHaltETH {
-		log.Printf("CIRCUIT BREAKER: daily loss %.4f ETH exceeds threshold %.4f ETH, halting",
-			lossETH, rm.config.DailyLossHaltETH)
+		slog.Error("circuit breaker: daily loss threshold exceeded, halting",
+			"loss_eth", lossETH,
+			"threshold_eth", rm.config.DailyLossHaltETH,
+		)
 		rm.notifyTrip("daily_loss_exceeded", StateHalted)
 	}
 }
@@ -387,7 +399,7 @@ func (rm *RiskManager) maybeResetDaily() {
 		rm.dailyVolume = big.NewInt(0)
 		rm.dailyPnL = big.NewInt(0)
 		rm.dailyResetTime = time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour)
-		log.Println("Daily counters reset")
+		slog.Info("daily counters reset")
 	}
 }
 

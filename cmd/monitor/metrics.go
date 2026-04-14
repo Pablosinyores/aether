@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -42,7 +42,7 @@ func (m *Metrics) ServeMetrics(addr string) error {
 	mux.HandleFunc("/metrics", m.handleMetrics)
 	mux.HandleFunc("/health", m.handleHealth)
 
-	log.Printf("Metrics server listening on %s", addr)
+	slog.Info("metrics server listening", "addr", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -96,6 +96,8 @@ func (m *Metrics) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	fmt.Println("aether-monitor: metrics, dashboard, and alerting service")
 
 	metricsPort := os.Getenv("METRICS_PORT")
@@ -114,20 +116,22 @@ func main() {
 	// Start metrics server
 	go func() {
 		if err := metrics.ServeMetrics(":" + metricsPort); err != nil {
-			log.Fatalf("Metrics server failed: %v", err)
+			slog.Error("metrics server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	// Start dashboard
 	go func() {
 		if err := dashboard.ServeDashboard(":" + dashboardPort); err != nil {
-			log.Fatalf("Dashboard server failed: %v", err)
+			slog.Error("dashboard server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
-	log.Println("Monitor service started")
-	log.Printf("Metrics: http://localhost:%s/metrics", metricsPort)
-	log.Printf("Dashboard: http://localhost:%s/", dashboardPort)
+	slog.Info("monitor service started")
+	slog.Info("metrics endpoint", "url", fmt.Sprintf("http://localhost:%s/metrics", metricsPort))
+	slog.Info("dashboard endpoint", "url", fmt.Sprintf("http://localhost:%s/", dashboardPort))
 
 	// Send startup alert
 	alerter.Send(SeverityInfo, "System Started", "Aether monitor service started")
