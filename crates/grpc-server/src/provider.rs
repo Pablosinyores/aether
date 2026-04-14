@@ -66,6 +66,7 @@ pub struct RpcProvider {
     config: ProviderConfig,
     event_channels: Arc<EventChannels>,
     node_pool: NodePool,
+    metrics: Option<Arc<crate::metrics::EngineMetrics>>,
 }
 
 impl RpcProvider {
@@ -102,7 +103,16 @@ impl RpcProvider {
             config,
             event_channels,
             node_pool,
+            metrics: None,
         }
+    }
+
+    /// Attach the engine-wide metrics handle so decode failures and other
+    /// provider-side events can be counted. Optional: when unset (e.g. in
+    /// tests), failures are still logged but not counted.
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::EngineMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Build a single-node `NodePool` from a URL, inferring the transport type.
@@ -434,8 +444,9 @@ impl RpcProvider {
         let address = log.address();
         let topics = log.topics();
         let data = &log.data().data;
-        if let Some(event) = event_decoder::decode_log(topics, data, address, None) {
-            self.event_channels.dispatch_pool_update(event);
+        match event_decoder::decode_log(topics, data, address, None) {
+            Some(event) => self.event_channels.dispatch_pool_update(event),
+            None => self.record_decode_failure(address, topics),
         }
     }
 
@@ -452,10 +463,28 @@ impl RpcProvider {
     /// Process raw logs from a block and dispatch decoded pool events.
     pub fn process_logs(&self, logs: &[(Address, Vec<B256>, Vec<u8>)]) {
         for (address, topics, data) in logs {
-            if let Some(event) = event_decoder::decode_log(topics, data, *address, None) {
-                self.event_channels.dispatch_pool_update(event);
+            match event_decoder::decode_log(topics, data, *address, None) {
+                Some(event) => self.event_channels.dispatch_pool_update(event),
+                None => self.record_decode_failure(*address, topics),
             }
         }
+    }
+
+    /// Surface a decoder drop to operators. Bumps the `aether_decode_errors_total`
+    /// counter (if metrics are attached) and logs the offending pool address and
+    /// first topic. Called from the hot path, so it must be cheap — the counter
+    /// is a single atomic increment and the `warn!` emits no allocations when
+    /// disabled at runtime.
+    fn record_decode_failure(&self, address: Address, topics: &[B256]) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.inc_decode_errors();
+        }
+        let topic0 = topics.first().copied().unwrap_or_default();
+        warn!(
+            pool = %address,
+            %topic0,
+            "Event decoder returned None; log skipped"
+        );
     }
 
     /// Get the configured RPC URL.
