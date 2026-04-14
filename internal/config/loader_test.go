@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -535,3 +536,73 @@ func validRiskFileConfig() RiskFileConfig {
 	cfg.PositionLimits.MaxTipSharePct = 95
 	return cfg
 }
+
+// ---------------------------------------------------------------------------
+// Executor config
+// ---------------------------------------------------------------------------
+
+func TestValidateExecutorConfig_Valid(t *testing.T) {
+	t.Parallel()
+	cfg := ExecutorFileConfig{
+		ExecutorAddress: "0x1111111111111111111111111111111111111111",
+		ExpectedChainID: 1,
+	}
+	if err := ValidateExecutorConfig(cfg); err != nil {
+		t.Fatalf("expected valid, got error: %v", err)
+	}
+}
+
+func TestValidateExecutorConfig_Errors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		cfg    ExecutorFileConfig
+		errSub string
+	}{
+		{"empty address", ExecutorFileConfig{"", 1}, "executor_address must not be empty"},
+		{"zero address", ExecutorFileConfig{"0x0000000000000000000000000000000000000000", 1}, "must not be the zero address"},
+		{"missing 0x prefix", ExecutorFileConfig{"1111111111111111111111111111111111111111", 1}, "0x-prefixed"},
+		{"too short", ExecutorFileConfig{"0x1234", 1}, "0x-prefixed"},
+		{"zero chain id", ExecutorFileConfig{"0x1111111111111111111111111111111111111111", 0}, "expected_chain_id must be > 0"},
+		{"negative chain id", ExecutorFileConfig{"0x1111111111111111111111111111111111111111", -1}, "expected_chain_id must be > 0"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateExecutorConfig(tc.cfg)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errSub)
+			}
+			if !strings.Contains(err.Error(), tc.errSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.errSub)
+			}
+		})
+	}
+}
+
+func TestLoadExecutorConfig_EnvExpansion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "executor.yaml")
+	body := "executor_address: ${TEST_AETHER_EXEC_ADDR}\nexpected_chain_id: 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("TEST_AETHER_EXEC_ADDR", "0x2222222222222222222222222222222222222222")
+	cfg, err := LoadExecutorConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.ExecutorAddress != "0x2222222222222222222222222222222222222222" {
+		t.Errorf("env expansion failed: got %q", cfg.ExecutorAddress)
+	}
+}
+
+func TestLoadExecutorConfig_MissingFile(t *testing.T) {
+	t.Parallel()
+	_, err := LoadExecutorConfig("/nonexistent/executor.yaml")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+

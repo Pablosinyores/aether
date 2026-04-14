@@ -224,6 +224,61 @@ type NodesFileConfig struct {
 	MinHealthyNodes int         `yaml:"min_healthy_nodes"`
 }
 
+// ---------------------------------------------------------------------------
+// Executor config (config/executor.yaml)
+// ---------------------------------------------------------------------------
+
+// ExecutorFileConfig maps the executor.yaml file structure.
+type ExecutorFileConfig struct {
+	ExecutorAddress string `yaml:"executor_address"`
+	ExpectedChainID int64  `yaml:"expected_chain_id"`
+}
+
+// LoadExecutorConfig reads and parses an executor YAML config file.
+// Environment variables in ${VAR} format are expanded before parsing,
+// so AETHER_EXECUTOR_ADDRESS can be injected via the yaml itself.
+func LoadExecutorConfig(path string) (ExecutorFileConfig, error) {
+	var cfg ExecutorFileConfig
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("read executor config %s: %w", path, err)
+	}
+
+	data = expandEnvVars(data)
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse executor config %s: %w", path, err)
+	}
+
+	if err := ValidateExecutorConfig(cfg); err != nil {
+		return cfg, fmt.Errorf("validate executor config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// ValidateExecutorConfig ensures required fields are present and well-formed.
+// Address syntax is validated here; on-chain bytecode check happens at runtime
+// against the connected Ethereum node.
+func ValidateExecutorConfig(cfg ExecutorFileConfig) error {
+	if cfg.ExecutorAddress == "" {
+		return fmt.Errorf("executor_address must not be empty")
+	}
+	addr := cfg.ExecutorAddress
+	if len(addr) != 42 || addr[:2] != "0x" {
+		return fmt.Errorf("executor_address must be a 0x-prefixed 20-byte hex string, got %q", addr)
+	}
+	zero := "0x0000000000000000000000000000000000000000"
+	if addr == zero {
+		return fmt.Errorf("executor_address must not be the zero address")
+	}
+	if cfg.ExpectedChainID <= 0 {
+		return fmt.Errorf("expected_chain_id must be > 0, got %d", cfg.ExpectedChainID)
+	}
+	return nil
+}
+
 // expandEnvVars replaces ${VAR} patterns in the input with their
 // corresponding environment variable values. Unset variables are
 // replaced with an empty string.

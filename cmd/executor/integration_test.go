@@ -112,8 +112,10 @@ func TestConsumeArbStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	lb := NewLiveBalance()
+	lb.Set(0.5)
 	consumeArbStream(ctx, client, bundler, submitter, rm,
-		"0x0000000000000000000000000000000000000000", 0.5)
+		"0x0000000000000000000000000000000000000000", lb)
 
 	// Verify bundle tracking was updated
 	missRate := rm.BundleMissRate()
@@ -218,8 +220,10 @@ func TestGracefulShutdown(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
+		lb := NewLiveBalance()
+		lb.Set(0.5)
 		consumeArbStream(ctx, client, bundler, submitter, rm,
-			"0x0000000000000000000000000000000000000000", 0.5)
+			"0x0000000000000000000000000000000000000000", lb)
 		close(done)
 	}()
 
