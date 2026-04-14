@@ -14,6 +14,7 @@ services:
       - reth-ipc:/tmp
     environment:
       - RUST_LOG=info
+      - LOG_FORMAT=json
       - AETHER_CONFIG_DIR=/app/config
       - GRPC_ADDRESS=0.0.0.0:50051
       - ETH_RPC_URL=${ETH_RPC_URL:-}
@@ -103,7 +104,32 @@ services:
     networks:
       - aether-net
 
-  # Loki: deferred — logs available via `docker logs`, Loki planned for production deployment
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: aether-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    restart: unless-stopped
+    networks:
+      - aether-net
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: aether-promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-data:/var/lib/promtail
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - aether-net
 
   # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
   # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
@@ -127,6 +153,8 @@ services:
 volumes:
   grafana-data:
   alertmanager-data:
+  loki-data:
+  promtail-data:
   reth-data:
   reth-ipc:
 
