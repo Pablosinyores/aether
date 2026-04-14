@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Metrics holds all Prometheus-style metrics
@@ -99,6 +101,19 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	fmt.Println("aether-monitor: metrics, dashboard, and alerting service")
+
+	shutdownTracer, err := initTracer(context.Background(), "aether-monitor")
+	if err != nil {
+		slog.Warn("otlp tracer init failed, continuing without traces", "err", err)
+		shutdownTracer = func(context.Context) error { return nil }
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(flushCtx); err != nil {
+			slog.Warn("tracer shutdown error", "err", err)
+		}
+	}()
 
 	metricsPort := os.Getenv("METRICS_PORT")
 	if metricsPort == "" {

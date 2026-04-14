@@ -14,12 +14,18 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aether-arb/aether/internal/config"
 	aethergrpc "github.com/aether-arb/aether/internal/grpc"
 	pb "github.com/aether-arb/aether/internal/pb"
 	"github.com/aether-arb/aether/internal/risk"
 )
+
+var tracer trace.Tracer = otel.Tracer("aether-executor")
 
 // Config holds executor service configuration.
 // ChainID, ExecutorAddr, and the live ETH balance are no longer carried here —
@@ -91,6 +97,23 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	fmt.Println("aether-executor: bundle construction and submission service")
+
+	// Initialise OTLP tracing. No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
+	tracerShutdownCtx, tracerShutdownCancel := context.WithCancel(context.Background())
+	defer tracerShutdownCancel()
+	shutdownTracer, err := initTracer(tracerShutdownCtx, "aether-executor")
+	if err != nil {
+		slog.Warn("otlp tracer init failed, continuing without traces", "err", err)
+		shutdownTracer = func(context.Context) error { return nil }
+	}
+	tracer = otel.Tracer("aether-executor")
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(flushCtx); err != nil {
+			slog.Warn("tracer shutdown error", "err", err)
+		}
+	}()
 
 	cfg := loadConfig()
 
@@ -303,6 +326,15 @@ func processArb(
 	executorAddr string,
 	ethBalance float64,
 ) (submitted bool, err error) {
+	ctx, span := tracer.Start(ctx, "processArb",
+		trace.WithAttributes(
+			attribute.String("arb_id", arb.Id),
+			attribute.Int("hops", len(arb.Hops)),
+			attribute.Int64("target_block", int64(arb.BlockNumber+1)),
+		),
+	)
+	defer span.End()
+
 	profitWei := new(big.Int).SetBytes(arb.NetProfitWei)
 	tradeValueWei := new(big.Int).SetBytes(arb.FlashloanAmount)
 
@@ -310,17 +342,31 @@ func processArb(
 	gasGwei := gasFees.GasPriceGwei
 	tipSharePct := rm.CalculateTipShare(profitWei, gasGwei)
 
+	_, preflightSpan := tracer.Start(ctx, "preflight")
 	result := rm.PreflightCheck(profitWei, tradeValueWei, gasGwei, tipSharePct, ethBalance)
+	preflightSpan.SetAttributes(
+		attribute.Bool("approved", result.Approved),
+		attribute.String("reason", result.Reason),
+	)
+	preflightSpan.End()
 	if !result.Approved {
 		recordRiskRejection()
 		slog.InfoContext(ctx, "arb rejected by preflight", "arb_id", arb.Id, "reason", result.Reason)
+		span.SetAttributes(attribute.String("outcome", "rejected"))
 		return false, nil
 	}
 
+	_, buildSpan := tracer.Start(ctx, "bundle.build")
 	bundle, err := bundler.BuildBundle(arb.Calldata, executorAddr, arb.TotalGas, arb.BlockNumber+1)
 	if err != nil {
+		buildSpan.RecordError(err)
+		buildSpan.SetStatus(codes.Error, "build bundle failed")
+		buildSpan.End()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "build bundle failed")
 		return false, fmt.Errorf("build bundle: %w", err)
 	}
+	buildSpan.End()
 
 	// Submit to all builders
 	recordEndToEndLatency(receivedAt)
@@ -338,6 +384,11 @@ func processArb(
 	}
 	rm.RecordBundleResult(included)
 
+	span.SetAttributes(
+		attribute.Int("builders", len(results)),
+		attribute.Int("accepted", successes),
+		attribute.Bool("included", included),
+	)
 	return included, nil
 }
 

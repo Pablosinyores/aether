@@ -12,6 +12,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // BuilderConfig holds configuration for a block builder.
@@ -104,7 +108,20 @@ func NewSubmitter(builders []BuilderConfig, searcherKey string) (*Submitter, err
 
 // SubmitToAll sends the bundle to all enabled builders concurrently.
 func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []SubmissionResult {
+	enabled := 0
+	for _, b := range s.builders {
+		if b.Enabled {
+			enabled++
+		}
+	}
+
+	ctx, fanoutSpan := tracer.Start(ctx, "submit.fanout",
+		trace.WithAttributes(attribute.Int("builders_enabled", enabled)),
+	)
+	defer fanoutSpan.End()
+
 	if s.submitFn == nil && len(bundle.RawTxs) == 0 {
+		fanoutSpan.SetStatus(codes.Error, "no signed transactions in bundle")
 		return []SubmissionResult{{
 			Builder: "all",
 			Success: false,
@@ -124,9 +141,19 @@ func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []Submissio
 			defer wg.Done()
 			start := time.Now()
 
-			result := s.submitToBuilder(ctx, b, bundle)
+			builderCtx, builderSpan := tracer.Start(ctx, "submit.builder",
+				trace.WithAttributes(attribute.String("builder", b.Name)),
+			)
+			result := s.submitToBuilder(builderCtx, b, bundle)
 			result.Latency = time.Since(start)
 			s.recordMetrics(b.Name, result)
+			if result.Success {
+				builderSpan.SetAttributes(attribute.String("bundle_hash", result.BundleHash))
+			} else if result.Error != nil {
+				builderSpan.RecordError(result.Error)
+				builderSpan.SetStatus(codes.Error, "builder rejected bundle")
+			}
+			builderSpan.End()
 
 			resultCh <- result
 		}(builder)
