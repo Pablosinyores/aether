@@ -142,15 +142,14 @@ mod tests {
         channels.dispatch_pool_update(event);
 
         let received = rx.recv().await.expect("should receive pool update");
-        match received {
-            PoolEvent::ReserveUpdate {
-                reserve0, reserve1, ..
-            } => {
-                assert_eq!(reserve0, U256::from(1000u64));
-                assert_eq!(reserve1, U256::from(2000u64));
-            }
-            other => panic!("Expected ReserveUpdate, got {:?}", other),
-        }
+        let PoolEvent::ReserveUpdate {
+            reserve0, reserve1, ..
+        } = received
+        else {
+            panic!("dispatch returned unexpected variant");
+        };
+        assert_eq!(reserve0, U256::from(1000u64));
+        assert_eq!(reserve1, U256::from(2000u64));
     }
 
     // ── Subscribe/dispatch new block ──
@@ -226,13 +225,11 @@ mod tests {
         let r3 = rx3.recv().await.expect("rx3 should receive");
 
         for received in [r1, r2, r3] {
-            match received {
-                PoolEvent::V3Update { tick, liquidity, .. } => {
-                    assert_eq!(tick, -50);
-                    assert_eq!(liquidity, 12345);
-                }
-                other => panic!("Expected V3Update, got {:?}", other),
-            }
+            let PoolEvent::V3Update { tick, liquidity, .. } = received else {
+                panic!("dispatch returned unexpected variant");
+            };
+            assert_eq!(tick, -50);
+            assert_eq!(liquidity, 12345);
         }
     }
 
