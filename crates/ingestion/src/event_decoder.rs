@@ -269,20 +269,19 @@ mod tests {
         let event = decode_log(&topics, &data, pool_addr, None);
         assert!(event.is_some());
 
-        match event.unwrap() {
-            PoolEvent::ReserveUpdate {
-                pool,
-                protocol,
-                reserve0: r0,
-                reserve1: r1,
-            } => {
-                assert_eq!(pool, pool_addr);
-                assert_eq!(protocol, ProtocolType::UniswapV2);
-                assert_eq!(r0, reserve0);
-                assert_eq!(r1, reserve1);
-            }
-            other => panic!("Expected ReserveUpdate, got {:?}", other),
-        }
+        let PoolEvent::ReserveUpdate {
+            pool,
+            protocol,
+            reserve0: r0,
+            reserve1: r1,
+        } = event.unwrap()
+        else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(pool, pool_addr);
+        assert_eq!(protocol, ProtocolType::UniswapV2);
+        assert_eq!(r0, reserve0);
+        assert_eq!(r1, reserve1);
     }
 
     #[test]
@@ -298,12 +297,10 @@ mod tests {
         let topics = vec![EventSignatures::sync_topic()];
 
         let event = decode_log(&topics, &data, pool_addr, Some(ProtocolType::SushiSwap));
-        match event.unwrap() {
-            PoolEvent::ReserveUpdate { protocol, .. } => {
-                assert_eq!(protocol, ProtocolType::SushiSwap);
-            }
-            other => panic!("Expected ReserveUpdate, got {:?}", other),
-        }
+        let PoolEvent::ReserveUpdate { protocol, .. } = event.unwrap() else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(protocol, ProtocolType::SushiSwap);
     }
 
     #[test]
@@ -355,20 +352,19 @@ mod tests {
         let event = decode_log(&topics, &data, pool_addr, None);
         assert!(event.is_some());
 
-        match event.unwrap() {
-            PoolEvent::V3Update {
-                pool,
-                sqrt_price_x96,
-                liquidity: liq,
-                tick,
-            } => {
-                assert_eq!(pool, pool_addr);
-                assert_eq!(sqrt_price_x96, sqrt_price);
-                assert_eq!(liq, 5_000_000u128);
-                assert_eq!(tick, 200);
-            }
-            other => panic!("Expected V3Update, got {:?}", other),
-        }
+        let PoolEvent::V3Update {
+            pool,
+            sqrt_price_x96,
+            liquidity: liq,
+            tick,
+        } = event.unwrap()
+        else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(pool, pool_addr);
+        assert_eq!(sqrt_price_x96, sqrt_price);
+        assert_eq!(liq, 5_000_000u128);
+        assert_eq!(tick, 200);
     }
 
     #[test]
@@ -394,12 +390,10 @@ mod tests {
         ];
 
         let event = decode_log(&topics, &data, pool_addr, None);
-        match event.unwrap() {
-            PoolEvent::V3Update { tick, .. } => {
-                assert_eq!(tick, -100);
-            }
-            other => panic!("Expected V3Update, got {:?}", other),
-        }
+        let PoolEvent::V3Update { tick, .. } = event.unwrap() else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(tick, -100);
     }
 
     #[test]
@@ -429,21 +423,20 @@ mod tests {
         let event = decode_log(&topics, &data, pool_addr, None);
         assert!(event.is_some());
 
-        match event.unwrap() {
-            PoolEvent::ReserveUpdate {
-                pool,
-                protocol,
-                reserve0,
-                reserve1,
-            } => {
-                assert_eq!(pool, pool_addr);
-                assert_eq!(protocol, ProtocolType::Curve);
-                // Zeroes because Curve needs on-chain refresh
-                assert_eq!(reserve0, U256::ZERO);
-                assert_eq!(reserve1, U256::ZERO);
-            }
-            other => panic!("Expected ReserveUpdate, got {:?}", other),
-        }
+        let PoolEvent::ReserveUpdate {
+            pool,
+            protocol,
+            reserve0,
+            reserve1,
+        } = event.unwrap()
+        else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(pool, pool_addr);
+        assert_eq!(protocol, ProtocolType::Curve);
+        // Zeroes because Curve needs on-chain refresh
+        assert_eq!(reserve0, U256::ZERO);
+        assert_eq!(reserve1, U256::ZERO);
     }
 
     // ── PairCreated decode tests ──
@@ -478,18 +471,17 @@ mod tests {
         let event = decode_log(&topics, &data, Address::ZERO, None);
         assert!(event.is_some());
 
-        match event.unwrap() {
-            PoolEvent::PoolCreated {
-                token0: t0,
-                token1: t1,
-                pool: p,
-            } => {
-                assert_eq!(t0, token0);
-                assert_eq!(t1, token1);
-                assert_eq!(p, pair);
-            }
-            other => panic!("Expected PoolCreated, got {:?}", other),
-        }
+        let PoolEvent::PoolCreated {
+            token0: t0,
+            token1: t1,
+            pool: p,
+        } = event.unwrap()
+        else {
+            panic!("decoder returned unexpected variant");
+        };
+        assert_eq!(t0, token0);
+        assert_eq!(t1, token1);
+        assert_eq!(p, pair);
     }
 
     #[test]
