@@ -32,11 +32,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize structured logging with tracing.
     // Respects RUST_LOG env var; defaults to `info` level.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // LOG_FORMAT=json switches to a JSON layer for log aggregation (Loki);
+    // any other value keeps the human-readable pretty output for `cargo run`.
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match std::env::var("LOG_FORMAT").as_deref() {
+        Ok("json") => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_env_filter(env_filter)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        }
+    }
 
     info!("Starting Aether gRPC server");
 
