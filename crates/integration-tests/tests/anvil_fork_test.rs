@@ -299,58 +299,54 @@ async fn test_anvil_fork_full_pipeline() {
         let mut pools_seen = std::collections::HashSet::new();
 
         for (address, topics, data) in &raw_logs {
-            if let Some(event) = event_decoder::decode_log(topics, data, *address, None) {
-                match event {
-                    event_decoder::PoolEvent::ReserveUpdate {
+            if let Some(event_decoder::PoolEvent::ReserveUpdate {
+                pool,
+                reserve0,
+                reserve1,
+                ..
+            }) = event_decoder::decode_log(topics, data, *address, None)
+            {
+                if reserve0 == U256::ZERO || reserve1 == U256::ZERO {
+                    continue;
+                }
+
+                // For Sync events, we don't know token addresses from the event.
+                // Use pool address as proxy for token0/token1 indices.
+                // In production, pool metadata provides the token mapping.
+                if pools_seen.insert(pool) {
+                    let idx0 = token_index.get_or_insert(pool);
+                    // Use a deterministic "token1" derived from pool.
+                    let token1_proxy = Address::from_word(B256::from(pool.into_word()));
+                    let idx1 = token_index.get_or_insert(token1_proxy);
+
+                    graph.resize(token_index.len());
+
+                    let r0_f64 = reserve0.to::<u128>() as f64;
+                    let r1_f64 = reserve1.to::<u128>() as f64;
+                    let rate = r1_f64 / r0_f64 * 0.997;
+
+                    let pool_id = PoolId {
+                        address: pool,
+                        protocol: ProtocolType::UniswapV2,
+                    };
+                    graph.add_edge(
+                        idx0,
+                        idx1,
+                        rate,
+                        pool_id,
                         pool,
-                        reserve0,
-                        reserve1,
-                        ..
-                    } => {
-                        if reserve0 == U256::ZERO || reserve1 == U256::ZERO {
-                            continue;
-                        }
-
-                        // For Sync events, we don't know token addresses from the event.
-                        // Use pool address as proxy for token0/token1 indices.
-                        // In production, pool metadata provides the token mapping.
-                        if pools_seen.insert(pool) {
-                            let idx0 = token_index.get_or_insert(pool);
-                            // Use a deterministic "token1" derived from pool.
-                            let token1_proxy = Address::from_word(B256::from(pool.into_word()));
-                            let idx1 = token_index.get_or_insert(token1_proxy);
-
-                            graph.resize(token_index.len());
-
-                            let r0_f64 = reserve0.to::<u128>() as f64;
-                            let r1_f64 = reserve1.to::<u128>() as f64;
-                            let rate = r1_f64 / r0_f64 * 0.997;
-
-                            let pool_id = PoolId {
-                                address: pool,
-                                protocol: ProtocolType::UniswapV2,
-                            };
-                            graph.add_edge(
-                                idx0,
-                                idx1,
-                                rate,
-                                pool_id,
-                                pool,
-                                ProtocolType::UniswapV2,
-                                U256::ZERO,
-                            );
-                            graph.add_edge(
-                                idx1,
-                                idx0,
-                                r0_f64 / r1_f64 * 0.997,
-                                pool_id,
-                                pool,
-                                ProtocolType::UniswapV2,
-                                U256::ZERO,
-                            );
-                        }
-                    }
-                    _ => {} // Ignore non-Sync events for this test.
+                        ProtocolType::UniswapV2,
+                        U256::ZERO,
+                    );
+                    graph.add_edge(
+                        idx1,
+                        idx0,
+                        r0_f64 / r1_f64 * 0.997,
+                        pool_id,
+                        pool,
+                        ProtocolType::UniswapV2,
+                        U256::ZERO,
+                    );
                 }
             }
         }

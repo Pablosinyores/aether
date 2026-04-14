@@ -359,7 +359,7 @@ async fn run_single_e2e_inner(
         dyn_provider,
         bn,
         blk.header.timestamp,
-        blk.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64,
+        blk.header.base_fee_per_gas.unwrap_or(30_000_000_000),
     )
     .ok_or("RpcForkedState failed")?;
 

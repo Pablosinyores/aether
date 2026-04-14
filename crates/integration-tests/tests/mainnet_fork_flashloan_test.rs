@@ -87,7 +87,7 @@ async fn run_flash_loan_test(anvil_url: &str) -> Result<(), String> {
         .ok_or("block not found")?;
 
     let timestamp = block.header.timestamp;
-    let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64;
+    let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000);
 
     phase_times.push(("Phase 1 (provider setup)", t_phase1.elapsed().as_millis()));
     eprintln!("\n=== Flash Loan Arbitrage E2E Test ===");
@@ -435,7 +435,7 @@ async fn run_flash_loan_test(anvil_url: &str) -> Result<(), String> {
         .ok_or("block not found for sim")?;
     let current_ts = current_block_data.header.timestamp;
     let current_base_fee =
-        current_block_data.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64;
+        current_block_data.header.base_fee_per_gas.unwrap_or(30_000_000_000);
 
     let sim_parsed: url::Url = anvil_url.parse().expect("valid URL");
     let sim_provider = ProviderBuilder::new().connect_http(sim_parsed);
