@@ -1,0 +1,253 @@
+/* ── Fonts ── */
+:root {
+  --vp-font-family-base: 'Space Grotesk', sans-serif;
+  --vp-font-family-mono: 'JetBrains Mono', monospace;
+}
+
+/* ── Brand Colors ── */
+:root {
+  --vp-c-brand-1: #7c6af6;
+  --vp-c-brand-2: #9580ff;
+  --vp-c-brand-3: #b4a0ff;
+  --vp-c-brand-soft: rgba(124, 106, 246, 0.14);
+}
+
+.dark {
+  --vp-c-brand-1: #9580ff;
+  --vp-c-brand-2: #b4a0ff;
+  --vp-c-brand-3: #d0c4ff;
+  --vp-c-brand-soft: rgba(149, 128, 255, 0.16);
+
+  --vp-c-bg: #0f0f14;
+  --vp-c-bg-alt: #15151c;
+  --vp-c-bg-elv: #1a1a24;
+  --vp-c-bg-soft: #1e1e2a;
+}
+
+/* ── Hero Section ── */
+.VPHero .name {
+  background: linear-gradient(135deg, #9580ff 0%, #6c5ce7 50%, #a29bfe 100%) !important;
+  -webkit-background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  background-clip: text !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em;
+}
+
+.VPHero .text {
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+}
+
+.VPHero .tagline {
+  font-size: 1.1rem !important;
+  line-height: 1.6 !important;
+  opacity: 0.85;
+}
+
+/* Hero gradient glow */
+.VPHero .image-bg {
+  background: radial-gradient(circle at center, rgba(124, 106, 246, 0.2) 0%, transparent 70%) !important;
+  animation: pulse-glow 4s ease-in-out infinite;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+/* ── Feature Cards ── */
+.VPFeatures .VPFeature {
+  border: 1px solid var(--vp-c-bg-soft);
+  border-radius: 12px;
+  transition: all 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.VPFeatures .VPFeature::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--vp-c-brand-1), transparent);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.VPFeatures .VPFeature:hover {
+  transform: translateY(-4px);
+  border-color: var(--vp-c-brand-soft);
+  box-shadow: 0 12px 40px rgba(124, 106, 246, 0.12);
+}
+
+.VPFeatures .VPFeature:hover::before {
+  opacity: 1;
+}
+
+.VPFeature .title {
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+}
+
+.VPFeature .details {
+  opacity: 0.8;
+  line-height: 1.6;
+}
+
+/* ── Staggered feature card entrance ── */
+.VPFeatures .VPFeature {
+  opacity: 0;
+  transform: translateY(20px);
+  animation: card-enter 0.5s ease forwards;
+}
+
+.VPFeatures .VPFeature:nth-child(1) { animation-delay: 0.1s; }
+.VPFeatures .VPFeature:nth-child(2) { animation-delay: 0.2s; }
+.VPFeatures .VPFeature:nth-child(3) { animation-delay: 0.3s; }
+.VPFeatures .VPFeature:nth-child(4) { animation-delay: 0.4s; }
+.VPFeatures .VPFeature:nth-child(5) { animation-delay: 0.5s; }
+.VPFeatures .VPFeature:nth-child(6) { animation-delay: 0.6s; }
+
+@keyframes card-enter {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Sidebar ── */
+.VPSidebar .group .text {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* ── Content ── */
+.vp-doc h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, var(--vp-c-brand-1), var(--vp-c-brand-3));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.vp-doc h2 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  border-bottom: 1px solid var(--vp-c-bg-soft);
+  padding-bottom: 0.5rem;
+}
+
+.vp-doc h3 {
+  font-weight: 600;
+}
+
+/* ── Code blocks ── */
+.vp-doc div[class*='language-'] {
+  border-radius: 10px;
+  border: 1px solid var(--vp-c-bg-soft);
+}
+
+.dark .vp-doc div[class*='language-'] {
+  background-color: #12121a !important;
+}
+
+/* ── Tables ── */
+.vp-doc table {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--vp-c-bg-soft);
+}
+
+.vp-doc th {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  background: var(--vp-c-bg-soft) !important;
+}
+
+.vp-doc tr {
+  transition: background 0.2s ease;
+}
+
+.vp-doc tr:hover {
+  background: var(--vp-c-bg-soft);
+}
+
+/* ── Custom containers (tip, warning, danger) ── */
+.vp-doc .custom-block {
+  border-radius: 10px;
+  border-left-width: 3px;
+}
+
+/* ── Mermaid diagrams ── */
+.mermaid {
+  background: var(--vp-c-bg-alt) !important;
+  border-radius: 12px;
+  padding: 1.5rem;
+  border: 1px solid var(--vp-c-bg-soft);
+  margin: 1.5rem 0;
+}
+
+/* ── Smooth page transitions ── */
+.VPContent {
+  animation: page-fade 0.3s ease;
+}
+
+@keyframes page-fade {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Nav bar blur ── */
+.VPNav {
+  backdrop-filter: blur(12px) !important;
+}
+
+.dark .VPNav {
+  background: rgba(15, 15, 20, 0.85) !important;
+}
+
+/* ── Scrollbar (dark mode) ── */
+.dark ::-webkit-scrollbar {
+  width: 6px;
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: var(--vp-c-bg);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: var(--vp-c-bg-soft);
+  border-radius: 3px;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: var(--vp-c-brand-soft);
+}
+
+/* ── Action buttons ── */
+.VPHero .actions .VPButton.brand {
+  background: linear-gradient(135deg, #7c6af6, #6c5ce7) !important;
+  border: none !important;
+  font-weight: 600;
+  transition: all 0.3s ease;
+}
+
+.VPHero .actions .VPButton.brand:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(124, 106, 246, 0.3);
+}
+
+.VPHero .actions .VPButton.alt {
+  font-weight: 500;
+  transition: all 0.3s ease;
+}
+
+.VPHero .actions .VPButton.alt:hover {
+  transform: translateY(-2px);
+}
