@@ -369,10 +369,12 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 				arb.Id, len(arb.Hops), arb.TotalGas, arb.BlockNumber)
 
 			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, ethBalance)
-			if err != nil {
+			switch {
+			case err != nil:
 				log.Printf("Error processing arb %s: %v", arb.Id, err)
+			case !submitted:
+				log.Printf("Skipped arb %s (risk-manager veto or below threshold)", arb.Id)
 			}
-			_ = submitted
 		}
 	}
 }
