@@ -94,6 +94,16 @@ struct Args {
     /// Print the top-N cycles.
     #[arg(long, default_value_t = 5)]
     top: usize,
+
+    /// Intra-block replay mode. Spawns Anvil forked at `block - 1`,
+    /// replays each tx of the target block via impersonation, and runs the
+    /// detector between every tx to catch intra-block arbitrage windows.
+    #[arg(long, default_value_t = false)]
+    full_block: bool,
+
+    /// Port for the Anvil fork (intra-block mode only).
+    #[arg(long, default_value_t = 8546)]
+    anvil_port: u16,
 }
 
 #[derive(serde::Deserialize)]
@@ -365,8 +375,13 @@ async fn main() -> Result<()> {
 
     let rpc_url = args
         .rpc_url
+        .clone()
         .or_else(|| std::env::var("ETH_RPC_URL").ok())
         .context("--rpc-url not set and ETH_RPC_URL env var missing")?;
+
+    if args.full_block {
+        return run_full_block_replay(&args, &rpc_url).await;
+    }
 
     println!("== Aether Replay ==");
     println!("  Target block:    {}", args.block);
@@ -467,5 +482,340 @@ async fn main() -> Result<()> {
 
     println!("\n  Total time:      {} ms", t_total.elapsed().as_millis());
 
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase 1b — intra-block replay via Anvil
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Anvil is used here purely as a **block replayer** — we spawn it forked at
+// `block - 1`, feed each historical tx of the target block through via
+// impersonation, and query pool state between every tx to see what the
+// detector would have found at every intermediate point.
+//
+// Aether's candidate arb tx (inserted at each detection point) is still
+// simulated via `aether-simulator::EvmSimulator` (revm) in the production path
+// — Anvil never simulates Aether's tx. This keeps the production simulator
+// honest while giving us cheap mid-block state computation.
+
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use alloy::rpc::types::BlockTransactionsKind;
+
+struct AnvilHandle {
+    child: Child,
+    url: String,
+}
+
+impl Drop for AnvilHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_anvil(fork_url: &str, fork_block: u64, port: u16) -> Result<AnvilHandle> {
+    let child = Command::new("anvil")
+        .arg("--fork-url")
+        .arg(fork_url)
+        .arg("--fork-block-number")
+        .arg(fork_block.to_string())
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--auto-impersonate")
+        .arg("--chain-id")
+        .arg("1")
+        .arg("--silent")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn anvil — is foundry installed?")?;
+
+    let url = format!("http://127.0.0.1:{port}");
+    Ok(AnvilHandle { child, url })
+}
+
+async fn wait_for_anvil(url: &str, timeout: Duration) -> Result<()> {
+    let parsed: url::Url = url.parse()?;
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let provider = ProviderBuilder::new().connect_http(parsed.clone());
+        if provider.get_block_number().await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    anyhow::bail!("anvil did not become ready at {url} within {timeout:?}")
+}
+
+/// Query reserves / sqrtPriceX96 for a single pool at "latest" against an RPC.
+async fn fetch_one_state_latest(
+    provider: &impl Provider,
+    pool: &LoadedPool,
+) -> Option<PoolState> {
+    let block_id = BlockId::Number(BlockNumberOrTag::Latest);
+    match pool.protocol {
+        ProtocolType::UniswapV2 | ProtocolType::SushiSwap => {
+            let calldata = getReservesCall {}.abi_encode();
+            let tx = TransactionRequest::default()
+                .to(pool.address)
+                .input(calldata.into());
+            let output = provider.call(tx).block(block_id).await.ok()?;
+            if output.len() >= 64 {
+                Some(PoolState::V2 {
+                    r0: U256::from_be_slice(&output[0..32]),
+                    r1: U256::from_be_slice(&output[32..64]),
+                })
+            } else {
+                None
+            }
+        }
+        ProtocolType::UniswapV3 => {
+            let calldata = slot0Call {}.abi_encode();
+            let tx = TransactionRequest::default()
+                .to(pool.address)
+                .input(calldata.into());
+            let output = provider.call(tx).block(block_id).await.ok()?;
+            if output.len() >= 32 {
+                Some(PoolState::V3 {
+                    sqrt_price_x96: U256::from_be_slice(&output[0..32]),
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Initial state fetch for all pools (called once before the tx loop).
+async fn fetch_all_states_latest(
+    provider: &impl Provider,
+    pools: &[LoadedPool],
+) -> Vec<(usize, PoolState)> {
+    let mut out = Vec::with_capacity(pools.len());
+    for (i, pool) in pools.iter().enumerate() {
+        if let Some(state) = fetch_one_state_latest(provider, pool).await {
+            out.push((i, state));
+        }
+    }
+    out
+}
+
+/// Build a `TransactionRequest` from a historical `Transaction` for replay via
+/// impersonation on Anvil. Drops the signature — `--auto-impersonate` accepts
+/// any `from` without a valid signature.
+fn build_impersonation_request(
+    tx: &alloy::rpc::types::Transaction,
+) -> Option<TransactionRequest> {
+    use alloy::consensus::{Transaction as TxTrait, Typed2718};
+
+    let inner = tx.inner.inner();
+    let ty = inner.ty();
+
+    // Skip EIP-4844 blob txs — Anvil's impersonation path doesn't accept
+    // blob-carrying txs cleanly and the execution-layer effect (non-blob
+    // fields) still modifies state via the rollup blob gas accounting.
+    // For mainnet-DEX replay these are rare; we log and skip.
+    if ty == 3 {
+        return None;
+    }
+
+    let mut req = TransactionRequest::default()
+        .from(tx.inner.signer())
+        .value(inner.value())
+        .input(inner.input().clone().into())
+        .nonce(inner.nonce())
+        .gas_limit(inner.gas_limit());
+
+    if let Some(to) = inner.to() {
+        req = req.to(to);
+    }
+
+    // Gas pricing: EIP-1559 vs legacy.
+    if let Some(max_fee) = inner.max_fee_per_gas().into() {
+        req = req.max_fee_per_gas(max_fee);
+    }
+    if let Some(tip) = inner.max_priority_fee_per_gas() {
+        req = req.max_priority_fee_per_gas(tip);
+    }
+    if ty == 0 {
+        // Legacy: use gas_price.
+        req = req.gas_price(inner.gas_price().unwrap_or(0));
+    }
+
+    // Access list (EIP-2930+).
+    if let Some(access_list) = inner.access_list() {
+        req = req.access_list(access_list.clone());
+    }
+
+    Some(req)
+}
+
+/// Intra-block replay entry point.
+async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
+    let fork_block = args.block.saturating_sub(1);
+
+    println!("== Aether Full-Block Replay ==");
+    println!("  Target block:    {}", args.block);
+    println!("  Anvil fork at:   {}  (state pre-block)", fork_block);
+
+    // Load pools.
+    let pools = match &args.pools {
+        Some(path) => load_pools(path)?,
+        None => default_pool_set(),
+    };
+    let v2 = pools
+        .iter()
+        .filter(|p| matches!(p.protocol, ProtocolType::UniswapV2 | ProtocolType::SushiSwap))
+        .count();
+    let v3 = pools
+        .iter()
+        .filter(|p| matches!(p.protocol, ProtocolType::UniswapV3))
+        .count();
+    println!(
+        "  Pools tracked:   {} ({} V2/Sushi, {} V3)",
+        pools.len(),
+        v2,
+        v3
+    );
+
+    // Fetch block N with full txs from the archive RPC (Alchemy).
+    let archive_url: url::Url = rpc_url.parse().context("parse RPC URL")?;
+    let archive = ProviderBuilder::new().connect_http(archive_url);
+    let block = archive
+        .get_block_by_number(BlockNumberOrTag::Number(args.block))
+        .kind(BlockTransactionsKind::Full)
+        .await
+        .context("eth_getBlockByNumber")?
+        .ok_or_else(|| anyhow::anyhow!("block {} not found", args.block))?;
+
+    let txs = match block.transactions {
+        alloy::rpc::types::BlockTransactions::Full(ref v) => v.clone(),
+        _ => anyhow::bail!("expected full-tx block, got hashes only"),
+    };
+    println!("  Block txs:       {}", txs.len());
+
+    // Spawn Anvil fork.
+    println!("\n  Spawning Anvil at port {} ...", args.anvil_port);
+    let anvil = spawn_anvil(rpc_url, fork_block, args.anvil_port)?;
+    wait_for_anvil(&anvil.url, Duration::from_secs(60)).await?;
+    let anvil_url: url::Url = anvil.url.parse()?;
+    let anvil_provider = ProviderBuilder::new().connect_http(anvil_url);
+    println!("  Anvil ready.");
+
+    // Establish initial pool state on Anvil (= state at end of block-1).
+    let initial_states = fetch_all_states_latest(&anvil_provider, &pools).await;
+    println!(
+        "  Initial state:   {}/{} pools populated",
+        initial_states.len(),
+        pools.len()
+    );
+
+    // Maintain a running `pool_idx -> PoolState` map. Only refresh entries
+    // for pools touched by each tx; avoids re-querying all 21 pools every tx.
+    let mut running_states: std::collections::HashMap<usize, PoolState> =
+        initial_states.into_iter().collect();
+
+    // Per-tx replay + detection.
+    let mut opp_events: Vec<(u64, usize)> = Vec::new(); // (tx_index, profitable_cycles)
+    let mut skipped = 0usize;
+    let mut reverted = 0usize;
+    let detector = BellmanFord::new(args.max_hops, args.max_time_us);
+
+    let t_replay = Instant::now();
+    for (i, tx) in txs.iter().enumerate() {
+        let Some(req) = build_impersonation_request(tx) else {
+            skipped += 1;
+            continue;
+        };
+
+        // Impersonate-send. `--auto-impersonate` handles the sig bypass.
+        let pending = match anvil_provider.send_transaction(req).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(tx_index = i, error = %e, "send_transaction failed");
+                skipped += 1;
+                continue;
+            }
+        };
+        let receipt = match pending.get_receipt().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(tx_index = i, error = %e, "get_receipt failed");
+                continue;
+            }
+        };
+        if !receipt.status() {
+            reverted += 1;
+        }
+
+        // Re-read state for pools touched by this tx (via receipt logs).
+        let touched: std::collections::HashSet<Address> =
+            receipt.logs().iter().map(|l| l.address()).collect();
+        let tracked_touched: Vec<usize> = pools
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| touched.contains(&p.address))
+            .map(|(i, _)| i)
+            .collect();
+
+        if tracked_touched.is_empty() {
+            continue;
+        }
+
+        // Refresh only the touched pools; keep the rest of the running state.
+        for &pool_idx in &tracked_touched {
+            if let Some(state) = fetch_one_state_latest(&anvil_provider, &pools[pool_idx]).await {
+                running_states.insert(pool_idx, state);
+            }
+        }
+
+        let states: Vec<(usize, PoolState)> =
+            running_states.iter().map(|(&i, &s)| (i, s)).collect();
+
+        let (graph, token_index) = build_graph(&pools, &states);
+        let cycles = detector.detect_negative_cycles(&graph);
+        let profitable = cycles.iter().filter(|c| c.is_profitable()).count();
+
+        if profitable > 0 {
+            opp_events.push((i as u64, profitable));
+            let tx_hash = receipt.transaction_hash;
+            println!(
+                "  tx #{:3}  {}  → {} profitable cycle(s), touched {} pool(s)",
+                i,
+                &format!("{:#x}", tx_hash)[..14],
+                profitable,
+                tracked_touched.len()
+            );
+            // Show top cycle.
+            if let Some(top) = cycles.iter().find(|c| c.is_profitable()) {
+                let path: Vec<String> = top
+                    .path
+                    .iter()
+                    .filter_map(|&v| token_index.get_address(v).map(token_label))
+                    .collect();
+                println!(
+                    "           top: {:.4}%  path: {}",
+                    top.profit_factor() * 100.0,
+                    path.join(" -> ")
+                );
+            }
+        }
+    }
+    let replay_ms = t_replay.elapsed().as_millis();
+
+    // Summary.
+    println!("\n== Summary ==");
+    println!("  Block:               {}", args.block);
+    println!("  Txs total:           {}", txs.len());
+    println!("  Txs skipped:         {} (e.g. EIP-4844 blobs)", skipped);
+    println!("  Txs reverted:        {}", reverted);
+    println!("  Detection events:    {}", opp_events.len());
+    println!("  Replay time:         {} ms", replay_ms);
+
+    drop(anvil);
     Ok(())
 }
