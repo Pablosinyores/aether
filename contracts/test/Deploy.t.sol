@@ -19,8 +19,8 @@ contract DeployTest is Test {
     function test_deploy_defaultAavePool() public {
         AetherExecutor executor = deployer.runWithParams(DEFAULT_AAVE_POOL, DEFAULT_BALANCER_VAULT, DEFAULT_BANCOR_NETWORK);
         assertEq(executor.aavePool(), DEFAULT_AAVE_POOL);
-        assertEq(executor.balancerVault(), DEFAULT_BALANCER_VAULT);
-        assertEq(executor.bancorNetwork(), DEFAULT_BANCOR_NETWORK);
+        assertEq(executor.protocolRouter(5), DEFAULT_BALANCER_VAULT); // BALANCER_V2
+        assertEq(executor.protocolRouter(6), DEFAULT_BANCOR_NETWORK); // BANCOR_V3
         assertEq(executor.owner(), tx.origin);
     }
 
@@ -45,7 +45,7 @@ contract DeployCustomPoolTest is Test {
     function test_deploy_customAavePool() public {
         AetherExecutor executor = deployer.runWithParams(CUSTOM_POOL, CUSTOM_VAULT, CUSTOM_BANCOR);
         assertEq(executor.aavePool(), CUSTOM_POOL);
-        assertEq(executor.balancerVault(), CUSTOM_VAULT);
-        assertEq(executor.bancorNetwork(), CUSTOM_BANCOR);
+        assertEq(executor.protocolRouter(5), CUSTOM_VAULT); // BALANCER_V2
+        assertEq(executor.protocolRouter(6), CUSTOM_BANCOR); // BANCOR_V3
     }
 }

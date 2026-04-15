@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {AetherExecutor} from "../src/AetherExecutor.sol";
 
 /// @dev Mock Aave pool that reverts on flashLoanSimple (used to test FlashLoanFailed)
@@ -319,24 +320,47 @@ contract AetherExecutorTest is Test {
     }
 
     // -------------------------------------------------------------------------
-    // transferOwnership
+    // transferOwnership (Ownable2Step — two-step handoff)
     // -------------------------------------------------------------------------
 
     function test_transferOwnership() public {
+        // Ownable2Step: transferOwnership only nominates pendingOwner; the new owner
+        // must call acceptOwnership() to complete the handoff.
         address newOwner = address(0x123);
         executor.transferOwnership(newOwner);
+
+        // Owner unchanged after step 1
+        assertEq(executor.owner(), owner);
+        assertEq(executor.pendingOwner(), newOwner);
+
+        // Step 2: new owner accepts
+        vm.prank(newOwner);
+        executor.acceptOwnership();
+
         assertEq(executor.owner(), newOwner);
+        assertEq(executor.pendingOwner(), address(0));
     }
 
     function test_transferOwnership_revert_notOwner() public {
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.transferOwnership(address(0x789));
     }
 
-    function test_transferOwnership_revert_zeroAddress() public {
-        vm.expectRevert(AetherExecutor.ZeroAddress.selector);
+    /// @dev Ownable2Step allows transferOwnership(address(0)) — it CANCELS a pending
+    ///      transfer by clearing pendingOwner. It does NOT revert.
+    function test_transferOwnership_cancel_withZeroAddress() public {
+        // First nominate a new owner
+        address pending = address(0x123);
+        executor.transferOwnership(pending);
+        assertEq(executor.pendingOwner(), pending);
+
+        // Now cancel by passing address(0). This does NOT revert on Ownable2Step.
         executor.transferOwnership(address(0));
+        assertEq(executor.pendingOwner(), address(0), "pendingOwner should be cleared");
+        assertEq(executor.owner(), owner, "owner unchanged after cancel");
     }
 
     // -------------------------------------------------------------------------
@@ -354,7 +378,9 @@ contract AetherExecutorTest is Test {
 
     function test_rescue_revert_notOwner() public {
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.rescue(address(token), 100);
     }
 
@@ -365,7 +391,9 @@ contract AetherExecutorTest is Test {
     function test_executeArb_revert_notOwner() public {
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 9000);
     }
 
@@ -437,7 +465,9 @@ contract AetherExecutorTest is Test {
         spenders[0] = address(aavePool);
 
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.setApprovals(tokens, spenders);
     }
 
