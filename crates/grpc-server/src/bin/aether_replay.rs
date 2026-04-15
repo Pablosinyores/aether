@@ -26,6 +26,7 @@ use tracing_subscriber::EnvFilter;
 
 use aether_common::types::{PoolId, ProtocolType};
 use aether_detector::bellman_ford::BellmanFord;
+use aether_detector::gas as gas_model;
 use aether_detector::opportunity::DetectedCycle;
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
@@ -104,6 +105,17 @@ struct Args {
     /// Port for the Anvil fork (intra-block mode only).
     #[arg(long, default_value_t = 8546)]
     anvil_port: u16,
+
+    /// Write per-detection-event rows to this CSV path (intra-block mode only).
+    /// Columns: block, tx_index, tx_hash, cycles, top_profit_factor, hops,
+    /// path, est_gas, base_fee_gwei, gas_cost_eth, sim_net_profit_eth.
+    #[arg(long)]
+    csv: Option<PathBuf>,
+
+    /// Input amount (in WETH, 18 decimals) used to compute simulated net
+    /// profit. `sim_net_profit = profit_factor * input - gas_cost`.
+    #[arg(long, default_value_t = 1.0)]
+    sim_input_weth: f64,
 }
 
 #[derive(serde::Deserialize)]
@@ -654,6 +666,63 @@ fn build_impersonation_request(
     Some(req)
 }
 
+/// Walk a detected cycle and produce (protocols_per_hop, tick_counts_per_hop)
+/// by picking the best edge (most negative weight) for each hop. Feeds directly
+/// into `aether-detector::gas::estimate_total_gas` so gas estimates match
+/// exactly what the production ranker computes.
+fn protocols_along_cycle(cycle: &DetectedCycle, graph: &PriceGraph) -> Vec<ProtocolType> {
+    let mut protocols = Vec::with_capacity(cycle.path.len().saturating_sub(1));
+    for pair in cycle.path.windows(2) {
+        let [from, to] = [pair[0], pair[1]];
+        let best = graph
+            .edges_from(from)
+            .iter()
+            .filter(|e| e.to == to)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(e) = best {
+            protocols.push(e.protocol);
+        }
+    }
+    protocols
+}
+
+/// Per-opportunity accounting. Same profit/gas math the production ranker runs.
+struct OppEstimate {
+    profit_factor: f64,
+    gas_units: u64,
+    base_fee_gwei: f64,
+    gas_cost_eth: f64,
+    gross_profit_eth: f64,
+    net_profit_eth: f64,
+}
+
+fn estimate_opp(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    base_fee_wei: u128,
+    input_eth: f64,
+) -> OppEstimate {
+    let protocols = protocols_along_cycle(cycle, graph);
+    // Conservative: 0 tick crossings per V3 hop. Real crossings would add
+    // UNIV3_PER_TICK_GAS each; pessimistic gas → net_profit_eth is a lower
+    // bound on profitability.
+    let ticks = vec![0u32; protocols.len()];
+    let gas_units = gas_model::estimate_total_gas(&protocols, &ticks);
+    let base_fee_gwei = base_fee_wei as f64 / 1e9;
+    let gas_cost_wei = gas_model::gas_cost_wei(gas_units, base_fee_gwei);
+    let gas_cost_eth = gas_cost_wei as f64 / 1e18;
+    let profit_factor = cycle.profit_factor();
+    let gross_profit_eth = profit_factor * input_eth;
+    OppEstimate {
+        profit_factor,
+        gas_units,
+        base_fee_gwei,
+        gas_cost_eth,
+        gross_profit_eth,
+        net_profit_eth: gross_profit_eth - gas_cost_eth,
+    }
+}
+
 /// Intra-block replay entry point.
 async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
     let fork_block = args.block.saturating_sub(1);
@@ -696,7 +765,10 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
         alloy::rpc::types::BlockTransactions::Full(ref v) => v.clone(),
         _ => anyhow::bail!("expected full-tx block, got hashes only"),
     };
+    let base_fee_wei = block.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u128;
     println!("  Block txs:       {}", txs.len());
+    println!("  Block base fee:  {:.2} gwei", base_fee_wei as f64 / 1e9);
+    println!("  Sim input:       {:.3} WETH", args.sim_input_weth);
 
     // Spawn Anvil fork.
     println!("\n  Spawning Anvil at port {} ...", args.anvil_port);
@@ -721,9 +793,24 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
 
     // Per-tx replay + detection.
     let mut opp_events: Vec<(u64, usize)> = Vec::new(); // (tx_index, profitable_cycles)
+    let mut total_net_profit_eth = 0.0f64;
     let mut skipped = 0usize;
     let mut reverted = 0usize;
     let detector = BellmanFord::new(args.max_hops, args.max_time_us);
+
+    // Optional CSV writer.
+    let mut csv_writer: Option<std::io::BufWriter<std::fs::File>> = match &args.csv {
+        Some(path) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+            use std::io::Write;
+            writeln!(
+                f,
+                "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
+            )?;
+            Some(f)
+        }
+        None => None,
+    };
 
     let t_replay = Instant::now();
     for (i, tx) in txs.iter().enumerate() {
@@ -783,38 +870,97 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
         if profitable > 0 {
             opp_events.push((i as u64, profitable));
             let tx_hash = receipt.transaction_hash;
+
+            // Rank profitable cycles; compute the top one's production-path
+            // gas + net profit estimate.
+            let top_cycle = cycles
+                .iter()
+                .filter(|c| c.is_profitable())
+                .min_by(|a, b| {
+                    a.total_weight
+                        .partial_cmp(&b.total_weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .expect("profitable > 0 implies at least one");
+
+            let path_labels: Vec<String> = top_cycle
+                .path
+                .iter()
+                .filter_map(|&v| token_index.get_address(v).map(token_label))
+                .collect();
+            let path_str = path_labels.join(" -> ");
+
+            let est = estimate_opp(top_cycle, &graph, base_fee_wei, args.sim_input_weth);
+            if est.net_profit_eth > 0.0 {
+                total_net_profit_eth += est.net_profit_eth;
+            }
+
             println!(
-                "  tx #{:3}  {}  → {} profitable cycle(s), touched {} pool(s)",
+                "  tx #{:3}  {}  → {} cycle(s), touched {} pool(s)",
                 i,
                 &format!("{:#x}", tx_hash)[..14],
                 profitable,
                 tracked_touched.len()
             );
-            // Show top cycle.
-            if let Some(top) = cycles.iter().find(|c| c.is_profitable()) {
-                let path: Vec<String> = top
-                    .path
-                    .iter()
-                    .filter_map(|&v| token_index.get_address(v).map(token_label))
-                    .collect();
-                println!(
-                    "           top: {:.4}%  path: {}",
-                    top.profit_factor() * 100.0,
-                    path.join(" -> ")
-                );
+            println!(
+                "           top: {:.4}%  path: {}",
+                est.profit_factor * 100.0,
+                path_str
+            );
+            println!(
+                "           sim @ {:.2} WETH input:  gross {:+.4} ETH  - gas {:.5} ETH  = net {:+.4} ETH  (gas {}, base fee {:.1} gwei)",
+                args.sim_input_weth,
+                est.gross_profit_eth,
+                est.gas_cost_eth,
+                est.net_profit_eth,
+                est.gas_units,
+                est.base_fee_gwei,
+            );
+
+            if let Some(w) = csv_writer.as_mut() {
+                use std::io::Write;
+                writeln!(
+                    w,
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6}",
+                    block = args.block,
+                    tx = i,
+                    hash = tx_hash,
+                    cycles = profitable,
+                    pf = est.profit_factor,
+                    hops = top_cycle.num_hops(),
+                    path = path_str,
+                    gas = est.gas_units,
+                    bf = est.base_fee_gwei,
+                    gc = est.gas_cost_eth,
+                    gp = est.gross_profit_eth,
+                    np = est.net_profit_eth,
+                )?;
             }
         }
     }
     let replay_ms = t_replay.elapsed().as_millis();
 
+    // Flush CSV if open.
+    if let Some(mut w) = csv_writer.take() {
+        use std::io::Write;
+        w.flush()?;
+    }
+
     // Summary.
     println!("\n== Summary ==");
-    println!("  Block:               {}", args.block);
-    println!("  Txs total:           {}", txs.len());
-    println!("  Txs skipped:         {} (e.g. EIP-4844 blobs)", skipped);
-    println!("  Txs reverted:        {}", reverted);
-    println!("  Detection events:    {}", opp_events.len());
-    println!("  Replay time:         {} ms", replay_ms);
+    println!("  Block:                     {}", args.block);
+    println!("  Txs total:                 {}", txs.len());
+    println!("  Txs skipped:               {} (e.g. EIP-4844 blobs)", skipped);
+    println!("  Txs reverted:              {}", reverted);
+    println!("  Detection events:          {}", opp_events.len());
+    println!(
+        "  Theoretical net captureable: {:+.4} ETH (at {:.2} WETH input, sum over tx windows)",
+        total_net_profit_eth, args.sim_input_weth
+    );
+    println!("  Replay time:               {} ms", replay_ms);
+    if let Some(path) = &args.csv {
+        println!("  CSV:                       {}", path.display());
+    }
 
     drop(anvil);
     Ok(())
