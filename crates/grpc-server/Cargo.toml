@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "aether-rust"
 path = "src/main.rs"
 
+[[bin]]
+name = "aether-replay"
+path = "src/bin/aether_replay.rs"
+
 [dependencies]
 aether-common = { path = "../common" }
 aether-ingestion = { path = "../ingestion" }
@@ -38,6 +42,8 @@ url = "2"
 dotenvy = "0.15.7"
 futures = "0.3"
 prometheus = "0.13.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 prost-build = { workspace = true }
