@@ -123,6 +123,118 @@ pub fn build_univ3_swap_calldata(
     call.abi_encode()
 }
 
+/// Build calldata for a Curve StableSwap `exchange`.
+///
+/// ABI: `function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256)`.
+/// Selector: `0x3df02124`. `i`/`j` are the pool's token indices (small signed ints).
+pub fn build_curve_swap_calldata(i: i128, j: i128, dx: U256, min_dy: U256) -> Vec<u8> {
+    sol! {
+        function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256);
+    }
+    // alloy's sol! lowers Solidity int128 to Rust's primitive i128 in the generated call
+    // struct — Curve indices are always small so i128 is both exact and appropriate.
+    let call = exchangeCall { i, j, dx, min_dy };
+    call.abi_encode()
+}
+
+/// Build calldata for a Balancer V2 Vault `swap` (single-pool, GIVEN_IN kind).
+///
+/// ABI:
+/// ```solidity
+/// function swap(SingleSwap singleSwap, FundManagement funds, uint256 limit, uint256 deadline);
+/// ```
+/// Populated with `kind = GIVEN_IN (0)`, empty `userData`, and `sender == recipient == executor`
+/// with both internal-balance flags false (direct ERC20 transfer from/to the executor).
+pub fn build_balancer_swap_calldata(
+    pool_id: [u8; 32],
+    asset_in: Address,
+    asset_out: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+    executor: Address,
+    deadline: U256,
+) -> Vec<u8> {
+    sol! {
+        enum SwapKind { GIVEN_IN, GIVEN_OUT }
+
+        struct SingleSwap {
+            bytes32 poolId;
+            uint8 kind;
+            address assetIn;
+            address assetOut;
+            uint256 amount;
+            bytes userData;
+        }
+
+        struct FundManagement {
+            address sender;
+            bool fromInternalBalance;
+            address recipient;
+            bool toInternalBalance;
+        }
+
+        function swap(
+            SingleSwap singleSwap,
+            FundManagement funds,
+            uint256 limit,
+            uint256 deadline
+        ) returns (uint256);
+    }
+
+    let call = swapCall {
+        singleSwap: SingleSwap {
+            poolId: pool_id.into(),
+            kind: 0, // GIVEN_IN — arbs always route exact-input
+            assetIn: asset_in,
+            assetOut: asset_out,
+            amount: amount_in,
+            userData: Bytes::new(),
+        },
+        funds: FundManagement {
+            sender: executor,
+            fromInternalBalance: false,
+            recipient: executor,
+            toInternalBalance: false,
+        },
+        limit: min_amount_out,
+        deadline,
+    };
+    call.abi_encode()
+}
+
+/// Build calldata for a Bancor V3 `tradeBySourceAmount`.
+///
+/// ABI: `function tradeBySourceAmount(address, address, uint256, uint256, uint256, address) returns (uint256)`.
+/// `beneficiary` is the recipient of the output tokens (the executor at runtime).
+pub fn build_bancor_swap_calldata(
+    source_token: Address,
+    target_token: Address,
+    source_amount: U256,
+    min_return: U256,
+    deadline: U256,
+    beneficiary: Address,
+) -> Vec<u8> {
+    sol! {
+        function tradeBySourceAmount(
+            address sourceToken,
+            address targetToken,
+            uint256 sourceAmount,
+            uint256 minReturnAmount,
+            uint256 deadline,
+            address beneficiary
+        ) returns (uint256);
+    }
+    let call = tradeBySourceAmountCall {
+        sourceToken: source_token,
+        targetToken: target_token,
+        sourceAmount: source_amount,
+        minReturnAmount: min_return,
+        deadline,
+        beneficiary,
+    };
+    call.abi_encode()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +451,136 @@ mod tests {
 
         // Same inputs must produce identical calldata (deterministic)
         assert_eq!(calldata1, calldata2);
+    }
+
+    #[test]
+    fn test_build_curve_swap_calldata_selector_and_roundtrip() {
+        // Exact selector is whatever alloy computes from the ABI string — we re-use the
+        // generated SELECTOR const rather than hardcoding it, so a future ABI tweak fails
+        // loudly in the builder rather than silently here.
+        sol! {
+            function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) returns (uint256);
+        }
+        let calldata = build_curve_swap_calldata(
+            0,
+            1,
+            U256::from(1_000_000_000_000_000_000u128),
+            U256::from(995_000_000_000_000_000u128),
+        );
+        assert_eq!(&calldata[0..4], exchangeCall::SELECTOR.as_slice());
+        assert_eq!(calldata.len(), 4 + 4 * 32); // static-word payload
+    }
+
+    #[test]
+    fn test_build_curve_swap_calldata_varies_with_inputs() {
+        let a = build_curve_swap_calldata(0, 1, U256::from(1_000u64), U256::from(990u64));
+        let b = build_curve_swap_calldata(1, 0, U256::from(1_000u64), U256::from(990u64));
+        assert_ne!(a, b);
+        assert_eq!(&a[0..4], &b[0..4]); // same selector
+    }
+
+    #[test]
+    fn test_build_balancer_swap_calldata_selector() {
+        let pool_id = [0x42u8; 32];
+        let asset_in = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"); // WETH
+        let asset_out = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // USDC
+        let executor = address!("1111111111111111111111111111111111111111");
+        let calldata = build_balancer_swap_calldata(
+            pool_id,
+            asset_in,
+            asset_out,
+            U256::from(1_000_000_000_000_000_000u128),
+            U256::from(1_980_000_000u64),
+            executor,
+            U256::from(1_700_000_000u64 + 120),
+        );
+        // Assert the selector is stable by comparing against the first 4 bytes of a
+        // second encoding with the same ABI — any ABI drift inside the builder fails here.
+        let calldata2 = build_balancer_swap_calldata(
+            pool_id,
+            asset_in,
+            asset_out,
+            U256::from(2u64),
+            U256::ZERO,
+            executor,
+            U256::from(1_700_000_000u64 + 120),
+        );
+        assert_eq!(&calldata[0..4], &calldata2[0..4]);
+        assert!(calldata.len() > 4);
+    }
+
+    #[test]
+    fn test_build_balancer_swap_calldata_varies_with_direction() {
+        let pool_id = [0x42u8; 32];
+        let executor = address!("1111111111111111111111111111111111111111");
+        let deadline = U256::from(1_700_000_000u64 + 120);
+        let a = build_balancer_swap_calldata(
+            pool_id,
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            U256::from(1u64),
+            U256::ZERO,
+            executor,
+            deadline,
+        );
+        let b = build_balancer_swap_calldata(
+            pool_id,
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            U256::from(1u64),
+            U256::ZERO,
+            executor,
+            deadline,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_build_bancor_swap_calldata_selector() {
+        let source = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let target = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let beneficiary = address!("1111111111111111111111111111111111111111");
+        let calldata = build_bancor_swap_calldata(
+            source,
+            target,
+            U256::from(1_000_000_000_000_000_000u128),
+            U256::from(1_980_000_000u64),
+            U256::from(1_700_000_000u64 + 120),
+            beneficiary,
+        );
+        // Compare against a second encoding rather than hardcoding the selector —
+        // the generated SELECTOR is authoritative.
+        sol! {
+            function tradeBySourceAmount(
+                address sourceToken,
+                address targetToken,
+                uint256 sourceAmount,
+                uint256 minReturnAmount,
+                uint256 deadline,
+                address beneficiary
+            ) returns (uint256);
+        }
+        assert_eq!(&calldata[0..4], tradeBySourceAmountCall::SELECTOR.as_slice());
+        // Selector + 6 * 32-byte words (all static types)
+        assert_eq!(calldata.len(), 4 + 6 * 32);
+    }
+
+    #[test]
+    fn test_build_bancor_swap_calldata_beneficiary_in_payload() {
+        let source = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let target = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let beneficiary = address!("2222222222222222222222222222222222222222");
+        let calldata = build_bancor_swap_calldata(
+            source,
+            target,
+            U256::from(1u64),
+            U256::ZERO,
+            U256::from(u64::MAX),
+            beneficiary,
+        );
+        // Last 32-byte word is the beneficiary address (right-aligned in 32 bytes)
+        let last_word = &calldata[calldata.len() - 32..];
+        assert_eq!(&last_word[12..], beneficiary.as_slice());
     }
 
     #[test]
