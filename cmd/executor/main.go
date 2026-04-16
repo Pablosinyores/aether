@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/aether-arb/aether/internal/config"
@@ -73,7 +74,34 @@ func loadConfig() Config {
 		log.Printf("Config: GRPC_ADDRESS=%s (from env)", addr)
 	}
 
+	// EXECUTOR_ADDRESS is mandatory — without it bundles target the zero
+	// address and silently no-op on-chain. Parsed and validated here; any
+	// problem is a deployment misconfiguration, not a runtime condition.
+	if addr, err := parseExecutorAddressEnv(os.Getenv("EXECUTOR_ADDRESS")); err != nil {
+		log.Fatalf("Config: EXECUTOR_ADDRESS: %v", err)
+	} else {
+		cfg.ExecutorAddr = addr
+		log.Printf("Config: EXECUTOR_ADDRESS=%s (from env)", addr)
+	}
+
 	return cfg
+}
+
+// parseExecutorAddressEnv validates that the value is a non-zero, hex-parseable
+// Ethereum address. Returns a canonical (checksummed) hex string.
+func parseExecutorAddressEnv(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("unset — set to the deployed AetherExecutor contract address")
+	}
+	if !common.IsHexAddress(raw) {
+		return "", fmt.Errorf("%q is not a valid hex address", raw)
+	}
+	addr := common.HexToAddress(raw)
+	if addr == (common.Address{}) {
+		return "", fmt.Errorf("zero address is not a valid executor target")
+	}
+	return addr.Hex(), nil
 }
 
 // loadRiskConfig attempts to load risk parameters from config/risk.yaml,

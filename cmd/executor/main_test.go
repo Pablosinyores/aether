@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -348,5 +349,39 @@ func TestSubmitter_CustomSubmitFn_IsUsed(t *testing.T) {
 	}
 	if results[0].Builder != "mock" {
 		t.Fatalf("expected builder mock, got %q", results[0].Builder)
+	}
+}
+
+func TestParseExecutorAddressEnv(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantErr bool
+		wantLow string // lowercased checksum if no error
+	}{
+		{"empty is error", "", true, ""},
+		{"whitespace is error", "   ", true, ""},
+		{"non-hex is error", "not-an-address", true, ""},
+		{"too short is error", "0x1234", true, ""},
+		{"zero is error", "0x0000000000000000000000000000000000000000", true, ""},
+		{"valid lowercase parses", "0x1111111111111111111111111111111111111111", false, "0x1111111111111111111111111111111111111111"},
+		{"whitespace trimmed", "  0x2222222222222222222222222222222222222222  ", false, "0x2222222222222222222222222222222222222222"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseExecutorAddressEnv(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if strings.ToLower(got) != tc.wantLow {
+				t.Fatalf("got %q, want (lowercased) %q", got, tc.wantLow)
+			}
+		})
 	}
 }
