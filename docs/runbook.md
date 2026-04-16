@@ -283,3 +283,48 @@ curl -s http://localhost:9090/metrics | grep aether_eth_balance
 # Manual sweep is handled by the Go executor
 # Ensure cold wallet address is configured in risk.yaml
 ```
+
+## Adding a DEX
+
+The executor supports two pathways, matched to what's actually changing:
+
+### (a) New instance of an existing protocol
+
+Use this when a protocol ships a new Vault/Router address or we want to point at a fork that reuses the same interface (e.g., a new Balancer Vault deployment, an alternate Bancor network contract).
+
+1. Owner multisig calls `setDexRouter(<protocolId>, <newAddress>)` on the executor.
+   ```bash
+   cast send <EXECUTOR_ADDRESS> "setDexRouter(uint8,address)" <PID> <NEW_ROUTER> \
+       --private-key <OWNER_KEY> --rpc-url <RPC_URL>
+   ```
+   Protocol IDs: `UNISWAP_V2=1, UNISWAP_V3=2, SUSHISWAP=3, CURVE=4, BALANCER_V2=5, BANCOR_V3=6`.
+   Only `5` and `6` currently store a router — the AMM protocols use per-swap pool addresses.
+2. Update `config/pools.toml` with the new instance's pool entries.
+3. Trigger Rust pool registry hot-reload:
+   ```bash
+   grpcurl -plaintext localhost:50051 aether.ControlService/ReloadConfig
+   ```
+4. No redeploy, no downtime.
+
+Disabling a compromised DEX is the same mechanism:
+```bash
+cast send <EXECUTOR_ADDRESS> "setDexEnabled(uint8,bool)" <PID> false \
+    --private-key <OWNER_KEY> --rpc-url <RPC_URL>
+```
+`executeArb` reverts pre-flashloan for any step whose protocol is disabled.
+
+### (b) New protocol type
+
+Use this when adding an AMM with novel swap semantics (e.g., Maverick, a new concentrated-liquidity variant) — the inline `_swapX` branch is hand-coded per protocol type, so a redeploy is unavoidable.
+
+1. Implement the `Pool` trait in `crates/pools/src/<new>.rs`.
+2. Add the event signature to `crates/ingestion/src/event_decoder.rs`.
+3. Add the `ProtocolType` variant with its `uint8` ID and gas estimate in `crates/common/src/types.rs` and `crates/detector/src/gas.rs`.
+4. Add a calldata builder in `crates/simulator/src/calldata.rs`.
+5. Add a `_swap<New>()` helper + branch in `AetherExecutor._executeSwap()`; bump the `UnknownProtocol` upper bound in `executeArb`'s pre-flight loop and in `setDexRouter`/`setDexEnabled`.
+6. Extend the constructor seeding loop so the new protocol is enabled at deploy.
+7. Deploy:
+   ```bash
+   forge script script/Deploy.s.sol --rpc-url $MAINNET_RPC --broadcast
+   ```
+8. Update `EXECUTOR_ADDRESS` env on Rust and Go services, restart both, update `config/pools.toml`.
