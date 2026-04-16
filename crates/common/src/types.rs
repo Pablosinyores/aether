@@ -1,7 +1,12 @@
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
-/// Protocol type enum matching on-chain constants in AetherExecutor.sol
+/// Protocol type enum matching on-chain constants in AetherExecutor.sol.
+///
+/// Discriminants are load-bearing: they are cast to `uint8` and encoded into
+/// `executeArb` calldata, where the on-chain contract branches on them. The
+/// const assertions below fail compilation if any discriminant drifts away
+/// from the Solidity constant it mirrors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ProtocolType {
@@ -12,6 +17,18 @@ pub enum ProtocolType {
     BalancerV2 = 5,
     BancorV3 = 6,
 }
+
+// Compile-time guard: if someone reorders the enum or changes a discriminant, the
+// build fails before a single test runs. Mirrors the Solidity constants in
+// `contracts/src/AetherExecutor.sol` (UNISWAP_V2..BANCOR_V3).
+const _: () = {
+    assert!(ProtocolType::UniswapV2 as u8 == 1);
+    assert!(ProtocolType::UniswapV3 as u8 == 2);
+    assert!(ProtocolType::SushiSwap as u8 == 3);
+    assert!(ProtocolType::Curve as u8 == 4);
+    assert!(ProtocolType::BalancerV2 as u8 == 5);
+    assert!(ProtocolType::BancorV3 as u8 == 6);
+};
 
 impl ProtocolType {
     /// Base gas cost for each protocol's swap
@@ -162,6 +179,11 @@ pub mod addresses {
 pub mod gas {
     pub const FLASHLOAN_BASE_GAS: u64 = 80_000;
     pub const TX_BASE_GAS: u64 = 21_000;
+    /// Catch-all overhead for `executeArb` framing: reentrancy guard, nonReentrant
+    /// modifier, calldata decoding, event emission, profit-split math, and per-step
+    /// dispatch. The 30k budget also absorbs the registry `SLOAD`s added in E4/WS-3
+    /// (2,100 gas cold on the first Balancer/Bancor hop of a block, ~100 gas warm on
+    /// subsequent reads) — worst case ~4,200 gas leaving >85% of the buffer unused.
     pub const EXECUTOR_OVERHEAD_GAS: u64 = 30_000;
     pub const UNIV3_PER_TICK_GAS: u64 = 5_000;
 }
