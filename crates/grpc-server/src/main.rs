@@ -1,5 +1,7 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::primitives::Address;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::{error, info};
@@ -56,8 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the AetherEngine with a broadcast sender connected to the
     // ArbService's stream.
     let arb_tx = arb_service.arb_sender();
+
+    // EXECUTOR_ADDRESS is mandatory — without it the engine builds calldata targeting
+    // the zero address, which is a silent no-op on-chain. Fail-fast at startup.
+    let executor_address = parse_executor_address()?;
+
     let engine_config = EngineConfig {
         rpc_url: std::env::var("ETH_RPC_URL").ok(),
+        executor_address,
         ..EngineConfig::default()
     };
     if engine_config.rpc_url.is_some() {
@@ -65,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("ETH_RPC_URL not set — engine will use empty-state simulation");
     }
+    info!(executor_address = %engine_config.executor_address, "Executor contract target");
     let engine = Arc::new(AetherEngine::new_with_metrics(
         engine_config,
         arb_tx,
@@ -198,4 +207,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_result?;
 
     Ok(())
+}
+
+/// Parse and validate the `EXECUTOR_ADDRESS` env var at startup.
+///
+/// Fails when the variable is unset, cannot be parsed as an Ethereum address, or is the
+/// zero address — all three are deployment misconfigurations, not recoverable runtime states.
+fn parse_executor_address() -> Result<Address, Box<dyn std::error::Error>> {
+    let raw = std::env::var("EXECUTOR_ADDRESS")
+        .map_err(|_| "EXECUTOR_ADDRESS env var is required (on-chain AetherExecutor contract)")?;
+    let addr = Address::from_str(raw.trim())
+        .map_err(|e| format!("EXECUTOR_ADDRESS='{raw}' is not a valid Ethereum address: {e}"))?;
+    if addr == Address::ZERO {
+        return Err("EXECUTOR_ADDRESS is the zero address — set it to the deployed AetherExecutor proxy or contract".into());
+    }
+    Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // std::env mutations must be serialized across tests to avoid cross-thread races.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn parse_executor_address_missing_env_is_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: set_var/remove_var are marked unsafe in the 2024 edition; the lock
+        // above serializes access across this module's tests.
+        unsafe { std::env::remove_var("EXECUTOR_ADDRESS"); }
+        assert!(parse_executor_address().is_err());
+    }
+
+    #[test]
+    fn parse_executor_address_invalid_hex_is_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("EXECUTOR_ADDRESS", "not-an-address"); }
+        assert!(parse_executor_address().is_err());
+        unsafe { std::env::remove_var("EXECUTOR_ADDRESS"); }
+    }
+
+    #[test]
+    fn parse_executor_address_zero_is_error() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(
+                "EXECUTOR_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            );
+        }
+        assert!(parse_executor_address().is_err());
+        unsafe { std::env::remove_var("EXECUTOR_ADDRESS"); }
+    }
+
+    #[test]
+    fn parse_executor_address_valid() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(
+                "EXECUTOR_ADDRESS",
+                "0x1111111111111111111111111111111111111111",
+            );
+        }
+        let got = parse_executor_address().expect("valid address parses");
+        assert_eq!(got.to_string().to_lowercase(), "0x1111111111111111111111111111111111111111");
+        unsafe { std::env::remove_var("EXECUTOR_ADDRESS"); }
+    }
 }
