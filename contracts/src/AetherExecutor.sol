@@ -263,7 +263,7 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
                 // Unwrap WETH, then try native ETH transfer; on failure re-wrap and send as WETH.
                 // Some builders run contract coinbases that reject plain ETH transfers.
                 IWETH(asset).withdraw(tipAmount);
-                (bool sent,) = block.coinbase.call{value: tipAmount, gas: 2300}("");
+                (bool sent,) = block.coinbase.call{value: tipAmount}("");
                 if (!sent) {
                     IWETH(WETH).deposit{value: tipAmount}();
                     IERC20(WETH).safeTransfer(block.coinbase, tipAmount);
