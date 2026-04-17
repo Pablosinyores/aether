@@ -95,19 +95,14 @@ func main() {
 	// Executor on-chain parameters (contract address, expected chain ID) are
 	// required: the service refuses to start without them. This prevents the
 	// old fail-open behaviour where a zero-address stub silently routed
-	// bundles to nowhere.
+	// bundles to nowhere. Deployments inject the address via
+	// ${AETHER_EXECUTOR_ADDRESS} which executor.yaml expands at load time —
+	// ExpandEnv runs inside LoadExecutorConfig before validation, so no
+	// separate post-load override path is needed.
 	execPath := config.ConfigPath("executor.yaml")
 	execCfg, err := config.LoadExecutorConfig(execPath)
 	if err != nil {
 		log.Fatalf("FATAL: executor config (%s) missing or invalid: %v", execPath, err)
-	}
-	// AETHER_EXECUTOR_ADDRESS env var overrides the yaml value so deployments
-	// can inject the deployed address without editing the file in-tree.
-	if envAddr := os.Getenv("AETHER_EXECUTOR_ADDRESS"); envAddr != "" {
-		execCfg.ExecutorAddress = envAddr
-	}
-	if err := config.ValidateExecutorConfig(execCfg); err != nil {
-		log.Fatalf("FATAL: executor config invalid after env override: %v", err)
 	}
 	log.Printf("Config: executor_address=%s expected_chain_id=%d",
 		execCfg.ExecutorAddress, execCfg.ExpectedChainID)
@@ -119,10 +114,11 @@ func main() {
 		log.Fatalf("FATAL: ETH_RPC_URL not set — required for chain-id / bytecode / balance checks")
 	}
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
 	ethClient, err := ethclient.DialContext(dialCtx, rpcURL)
-	dialCancel()
 	if err != nil {
-		log.Fatalf("FATAL: failed to connect to ETH_RPC_URL: %v", err)
+		log.Fatalf("FATAL: failed to connect to ETH_RPC_URL (%s): %v",
+			redactRPCURL(rpcURL), redactRPCError(err, rpcURL))
 	}
 	log.Printf("Connected to Ethereum node")
 
@@ -130,10 +126,10 @@ func main() {
 	// executor.yaml. A mismatch here typically means someone pointed a
 	// mainnet config at a testnet RPC (or vice versa) — refuse to start.
 	chainCtx, chainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer chainCancel()
 	chainID, err := ethClient.ChainID(chainCtx)
-	chainCancel()
 	if err != nil {
-		log.Fatalf("FATAL: eth_chainId failed: %v", err)
+		log.Fatalf("FATAL: eth_chainId failed: %v", redactRPCError(err, rpcURL))
 	}
 	if chainID.Int64() != execCfg.ExpectedChainID {
 		log.Fatalf("FATAL: chain-id mismatch — node reports %d, config expects %d",
@@ -144,10 +140,11 @@ func main() {
 	// Verify the configured executor contract actually exists on-chain. A
 	// zero-bytecode result means we'd be sending bundles to a non-contract.
 	codeCtx, codeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer codeCancel()
 	code, err := ethClient.CodeAt(codeCtx, common.HexToAddress(execCfg.ExecutorAddress), nil)
-	codeCancel()
 	if err != nil {
-		log.Fatalf("FATAL: eth_getCode(%s) failed: %v", execCfg.ExecutorAddress, err)
+		log.Fatalf("FATAL: eth_getCode(%s) failed: %v",
+			execCfg.ExecutorAddress, redactRPCError(err, rpcURL))
 	}
 	if len(code) == 0 {
 		log.Fatalf("FATAL: executor address %s has no bytecode on chain %d",
@@ -228,16 +225,20 @@ func main() {
 		gasOracle.UpdateLoop(ctx, 12*time.Second)
 	}()
 
-	// Start ETH balance watcher. Perform one synchronous fetch first so the
-	// first arb does not see a zero balance and get rejected incorrectly.
+	// Start ETH balance watcher. The initial fetch is synchronous and fatal
+	// on failure: LiveBalance starts at zero, and risk.PreflightCheck rejects
+	// anything below MinETHBalance, so a transient startup blip would
+	// silently kill every arb for up to 30s until balanceWatchLoop's first
+	// tick. This matches the fatal-on-startup pattern of the dial, chain-ID,
+	// and bytecode checks.
 	if txSigner != nil {
 		if err := fetchAndStoreBalance(ctx, ethClient, txSigner.Address(), liveBalance); err != nil {
-			log.Printf("WARNING: initial eth_getBalance failed: %v", err)
+			log.Fatalf("FATAL: initial eth_getBalance failed: %v", redactRPCError(err, rpcURL))
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			balanceWatchLoop(ctx, ethClient, txSigner.Address(), 30*time.Second, liveBalance)
+			balanceWatchLoop(ctx, ethClient, txSigner.Address(), 30*time.Second, liveBalance, rpcURL)
 		}()
 	}
 

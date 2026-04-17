@@ -560,9 +560,13 @@ func TestValidateExecutorConfig_Errors(t *testing.T) {
 		errSub string
 	}{
 		{"empty address", ExecutorFileConfig{"", 1}, "executor_address must not be empty"},
+		{"whitespace-only address", ExecutorFileConfig{"   ", 1}, "executor_address must not be empty"},
 		{"zero address", ExecutorFileConfig{"0x0000000000000000000000000000000000000000", 1}, "must not be the zero address"},
 		{"missing 0x prefix", ExecutorFileConfig{"1111111111111111111111111111111111111111", 1}, "0x-prefixed"},
 		{"too short", ExecutorFileConfig{"0x1234", 1}, "0x-prefixed"},
+		// Defense-in-depth: reject non-hex digits that the old length-only
+		// check accepted and common.HexToAddress silently coerced to zero.
+		{"non-hex chars", ExecutorFileConfig{"0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", 1}, "0x-prefixed"},
 		{"zero chain id", ExecutorFileConfig{"0x1111111111111111111111111111111111111111", 0}, "expected_chain_id must be > 0"},
 		{"negative chain id", ExecutorFileConfig{"0x1111111111111111111111111111111111111111", -1}, "expected_chain_id must be > 0"},
 	}
@@ -603,6 +607,70 @@ func TestLoadExecutorConfig_MissingFile(t *testing.T) {
 	_, err := LoadExecutorConfig("/nonexistent/executor.yaml")
 	if err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+// When the yaml references an env var that is unset, ExpandEnv substitutes
+// an empty string and validation must reject it. Prevents a silent "this
+// looks like a valid yaml, why are bundles going nowhere" bug in prod.
+func TestLoadExecutorConfig_EnvUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "executor.yaml")
+	body := "executor_address: ${TEST_AETHER_UNSET_VAR}\nexpected_chain_id: 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Make sure the var really is unset for this test — Setenv+Unsetenv
+	// instead of a bare Unsetenv so t.Cleanup restores any prior value.
+	t.Setenv("TEST_AETHER_UNSET_VAR", "")
+	os.Unsetenv("TEST_AETHER_UNSET_VAR")
+
+	_, err := LoadExecutorConfig(path)
+	if err == nil {
+		t.Fatal("expected error when env var is unset")
+	}
+	if !strings.Contains(err.Error(), "executor_address must not be empty") {
+		t.Errorf("error %q does not point at the empty-address case", err.Error())
+	}
+}
+
+// Env var expands to the zero address — must be rejected, not treated as a
+// deployed contract address.
+func TestLoadExecutorConfig_EnvIsZeroAddress(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "executor.yaml")
+	body := "executor_address: ${TEST_AETHER_ZERO_ADDR}\nexpected_chain_id: 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("TEST_AETHER_ZERO_ADDR", "0x0000000000000000000000000000000000000000")
+
+	_, err := LoadExecutorConfig(path)
+	if err == nil {
+		t.Fatal("expected error for zero-address env expansion")
+	}
+	if !strings.Contains(err.Error(), "must not be the zero address") {
+		t.Errorf("error %q does not point at the zero-address case", err.Error())
+	}
+}
+
+// Strict YAML decoding rejects unknown keys so typos (e.g. `expected_chainid:`)
+// surface as a decoder error instead of silently leaving the field at zero
+// and tripping the generic `> 0` validator with a misleading message.
+func TestLoadExecutorConfig_RejectsUnknownKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "executor.yaml")
+	body := "executor_address: 0x1111111111111111111111111111111111111111\nexpected_chainid: 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, err := LoadExecutorConfig(path)
+	if err == nil {
+		t.Fatal("expected error for unknown key")
+	}
+	if !strings.Contains(err.Error(), "expected_chainid") {
+		t.Errorf("error %q does not name the offending key", err.Error())
 	}
 }
 
