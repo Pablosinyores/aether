@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -384,6 +386,9 @@ func processArb(
 			"gas", arb.TotalGas,
 			"tip_share_pct", tipSharePct,
 		)
+		if err := dumpShadowBundle(arb, bundle, profitEth, gasGwei, tipSharePct); err != nil {
+			slog.WarnContext(ctx, "shadow bundle json dump failed", "arb_id", arb.Id, "err", err)
+		}
 		span.SetAttributes(attribute.String("outcome", "shadow"))
 		return true, nil
 	}
@@ -542,6 +547,125 @@ func stateToInt(s risk.SystemState) int {
 func isShadowMode() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("AETHER_SHADOW")))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// shadowBundleDumpDir returns the target dir for shadow-bundle JSONs.
+// Defaults to ./reports/bundles so the e2e script picks them up without any
+// extra wiring. Override via AETHER_SHADOW_DUMP_DIR for custom orchestrations.
+func shadowBundleDumpDir() string {
+	if d := strings.TrimSpace(os.Getenv("AETHER_SHADOW_DUMP_DIR")); d != "" {
+		return d
+	}
+	return "reports/bundles"
+}
+
+// Well-known mainnet token labels for human-readable bundle dumps.
+// Keep in sync with the set in aether-replay so the comparison script can
+// match paths across the two sides.
+var tokenLabels = map[string]string{
+	strings.ToLower("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"): "WETH",
+	strings.ToLower("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"): "USDC",
+	strings.ToLower("0xdAC17F958D2ee523a2206206994597C13D831ec7"): "USDT",
+	strings.ToLower("0x6B175474E89094C44Da98b954EedeAC495271d0F"): "DAI",
+	strings.ToLower("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"): "WBTC",
+	strings.ToLower("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"): "AAVE",
+}
+
+func tokenLabel(addrBytes []byte) string {
+	if len(addrBytes) == 0 {
+		return "?"
+	}
+	hex := strings.ToLower(fmt.Sprintf("0x%x", addrBytes))
+	if lbl, ok := tokenLabels[hex]; ok {
+		return lbl
+	}
+	if len(hex) >= 10 {
+		return hex[:10] + "…"
+	}
+	return hex
+}
+
+// dumpShadowBundle writes a single JSON file per shadow-mode bundle. One file
+// per arb makes the output easy to inspect (`jq . reports/bundles/*.json`) and
+// easy to correlate with aether-replay's CSV for hit-rate comparisons.
+func dumpShadowBundle(
+	arb *pb.ValidatedArb,
+	bundle *Bundle,
+	profitEth float64,
+	gasGwei float64,
+	tipSharePct float64,
+) error {
+	dir := shadowBundleDumpDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+
+	// Build the human-readable token path from the hops.
+	path := make([]string, 0, len(arb.Hops)+1)
+	if len(arb.Hops) > 0 {
+		path = append(path, tokenLabel(arb.Hops[0].TokenIn))
+	}
+	for _, h := range arb.Hops {
+		path = append(path, tokenLabel(h.TokenOut))
+	}
+
+	// Serialise hops + raw txs (hex-encoded) for forensic inspection.
+	hopsOut := make([]map[string]interface{}, 0, len(arb.Hops))
+	for _, h := range arb.Hops {
+		hopsOut = append(hopsOut, map[string]interface{}{
+			"protocol":      h.Protocol.String(),
+			"pool_address":  fmt.Sprintf("0x%x", h.PoolAddress),
+			"token_in":      tokenLabel(h.TokenIn),
+			"token_out":     tokenLabel(h.TokenOut),
+			"amount_in":     new(big.Int).SetBytes(h.AmountIn).String(),
+			"expected_out":  new(big.Int).SetBytes(h.ExpectedOut).String(),
+			"estimated_gas": h.EstimatedGas,
+		})
+	}
+
+	rawHex := make([]string, 0, len(bundle.RawTxs))
+	for _, b := range bundle.RawTxs {
+		rawHex = append(rawHex, fmt.Sprintf("0x%x", b))
+	}
+
+	payload := map[string]interface{}{
+		"ts":                time.Now().UTC().Format(time.RFC3339Nano),
+		"arb_id":            arb.Id,
+		"target_block":      bundle.BlockNumber,
+		"source_block":      arb.BlockNumber,
+		"path":              path,
+		"hops":              hopsOut,
+		"flashloan_token":   tokenLabel(arb.FlashloanToken),
+		"flashloan_amount":  new(big.Int).SetBytes(arb.FlashloanAmount).String(),
+		"net_profit_wei":    new(big.Int).SetBytes(arb.NetProfitWei).String(),
+		"net_profit_eth":    profitEth,
+		"total_gas":         arb.TotalGas,
+		"gas_price_gwei":    gasGwei,
+		"tip_share_pct":     tipSharePct,
+		"tx_count":          len(bundle.RawTxs),
+		"raw_tx_hex":        rawHex,
+		"calldata_hex":      fmt.Sprintf("0x%x", arb.Calldata),
+	}
+
+	out, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	// Sanitise arb_id for safe filename use.
+	safeID := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, arb.Id)
+	if safeID == "" {
+		safeID = "anon"
+	}
+	filename := filepath.Join(dir, safeID+".json")
+	return os.WriteFile(filename, out, 0o644)
 }
 
 func weiToEth(wei *big.Int) float64 {
