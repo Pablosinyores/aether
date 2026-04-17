@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -14,6 +14,8 @@ use aether_ingestion::event_decoder;
 use aether_ingestion::event_decoder::EventSignatures;
 use aether_ingestion::node_pool::{NodeConfig, NodeConnection, NodePool, NodeType};
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
+
+use crate::metrics::EngineMetrics;
 
 /// Configuration for the RPC provider connection
 #[derive(Debug, Clone)]
@@ -66,16 +68,27 @@ pub struct RpcProvider {
     config: ProviderConfig,
     event_channels: Arc<EventChannels>,
     node_pool: NodePool,
-    metrics: Option<Arc<crate::metrics::EngineMetrics>>,
+    metrics: Arc<EngineMetrics>,
 }
 
 impl RpcProvider {
     /// Create a new `RpcProvider`.
     ///
-    /// If `config.nodes_config_path` is set, loads the multi-node pool from
-    /// the YAML config file. Otherwise, creates a single-node pool from
-    /// `config.rpc_url` with the transport type inferred from the URL scheme.
-    pub fn new(config: ProviderConfig, event_channels: Arc<EventChannels>) -> Self {
+    /// `metrics` is required at construction so the decode-failure counter
+    /// is always wired up — forgetting to attach it would ship a dead
+    /// counter that pegs at zero forever (indistinguishable from "no
+    /// decode failures are happening") rather than surfacing as a missing
+    /// time series that alerts can match on.
+    ///
+    /// If `config.nodes_config_path` is set, loads the multi-node pool
+    /// from the YAML config file. Otherwise, creates a single-node pool
+    /// from `config.rpc_url` with the transport type inferred from the
+    /// URL scheme.
+    pub fn new(
+        config: ProviderConfig,
+        event_channels: Arc<EventChannels>,
+        metrics: Arc<EngineMetrics>,
+    ) -> Self {
         let node_pool = match &config.nodes_config_path {
             Some(path) => match load_nodes_config(path) {
                 Ok((configs, min_healthy)) => {
@@ -103,16 +116,8 @@ impl RpcProvider {
             config,
             event_channels,
             node_pool,
-            metrics: None,
+            metrics,
         }
-    }
-
-    /// Attach the engine-wide metrics handle so decode failures and other
-    /// provider-side events can be counted. Optional: when unset (e.g. in
-    /// tests), failures are still logged but not counted.
-    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::EngineMetrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
     }
 
     /// Build a single-node `NodePool` from a URL, inferring the transport type.
@@ -470,17 +475,24 @@ impl RpcProvider {
         }
     }
 
-    /// Surface a decoder drop to operators. Bumps the `aether_decode_errors_total`
-    /// counter (if metrics are attached) and logs the offending pool address and
-    /// first topic. Called from the hot path, so it must be cheap — the counter
-    /// is a single atomic increment and the `warn!` emits no allocations when
-    /// disabled at runtime.
+    /// Surface a decoder drop to operators. Bumps `aether_decode_errors_total`
+    /// (the primary ops signal — it's a monotonic counter wired to alerting)
+    /// and emits a `trace!` with the offending pool address and first topic
+    /// for triage.
+    ///
+    /// The per-event log is deliberately `trace!`, not `warn!`: in discovery
+    /// mode (`monitored_pools = []`) every unmatched log on mainnet — tens
+    /// of thousands per block — lands here, and a `warn!` would swamp Loki.
+    /// Operators should watch the counter; the trace line exists only for
+    /// targeted debugging when someone actively raises `RUST_LOG`.
+    ///
+    /// Called from the hot path, so it must be cheap — the counter is a
+    /// single atomic increment and `trace!` is compiled to a tiny level
+    /// check at the disabled level.
     fn record_decode_failure(&self, address: Address, topics: &[B256]) {
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.inc_decode_errors();
-        }
+        self.metrics.inc_decode_errors();
         let topic0 = topics.first().copied().unwrap_or_default();
-        warn!(
+        trace!(
             pool = %address,
             %topic0,
             "Event decoder returned None; log skipped"
@@ -511,6 +523,13 @@ mod tests {
     use super::*;
     use alloy::primitives::U256;
 
+    /// Fresh metrics handle for tests that don't care about counter values —
+    /// keeps every `RpcProvider::new` call site short and avoids a global
+    /// registry (`EngineMetrics::new()` builds an independent one).
+    fn test_metrics() -> Arc<EngineMetrics> {
+        Arc::new(EngineMetrics::new())
+    }
+
     #[test]
     fn test_provider_config_default() {
         let config = ProviderConfig {
@@ -537,7 +556,7 @@ mod tests {
             rpc_url: "ws://localhost:8546".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, channels);
+        let provider = RpcProvider::new(config, channels, test_metrics());
         assert_eq!(provider.rpc_url(), "ws://localhost:8546");
         assert!(provider.is_configured());
     }
@@ -549,7 +568,7 @@ mod tests {
             rpc_url: String::new(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, channels);
+        let provider = RpcProvider::new(config, channels, test_metrics());
         assert!(!provider.is_configured());
     }
 
@@ -562,7 +581,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, Arc::clone(&channels));
+        let provider = RpcProvider::new(config, Arc::clone(&channels), test_metrics());
 
         provider.dispatch_block(18_000_000, 1_700_000_000, 30_000_000_000, 30_000_000);
 
@@ -582,7 +601,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, Arc::clone(&channels));
+        let provider = RpcProvider::new(config, Arc::clone(&channels), test_metrics());
 
         let pool_addr = Address::repeat_byte(0xAA);
         let topics = vec![EventSignatures::sync_topic()];
@@ -613,12 +632,55 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, Arc::clone(&channels));
+        let provider = RpcProvider::new(config, Arc::clone(&channels), test_metrics());
 
         let unknown_topic = B256::repeat_byte(0xFF);
         provider.process_logs(&[(Address::ZERO, vec![unknown_topic], vec![0u8; 64])]);
 
         assert!(rx.try_recv().is_err());
+    }
+
+    /// End-to-end check that a dropped log actually moves the
+    /// `aether_decode_errors_total` counter. The unit test in `metrics.rs`
+    /// only exercises `inc_decode_errors()` directly; this one proves the
+    /// real call path through `process_logs → record_decode_failure →
+    /// metrics.inc_decode_errors` is wired correctly end-to-end.
+    #[test]
+    fn test_process_logs_decode_failure_increments_counter() {
+        let channels = Arc::new(EventChannels::new());
+        let metrics = Arc::new(EngineMetrics::new());
+
+        let config = ProviderConfig {
+            rpc_url: "http://localhost:8545".to_string(),
+            ..ProviderConfig::default()
+        };
+        let provider = RpcProvider::new(config, channels, Arc::clone(&metrics));
+
+        // Unknown topic0 → decode_log returns None → counter bumps by 1.
+        let unknown_topic = B256::repeat_byte(0xFF);
+        provider.process_logs(&[(
+            Address::ZERO,
+            vec![unknown_topic],
+            vec![0u8; 64],
+        )]);
+
+        let rendered = String::from_utf8(metrics.render()).expect("metrics utf-8");
+        assert!(
+            rendered.contains("aether_decode_errors_total 1"),
+            "expected counter at 1, got: {rendered}"
+        );
+
+        // Second drop should advance the counter, not reset it.
+        provider.process_logs(&[(
+            Address::ZERO,
+            vec![unknown_topic],
+            vec![0u8; 64],
+        )]);
+        let rendered = String::from_utf8(metrics.render()).expect("metrics utf-8");
+        assert!(
+            rendered.contains("aether_decode_errors_total 2"),
+            "expected counter at 2 after second drop, got: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -630,7 +692,7 @@ mod tests {
             reconnect_delay: Duration::from_millis(200),
             ..ProviderConfig::default()
         };
-        let provider = Arc::new(RpcProvider::new(config, channels));
+        let provider = Arc::new(RpcProvider::new(config, channels, test_metrics()));
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -657,7 +719,7 @@ mod tests {
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, Arc::clone(&channels));
+        let provider = RpcProvider::new(config, Arc::clone(&channels), test_metrics());
 
         let pool1 = Address::repeat_byte(0x01);
         let pool2 = Address::repeat_byte(0x02);
@@ -767,7 +829,7 @@ min_healthy_nodes: 1
             nodes_config_path: Some(path.to_str().expect("valid path").to_string()),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, channels);
+        let provider = RpcProvider::new(config, channels, test_metrics());
 
         assert_eq!(provider.node_pool().all_nodes().len(), 3);
 
@@ -787,7 +849,7 @@ min_healthy_nodes: 1
             nodes_config_path: Some("/nonexistent/path/nodes.yaml".to_string()),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, channels);
+        let provider = RpcProvider::new(config, channels, test_metrics());
         assert_eq!(provider.node_pool().all_nodes().len(), 1);
     }
 
@@ -798,7 +860,7 @@ min_healthy_nodes: 1
             rpc_url: "http://localhost:8545".to_string(),
             ..ProviderConfig::default()
         };
-        let provider = RpcProvider::new(config, channels);
+        let provider = RpcProvider::new(config, channels, test_metrics());
 
         let topics = provider.event_topics();
         assert_eq!(topics.len(), 5);
