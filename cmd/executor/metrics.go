@@ -79,6 +79,10 @@ var (
 		Name: "aether_circuit_breaker_trips_total",
 		Help: "Circuit breaker trip count by reason",
 	}, []string{"reason"})
+	shadowBundles = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aether_executor_shadow_bundles_total",
+		Help: "Bundles built+logged but not submitted (AETHER_SHADOW=1)",
+	})
 )
 
 func init() {
@@ -96,7 +100,12 @@ func init() {
 		builderLatencyMs,
 		systemStateGauge,
 		circuitBreakerTripsTotal,
+		shadowBundles,
 	)
+}
+
+func recordShadowBundle() {
+	shadowBundles.Inc()
 }
 
 func startMetricsServer() {
