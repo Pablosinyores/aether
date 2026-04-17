@@ -106,6 +106,12 @@ struct Args {
     #[arg(long, default_value_t = 8546)]
     anvil_port: u16,
 
+    /// Attach to an already-running Anvil at `--anvil-port` instead of
+    /// spawning a new one. Used by `scripts/historical_replay_e2e.sh`, which
+    /// spawns Anvil once and points the whole production pipeline at it.
+    #[arg(long, default_value_t = false)]
+    anvil_attach: bool,
+
     /// Write per-detection-event rows to this CSV path (intra-block mode only).
     /// Columns: block, tx_index, tx_hash, cycles, top_profit_factor, hops,
     /// path, est_gas, base_fee_gwei, gas_cost_eth, sim_net_profit_eth.
@@ -770,11 +776,24 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
     println!("  Block base fee:  {:.2} gwei", base_fee_wei as f64 / 1e9);
     println!("  Sim input:       {:.3} WETH", args.sim_input_weth);
 
-    // Spawn Anvil fork.
-    println!("\n  Spawning Anvil at port {} ...", args.anvil_port);
-    let anvil = spawn_anvil(rpc_url, fork_block, args.anvil_port)?;
-    wait_for_anvil(&anvil.url, Duration::from_secs(60)).await?;
-    let anvil_url: url::Url = anvil.url.parse()?;
+    // Anvil fork: spawn a new instance, or attach to a pre-existing one
+    // (used by the e2e orchestration script which runs the full pipeline
+    // against a single long-lived Anvil).
+    let anvil_url_str = format!("http://127.0.0.1:{}", args.anvil_port);
+    let _anvil_handle: Option<AnvilHandle> = if args.anvil_attach {
+        println!(
+            "\n  Attaching to existing Anvil at port {} ...",
+            args.anvil_port
+        );
+        wait_for_anvil(&anvil_url_str, Duration::from_secs(15)).await?;
+        None
+    } else {
+        println!("\n  Spawning Anvil at port {} ...", args.anvil_port);
+        let anvil = spawn_anvil(rpc_url, fork_block, args.anvil_port)?;
+        wait_for_anvil(&anvil.url, Duration::from_secs(60)).await?;
+        Some(anvil)
+    };
+    let anvil_url: url::Url = anvil_url_str.parse()?;
     let anvil_provider = ProviderBuilder::new().connect_http(anvil_url);
     println!("  Anvil ready.");
 
@@ -962,6 +981,6 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
         println!("  CSV:                       {}", path.display());
     }
 
-    drop(anvil);
+    drop(_anvil_handle);
     Ok(())
 }

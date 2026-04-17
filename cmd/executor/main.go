@@ -369,6 +369,25 @@ func processArb(
 	}
 	buildSpan.End()
 
+	// Shadow mode: the bundle is fully built and signed, but we skip the
+	// network submission. Used by historical replay + pre-prod measurement
+	// to exercise the full pipeline without touching Flashbots.
+	if isShadowMode() {
+		recordEndToEndLatency(receivedAt)
+		recordShadowBundle()
+		profitEth := weiToEth(profitWei)
+		slog.InfoContext(ctx, "shadow bundle built, skipping submission",
+			"arb_id", arb.Id,
+			"target_block", arb.BlockNumber+1,
+			"tip_tx_count", len(bundle.RawTxs),
+			"profit_eth", profitEth,
+			"gas", arb.TotalGas,
+			"tip_share_pct", tipSharePct,
+		)
+		span.SetAttributes(attribute.String("outcome", "shadow"))
+		return true, nil
+	}
+
 	// Submit to all builders
 	recordEndToEndLatency(receivedAt)
 	recordBundleSubmitted()
@@ -516,4 +535,19 @@ func stateToInt(s risk.SystemState) int {
 	default:
 		return -1
 	}
+}
+
+// isShadowMode reports whether AETHER_SHADOW is set to a truthy value.
+// Evaluated on every call so tests can flip the env without restart.
+func isShadowMode() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("AETHER_SHADOW")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func weiToEth(wei *big.Int) float64 {
+	if wei == nil || wei.Sign() == 0 {
+		return 0
+	}
+	f, _ := new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(1e18)).Float64()
+	return f
 }
