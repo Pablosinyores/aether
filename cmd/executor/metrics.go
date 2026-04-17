@@ -245,7 +245,10 @@ func fetchAndStoreBalance(ctx context.Context, client *ethclient.Client, addr co
 	return nil
 }
 
-func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration, live *LiveBalance) {
+// balanceWatchLoop periodically refreshes the searcher's ETH balance. rpcURL
+// is used only to strip the embedded API key from logged errors (Alchemy /
+// QuickNode / Infura all put the key in the URL path).
+func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration, live *LiveBalance, rpcURL string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -254,7 +257,7 @@ func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common
 			return
 		case <-ticker.C:
 			if err := fetchAndStoreBalance(ctx, client, addr, live); err != nil {
-				log.Printf("WARNING: eth_getBalance failed: %v", err)
+				log.Printf("WARNING: eth_getBalance failed: %v", redactRPCError(err, rpcURL))
 			}
 		}
 	}

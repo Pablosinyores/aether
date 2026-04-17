@@ -9,8 +9,9 @@
 #   fails fast on mismatch (prevents mainnet bundles from being sent to a
 #   testnet RPC, or vice versa).
 #
-# Both fields support ${ENV_VAR} expansion. AETHER_EXECUTOR_ADDRESS is the
-# conventional override for the address.
+# Both fields support ${ENV_VAR} substitution at load time. In practice the
+# address is sourced from the AETHER_EXECUTOR_ADDRESS env var via the
+# ${...} placeholder below, not via a post-load override path.
 
 executor_address: ${AETHER_EXECUTOR_ADDRESS}
 expected_chain_id: 1
