@@ -25,8 +25,9 @@ use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
 
 // Import the proto ValidatedArb type from service module
+use aether_grpc_server::EngineMetrics;
+
 use crate::pipeline;
-use crate::metrics::EngineMetrics;
 use crate::service::aether_proto::ValidatedArb as ProtoValidatedArb;
 
 /// Configuration for the AetherEngine.

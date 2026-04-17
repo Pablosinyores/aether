@@ -146,7 +146,7 @@ mod tests {
             reserve0, reserve1, ..
         } = received
         else {
-            panic!("dispatch returned unexpected variant");
+            panic!("dispatch returned unexpected variant: {received:?}");
         };
         assert_eq!(reserve0, U256::from(1000u64));
         assert_eq!(reserve1, U256::from(2000u64));
@@ -226,7 +226,7 @@ mod tests {
 
         for received in [r1, r2, r3] {
             let PoolEvent::V3Update { tick, liquidity, .. } = received else {
-                panic!("dispatch returned unexpected variant");
+                panic!("dispatch returned unexpected variant: {received:?}");
             };
             assert_eq!(tick, -50);
             assert_eq!(liquidity, 12345);

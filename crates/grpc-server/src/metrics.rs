@@ -134,7 +134,10 @@ impl EngineMetrics {
         self.decode_errors.inc();
     }
 
-    fn render(&self) -> Vec<u8> {
+    /// Render the registered metrics in Prometheus text exposition format.
+    /// `pub(crate)` so sibling modules (`provider::tests`) can assert on
+    /// rendered counter values without exposing the whole registry.
+    pub(crate) fn render(&self) -> Vec<u8> {
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -269,5 +272,6 @@ mod tests {
         assert!(output.contains("aether_simulations_run_total 3"));
         assert!(output.contains("aether_arbs_published_total 4"));
         assert!(output.contains("aether_blocks_processed_total 1"));
+        assert!(output.contains("aether_decode_errors_total 1"));
     }
 }
