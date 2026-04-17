@@ -325,7 +325,7 @@ mod tests {
         let info = state.get_account(&addr).expect("Account should exist");
         assert_eq!(info.balance, balance);
         assert_eq!(info.nonce, 0);
-        assert!(info.code.is_none() || info.code.as_ref().is_none_or(|c| c.is_empty()));
+        assert!(info.code.as_ref().is_none_or(|c| c.is_empty()));
     }
 
     #[test]
