@@ -360,29 +360,37 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
         IERC20(_pendingV3TokenIn).safeTransfer(msg.sender, amountOwed);
     }
 
-    /// @dev Curve: approve pool to pull tokens, call exchange, reset approval
+    /// @dev Curve: approve pool to pull tokens (capped at live balance), call exchange, reset approval.
+    ///      Capping mirrors the UniV2/Sushi pattern: if the off-chain optimizer over-specs amountIn
+    ///      relative to the live balance the pool's transferFrom would revert mid-flashloan, burning
+    ///      150-400 k gas plus the Aave premium.  The cap makes the on-chain math self-healing.
     function _swapCurve(SwapStep memory step, uint256 index) internal {
-        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
+        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
+        IERC20(step.tokenIn).forceApprove(step.pool, actualIn);
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
-    /// @dev Balancer V2: approve the registry-configured Vault to pull tokens.
+    /// @dev Balancer V2: approve the registry-configured Vault to pull tokens (capped at live balance).
+    ///      See _swapCurve for the reasoning behind the live-balance cap.
     function _swapBalancer(SwapStep memory step, uint256 index) internal {
         address vault = protocolRouter[BALANCER_V2];
         if (vault == address(0)) revert ZeroRouter();
-        IERC20(step.tokenIn).forceApprove(vault, step.amountIn);
+        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
+        IERC20(step.tokenIn).forceApprove(vault, actualIn);
         (bool success,) = vault.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(vault, 0);
     }
 
-    /// @dev Bancor V3: approve the registry-configured BancorNetwork to pull tokens.
+    /// @dev Bancor V3: approve the registry-configured BancorNetwork to pull tokens (capped at live balance).
+    ///      See _swapCurve for the reasoning behind the live-balance cap.
     function _swapBancor(SwapStep memory step, uint256 index) internal {
         address network = protocolRouter[BANCOR_V3];
         if (network == address(0)) revert ZeroRouter();
-        IERC20(step.tokenIn).forceApprove(network, step.amountIn);
+        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
+        IERC20(step.tokenIn).forceApprove(network, actualIn);
         (bool success,) = network.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(network, 0);
