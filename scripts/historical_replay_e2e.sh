@@ -257,12 +257,17 @@ log_ok "aether-rust running (PID $RUST_PID)"
 
 log_step "Phase 4: Start aether-executor (AETHER_SHADOW=1)"
 
+BUNDLE_DUMP_DIR="$REPORTS_DIR/bundles_$BLOCK"
+rm -rf "$BUNDLE_DUMP_DIR"
+mkdir -p "$BUNDLE_DUMP_DIR"
+
 ETH_RPC_URL="$ANVIL_RPC" \
 GRPC_ADDRESS="127.0.0.1:$GRPC_PORT" \
 SEARCHER_KEY="$STAGING_KEY" \
 METRICS_PORT="$GO_METRICS_PORT" \
 DASHBOARD_PORT="$DASHBOARD_PORT" \
 AETHER_SHADOW="1" \
+AETHER_SHADOW_DUMP_DIR="$BUNDLE_DUMP_DIR" \
     "$AETHER_EXECUTOR" > "$LOG_DIR/executor.log" 2>&1 &
 EXECUTOR_PID=$!
 
@@ -387,5 +392,103 @@ if [ "$PEAK_BUNDLES" -gt 0 ]; then
     log_error "Bundles were ACTUALLY submitted — shadow mode failed!"
     exit 1
 fi
+
+# ── Phase 8: Ground-truth vs pipeline comparison ────────────────────────
+
+log_step "Phase 8: Arb Catch Report"
+
+python3 - "$REPLAY_CSV" "$BUNDLE_DUMP_DIR" <<'PY' || log_warn "comparison failed (non-fatal)"
+import csv
+import json
+import os
+import sys
+from collections import defaultdict
+from glob import glob
+
+replay_csv, bundles_dir = sys.argv[1], sys.argv[2]
+
+replay_rows = []
+if os.path.exists(replay_csv):
+    with open(replay_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            # Normalise path string for matching; aether-replay uses
+            # "WETH -> AAVE -> WETH" with spaces, Go mirrors this.
+            row["path"] = row.get("path", "").strip()
+            replay_rows.append(row)
+
+bundles = []
+for p in sorted(glob(os.path.join(bundles_dir, "*.json"))):
+    try:
+        with open(p) as f:
+            bundles.append(json.load(f))
+    except Exception as e:
+        print(f"  (skipping {p}: {e})")
+
+def path_str(b):
+    return " -> ".join(b.get("path", []))
+
+# ── Per-path hit rate ────────────────────────────────────────────────
+replay_paths = defaultdict(int)
+for r in replay_rows:
+    replay_paths[r["path"]] += 1
+
+bundle_paths = defaultdict(int)
+for b in bundles:
+    bundle_paths[path_str(b)] += 1
+
+print()
+print("  Replay (ground truth) detection events:  {}".format(len(replay_rows)))
+print("  Pipeline shadow bundles built:            {}".format(len(bundles)))
+print()
+
+# ── Hit rate per path ────────────────────────────────────────────────
+all_paths = sorted(set(replay_paths) | set(bundle_paths))
+if all_paths:
+    print("  By path (replay / pipeline):")
+    for p in all_paths:
+        r = replay_paths.get(p, 0)
+        b = bundle_paths.get(p, 0)
+        hr = (100.0 * b / r) if r else 0.0
+        print(f"    {p:<40} {r:>4} / {b:>4}    ({hr:5.1f}%)")
+
+# ── Top bundles by profit ────────────────────────────────────────────
+if bundles:
+    top = sorted(bundles, key=lambda b: b.get("net_profit_eth", 0.0), reverse=True)[:5]
+    print()
+    print("  Top pipeline bundles by net_profit_eth:")
+    for b in top:
+        print(
+            "    id={id:<32} path={path:<28} profit={p:>14.6f} ETH  gas={gas}".format(
+                id=b.get("arb_id", "?"),
+                path=path_str(b),
+                p=b.get("net_profit_eth", 0.0),
+                gas=b.get("total_gas", 0),
+            )
+        )
+
+# ── Biggest arb in replay that didn't make it to a bundle ────────────
+if replay_rows and bundles:
+    bundle_path_set = set(bundle_paths)
+    missed = [r for r in replay_rows if r["path"] not in bundle_path_set]
+    if missed:
+        def profit(r):
+            try:
+                return float(r.get("sim_net_profit_eth") or r.get("sim_gross_profit_eth") or 0)
+            except ValueError:
+                return 0.0
+        biggest = max(missed, key=profit)
+        print()
+        print("  Largest replay-detected arb with NO matching pipeline bundle:")
+        print(f"    path:     {biggest.get('path')}")
+        print(f"    tx_index: {biggest.get('tx_index')}")
+        print(f"    profit:   {profit(biggest):.6f} ETH (replay estimate)")
+    else:
+        print()
+        print("  Every replay-detected path produced at least one pipeline bundle ✓")
+
+print()
+print("  Per-bundle JSONs: {}/".format(bundles_dir))
+print("  Inspect any bundle:  jq . {}/<arb_id>.json".format(bundles_dir))
+PY
 
 log_ok "E2E replay completed successfully (shadow mode held; no real submissions)"
