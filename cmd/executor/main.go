@@ -233,7 +233,8 @@ func main() {
 	// and bytecode checks.
 	if txSigner != nil {
 		if err := fetchAndStoreBalance(ctx, ethClient, txSigner.Address(), liveBalance); err != nil {
-			log.Fatalf("FATAL: initial eth_getBalance failed: %v", redactRPCError(err, rpcURL))
+			log.Fatalf("FATAL: initial eth_getBalance(%s) failed: %v",
+				txSigner.Address().Hex(), redactRPCError(err, rpcURL))
 		}
 		wg.Add(1)
 		go func() {
