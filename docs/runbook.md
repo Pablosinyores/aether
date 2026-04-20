@@ -284,6 +284,42 @@ curl -s http://localhost:9090/metrics | grep aether_eth_balance
 # Ensure cold wallet address is configured in risk.yaml
 ```
 
+## Emergency Pause
+
+`AetherExecutor.setPaused(bool)` is the fast-path circuit breaker for halting on-chain execution without touching ownership. It is separate from the Rust-side `ControlService/SetState` (which pauses opportunity detection in the Rust core) — pausing the contract stops `executeArb` from executing, while pausing the Rust side stops bundles from being submitted at all. Both may need to be toggled independently.
+
+### Pause execution (owner only)
+
+```bash
+cast send <EXECUTOR_ADDRESS> "setPaused(bool)" true \
+    --private-key <OWNER_KEY> --rpc-url <RPC_URL>
+```
+
+Any `executeArb` call will revert with `Paused()` while the flag is set.
+
+### Resume execution
+
+```bash
+cast send <EXECUTOR_ADDRESS> "setPaused(bool)" false \
+    --private-key <OWNER_KEY> --rpc-url <RPC_URL>
+```
+
+### Verify current state
+
+```bash
+cast call <EXECUTOR_ADDRESS> "paused()(bool)" --rpc-url <RPC_URL>
+```
+
+### Distinction from Rust-side pause
+
+| What it stops | Command |
+|---|---|
+| On-chain `executeArb` (contract layer) | `cast send ... "setPaused(bool)" true` |
+| Bundle submission (Go executor) | `grpcurl ... ControlService/SetState -d '{"state": "PAUSED"}'` |
+| Opportunity detection (Rust core) | `grpcurl ... ControlService/SetState -d '{"state": "PAUSED"}'` |
+
+For a full emergency stop, pause both layers. For MEV-risk scenarios where detection should continue but execution must stop, pause only the contract.
+
 ## Adding a DEX
 
 The executor supports two pathways, matched to what's actually changing:

@@ -236,9 +236,7 @@
 
 | Channel | Used For | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml` → `alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml` → `alerting.telegram` |
-| Discord | All severities | `config/risk.yaml` → `alerting.discord` |
+| Slack | All severities | `config/risk.yaml` → `alerting.slack` |
 
 ### Escalation Path
 
