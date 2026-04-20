@@ -285,19 +285,14 @@ REPLAY_CSV="$REPORTS_DIR/e2e_replay_$BLOCK.csv"
 log_info "Driving replay via aether-replay --full-block..."
 log_info "  CSV: $REPLAY_CSV"
 
-# Use the EXISTING aether-replay binary, pointed at our already-spawned Anvil.
-# `--anvil-port` tells it to reuse our Anvil instead of spawning its own.
-# NOTE: if the binary doesn't support reusing anvil yet, it spawns a sibling
-# on a different port — that's acceptable for the MVP, the REAL pipeline is
-# still consuming events from the ORIGINAL Anvil attached to aether-rust.
-#
-# For the cleanest e2e behaviour, we drive tx replay directly by inlining
-# the same logic as aether-replay's --full-block here. Simpler: just call it
-# and let it run; the pipeline collects metrics from its own event loop as
-# Anvil mines each tx's block.
+# Use the EXISTING aether-replay binary, pointed at our already-spawned Anvil
+# via `--anvil-attach --anvil-port $ANVIL_PORT`. The binary skips its own
+# Anvil spawn and drives tx replay through our long-lived fork, so every tx
+# mined hits the aether-rust event loop attached to this same Anvil.
 AETHER_REPLAY_LOG="warn" "$AETHER_REPLAY" \
     --block "$BLOCK" \
     --full-block \
+    --anvil-attach \
     --anvil-port "$ANVIL_PORT" \
     --csv "$REPLAY_CSV" \
     > "$LOG_DIR/replay.log" 2>&1 &

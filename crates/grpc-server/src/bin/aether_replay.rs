@@ -59,12 +59,14 @@ fn token_label(addr: &Address) -> String {
     const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
     const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
     const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
+    const AAVE: Address = address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9");
     match *addr {
         WETH => "WETH".into(),
         USDC => "USDC".into(),
         USDT => "USDT".into(),
         DAI => "DAI".into(),
         WBTC => "WBTC".into(),
+        AAVE => "AAVE".into(),
         _ => format!("{:#x}", addr).chars().take(10).collect::<String>() + "…",
     }
 }
@@ -393,7 +395,11 @@ fn build_graph(
 
 fn print_cycles(cycles: &[DetectedCycle], token_index: &TokenIndex, top: usize) {
     let mut ranked: Vec<&DetectedCycle> = cycles.iter().filter(|c| c.is_profitable()).collect();
-    ranked.sort_by(|a, b| a.total_weight.partial_cmp(&b.total_weight).unwrap());
+    ranked.sort_by(|a, b| {
+        a.total_weight
+            .partial_cmp(&b.total_weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let shown = ranked.iter().take(top);
     for (i, cycle) in shown.enumerate() {
@@ -1823,5 +1829,124 @@ fn truncate_err(s: &str) -> String {
         s.replace(['\n', ','], " ")
     } else {
         format!("{}…", &s.chars().take(240).collect::<String>().replace(['\n', ','], " "))
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Unit tests — pure helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_label_known_symbols() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let usdt = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+        let wbtc = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
+        let aave = address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9");
+        assert_eq!(token_label(&weth), "WETH");
+        assert_eq!(token_label(&usdc), "USDC");
+        assert_eq!(token_label(&usdt), "USDT");
+        assert_eq!(token_label(&dai), "DAI");
+        assert_eq!(token_label(&wbtc), "WBTC");
+        assert_eq!(token_label(&aave), "AAVE");
+    }
+
+    #[test]
+    fn token_label_unknown_falls_back_to_truncated_hex() {
+        let unknown = address!("1234567890123456789012345678901234567890");
+        let label = token_label(&unknown);
+        assert!(label.ends_with('\u{2026}'));
+        assert!(label.starts_with("0x"));
+    }
+
+    #[test]
+    fn parse_protocol_all_variants() {
+        assert_eq!(parse_protocol("uniswap_v2"), Some(ProtocolType::UniswapV2));
+        assert_eq!(parse_protocol("sushiswap"), Some(ProtocolType::SushiSwap));
+        assert_eq!(parse_protocol("uniswap_v3"), Some(ProtocolType::UniswapV3));
+        assert_eq!(parse_protocol("curve"), Some(ProtocolType::Curve));
+        assert_eq!(parse_protocol("balancer_v2"), Some(ProtocolType::BalancerV2));
+        assert_eq!(parse_protocol("bancor_v3"), Some(ProtocolType::BancorV3));
+    }
+
+    #[test]
+    fn parse_protocol_unknown_returns_none() {
+        assert!(parse_protocol("pancakeswap_v3").is_none());
+        assert!(parse_protocol("").is_none());
+        assert!(parse_protocol("UNISWAP_V2").is_none()); // case-sensitive
+    }
+
+    #[test]
+    fn uniswap_v2_get_amount_out_matches_onchain_math() {
+        // Hand-verified: 1 ETH in, 10 ETH / 20_000 USDC reserves, 30 bps fee.
+        //   amount_in_with_fee = 1e18 * 9970 = 9.97e21
+        //   numerator          = 9.97e21 * 2e10 = 1.994e32
+        //   denom              = 10e18 * 10000 + 9.97e21 = 1.0997e23
+        //   amount_out         = 1.994e32 / 1.0997e23 ≈ 1.8136e9 micro-USDC
+        let amt = uniswap_v2_get_amount_out(
+            U256::from(1_000_000_000_000_000_000u128),  // 1 WETH
+            U256::from(10_000_000_000_000_000_000u128), // 10 WETH reserves
+            U256::from(20_000_000_000u64),              // 20_000 USDC (6 dec)
+            30,
+        )
+        .unwrap();
+        // Strictly below the no-slippage ceiling (2e9 micro-USDC = 2000 USDC).
+        assert!(amt > U256::ZERO);
+        assert!(amt < U256::from(2_000_000_000u64));
+        // Within ~1 USDC of the analytical answer (1813.6 USDC).
+        assert!(amt >= U256::from(1_813_000_000u64));
+        assert!(amt <= U256::from(1_814_000_000u64));
+    }
+
+    #[test]
+    fn uniswap_v2_get_amount_out_rejects_degenerate_inputs() {
+        // Zero reserves on either side = no liquidity
+        assert!(uniswap_v2_get_amount_out(U256::from(1u64), U256::ZERO, U256::from(100u64), 30).is_none());
+        assert!(uniswap_v2_get_amount_out(U256::from(1u64), U256::from(100u64), U256::ZERO, 30).is_none());
+        // Zero input — nothing to swap
+        assert!(uniswap_v2_get_amount_out(U256::ZERO, U256::from(100u64), U256::from(100u64), 30).is_none());
+    }
+
+    #[test]
+    fn truncate_err_short_passthrough() {
+        let s = "simple error no commas or newlines";
+        assert_eq!(truncate_err(s), s);
+    }
+
+    #[test]
+    fn truncate_err_strips_commas_and_newlines() {
+        let s = "error line1\nline2, with comma";
+        let out = truncate_err(s);
+        assert!(!out.contains('\n'));
+        assert!(!out.contains(','));
+    }
+
+    #[test]
+    fn truncate_err_caps_at_240_chars() {
+        let s = "x".repeat(500);
+        let out = truncate_err(&s);
+        // 240 chars + a single ellipsis sentinel
+        assert!(out.chars().count() <= 241);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn u256_to_f64_roundtrip_small_values() {
+        // Exact for integers below 2^52 (f64 mantissa limit).
+        for &v in &[0u64, 1, 42, 1_000_000, (1u64 << 52) - 1] {
+            assert_eq!(u256_to_f64(U256::from(v)), v as f64);
+        }
+    }
+
+    #[test]
+    fn u256_to_f64_handles_one_eth() {
+        // 1e18 wei in U256 should f64-round to exactly 1e18 (representable).
+        let one_eth = U256::from(10u64).pow(U256::from(18u64));
+        assert_eq!(u256_to_f64(one_eth), 1e18);
     }
 }
