@@ -360,37 +360,59 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
         IERC20(_pendingV3TokenIn).safeTransfer(msg.sender, amountOwed);
     }
 
-    /// @dev Curve: approve pool to pull tokens (capped at live balance), call exchange, reset approval.
-    ///      Capping mirrors the UniV2/Sushi pattern: if the off-chain optimizer over-specs amountIn
-    ///      relative to the live balance the pool's transferFrom would revert mid-flashloan, burning
-    ///      150-400 k gas plus the Aave premium.  The cap makes the on-chain math self-healing.
+    /// @dev Curve: approve pool to pull tokens, call exchange, reset approval.
+    ///
+    ///      PULL-BASED PROTOCOL — the Curve pool calls `transferFrom(executor, pool, amount)`
+    ///      where `amount` is parsed from the calldata encoded in `step.data` (set off-chain
+    ///      by the engine with `step.amountIn`). A live-balance cap at this layer would only
+    ///      reduce the ERC-20 allowance, not the amount encoded in `step.data`. The pool would
+    ///      then attempt `transferFrom` for `step.data`-amount but find allowance < that amount,
+    ///      reverting with ERC20InsufficientAllowance — same gas burn, same Aave premium lost.
+    ///
+    ///      Correct sizing is the engine's responsibility: the off-chain calldata encoder MUST
+    ///      intersect `amount_in` with the live post-prior-hop balance before encoding the swap,
+    ///      ensuring the approved amount and the amount encoded in `step.data` always match.
+    ///      Engine-side live-balance intersection is tracked in issue #97.
+    ///
+    ///      Contrast with UniV2/Sushi (push-based): the executor calls `safeTransfer(pool, actualIn)`
+    ///      before invoking `swap(...)`, so capping the transfer at live balance is safe and correct.
+    ///      That cap remains in place and is unchanged.
     function _swapCurve(SwapStep memory step, uint256 index) internal {
-        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
-        IERC20(step.tokenIn).forceApprove(step.pool, actualIn);
+        IERC20(step.tokenIn).forceApprove(step.pool, step.amountIn);
         (bool success,) = step.pool.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(step.pool, 0);
     }
 
-    /// @dev Balancer V2: approve the registry-configured Vault to pull tokens (capped at live balance).
-    ///      See _swapCurve for the reasoning behind the live-balance cap.
+    /// @dev Balancer V2: approve the registry-configured Vault to pull tokens.
+    ///
+    ///      PULL-BASED PROTOCOL — the Balancer Vault calls `transferFrom(executor, vault, amount)`
+    ///      where `amount` comes from the `IAsset[]` amounts encoded inside `step.data`. A
+    ///      live-balance cap on the allowance alone does not cap the amount the Vault will try
+    ///      to pull — it causes ERC20InsufficientAllowance on any dust shortfall.
+    ///      Amount sizing is the engine's responsibility (see issue #97).
+    ///      See _swapCurve for the full push-vs-pull rationale.
     function _swapBalancer(SwapStep memory step, uint256 index) internal {
         address vault = protocolRouter[BALANCER_V2];
         if (vault == address(0)) revert ZeroRouter();
-        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
-        IERC20(step.tokenIn).forceApprove(vault, actualIn);
+        IERC20(step.tokenIn).forceApprove(vault, step.amountIn);
         (bool success,) = vault.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(vault, 0);
     }
 
-    /// @dev Bancor V3: approve the registry-configured BancorNetwork to pull tokens (capped at live balance).
-    ///      See _swapCurve for the reasoning behind the live-balance cap.
+    /// @dev Bancor V3: approve the registry-configured BancorNetwork to pull tokens.
+    ///
+    ///      PULL-BASED PROTOCOL — BancorNetwork calls `transferFrom(executor, network, sourceAmount)`
+    ///      where `sourceAmount` is ABI-encoded inside `step.data`. A live-balance cap on the
+    ///      allowance alone does not reduce `sourceAmount` in the calldata — it causes
+    ///      ERC20InsufficientAllowance on any shortfall.
+    ///      Amount sizing is the engine's responsibility (see issue #97).
+    ///      See _swapCurve for the full push-vs-pull rationale.
     function _swapBancor(SwapStep memory step, uint256 index) internal {
         address network = protocolRouter[BANCOR_V3];
         if (network == address(0)) revert ZeroRouter();
-        uint256 actualIn = Math.min(step.amountIn, IERC20(step.tokenIn).balanceOf(address(this)));
-        IERC20(step.tokenIn).forceApprove(network, actualIn);
+        IERC20(step.tokenIn).forceApprove(network, step.amountIn);
         (bool success,) = network.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(network, 0);
