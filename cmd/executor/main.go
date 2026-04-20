@@ -95,7 +95,7 @@ func parseExecutorAddressEnv(raw string) (string, error) {
 		return "", fmt.Errorf("unset — set to the deployed AetherExecutor contract address")
 	}
 	if !common.IsHexAddress(raw) {
-		return "", fmt.Errorf("%q is not a valid hex address", raw)
+		return "", fmt.Errorf("EXECUTOR_ADDRESS is not a valid hex address (input length=%d)", len(raw))
 	}
 	addr := common.HexToAddress(raw)
 	if addr == (common.Address{}) {
