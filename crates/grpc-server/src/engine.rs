@@ -681,6 +681,26 @@ impl AetherEngine {
                     }
                 }
             }
+            PoolEvent::V2Swap {
+                pool,
+                sender,
+                to,
+                amount0_in,
+                amount1_in,
+                amount0_out,
+                amount1_out,
+            } => {
+                // Informational only — reserves reconcile via the paired
+                // `Sync` event, which arrives in the same log batch and
+                // drives `ReserveUpdate` above. This arm exists so the
+                // match stays exhaustive and downstream trade analytics
+                // have a hook.
+                debug!(
+                    %pool, %sender, %to,
+                    %amount0_in, %amount1_in, %amount0_out, %amount1_out,
+                    "V2 swap (informational)"
+                );
+            }
             PoolEvent::V3Update {
                 pool,
                 sqrt_price_x96,
