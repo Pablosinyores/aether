@@ -263,6 +263,10 @@ func LoadExecutorConfig(path string) (ExecutorFileConfig, error) {
 		return cfg, fmt.Errorf("parse executor config %s: %w", path, err)
 	}
 
+	// Normalize whitespace before validation so downstream consumers and log
+	// sites see the clean address without padding.
+	cfg.ExecutorAddress = strings.TrimSpace(cfg.ExecutorAddress)
+
 	if err := ValidateExecutorConfig(cfg); err != nil {
 		return cfg, fmt.Errorf("validate executor config: %w", err)
 	}

@@ -7,12 +7,105 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// LiveBalance is read on the arb hot path and written by balanceWatchLoop.
+// These tests pin the atomic-float64 contract — round-trip correctness for
+// edge values and race-free concurrent Get/Set — so a future refactor that
+// silently replaces the atomic.Uint64 with a plain float64 (which would
+// tear reads under contention) fails loudly.
+
+func TestLiveBalance_ZeroValue(t *testing.T) {
+	lb := NewLiveBalance()
+	if got := lb.Get(); got != 0 {
+		t.Fatalf("fresh LiveBalance.Get() = %v, want 0", got)
+	}
+}
+
+func TestLiveBalance_SetGetRoundTrip(t *testing.T) {
+	cases := []float64{
+		0,
+		1,
+		0.5,
+		1e18,
+		1e-18,
+		math.MaxFloat64,
+		math.SmallestNonzeroFloat64,
+	}
+	lb := NewLiveBalance()
+	for _, v := range cases {
+		lb.Set(v)
+		if got := lb.Get(); got != v {
+			t.Errorf("round-trip %v: got %v", v, got)
+		}
+	}
+}
+
+func TestLiveBalance_OverwritesPreviousValue(t *testing.T) {
+	lb := NewLiveBalance()
+	lb.Set(3.14)
+	lb.Set(2.71)
+	if got := lb.Get(); got != 2.71 {
+		t.Fatalf("after two Sets, Get() = %v, want 2.71", got)
+	}
+}
+
+func TestLiveBalance_ConcurrentSetGet(t *testing.T) {
+	// The contract is: Get always returns a value that was passed to Set by
+	// some goroutine. Float64 tearing (observing a bit pattern that was
+	// never written) must not happen.
+	lb := NewLiveBalance()
+	const writers = 8
+	const readers = 8
+	const iters = 10_000
+
+	// Valid write values. Every observed read must match one of these.
+	values := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8}
+	valid := make(map[float64]struct{}, len(values)+1)
+	for _, v := range values {
+		valid[v] = struct{}{}
+	}
+	valid[0] = struct{}{} // zero-value is also valid (never-written state)
+
+	var wg sync.WaitGroup
+	wg.Add(writers + readers)
+
+	for w := 0; w < writers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				lb.Set(values[(id+i)%len(values)])
+			}
+		}(w)
+	}
+
+	var tearCount int64
+	var tearMu sync.Mutex
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				v := lb.Get()
+				if _, ok := valid[v]; !ok {
+					tearMu.Lock()
+					tearCount++
+					tearMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	if tearCount != 0 {
+		t.Fatalf("observed %d torn reads out of %d, atomic contract broken", tearCount, readers*iters)
+	}
+}
 
 func TestMetricsEndpoint_ContainsRequiredMetrics(t *testing.T) {
 	server := httptest.NewServer(promhttp.Handler())
