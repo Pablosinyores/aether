@@ -167,6 +167,28 @@ contract MockBalancerVault {
     }
 }
 
+/// @dev Counting Balancer Vault — tracks swap call count to assert routing target
+contract CountingBalancerVault {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+    uint256 public swapCallCount;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        swapCallCount += 1;
+        uint256 approved = tokenIn.allowance(msg.sender, address(this));
+        require(approved > 0, "CountingVault: no approval");
+        tokenIn.transferFrom(msg.sender, address(this), approved);
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
 /// @dev Mock Bancor router — pulls tokenIn via transferFrom, sends tokenOut
 contract MockBancorRouter {
     MockERC20 public immutable tokenIn;
@@ -1393,6 +1415,81 @@ contract AetherExecutorTest is Test {
         assertEq(executor.protocolRouter(BALANCER_V2), newVault, "router not updated");
     }
 
+    /// @dev End-to-end: setDexRouter(BALANCER_V2, secondVault) must route the next Balancer
+    ///      hop to the NEW vault and leave the original vault untouched.
+    function test_setDexRouter_balancerV2_routesToNewVault() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Deploy two vaults — both can serve the swap; we assert only the second is called.
+        CountingBalancerVault firstVault = new CountingBalancerVault(tokenIn, tokenOut, swapOut);
+        CountingBalancerVault secondVault = new CountingBalancerVault(tokenIn, tokenOut, swapOut);
+
+        // Seed both vaults with enough tokenOut to complete the swap.
+        tokenOut.mint(address(firstVault), swapOut);
+        tokenOut.mint(address(secondVault), swapOut);
+
+        // Deploy executor pointing at firstVault.
+        AetherExecutor regExecutor = new AetherExecutor(address(aavePool), address(firstVault), address(0xBAAC));
+
+        // Migrate to secondVault — this is the action under test.
+        regExecutor.setDexRouter(BALANCER_V2, address(secondVault));
+        assertEq(regExecutor.protocolRouter(BALANCER_V2), address(secondVault), "router not updated");
+
+        // Return pool to close the arb loop.
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory balancerData = abi.encodeWithSignature(
+            "swap(bytes32,address,address,uint256,uint256)",
+            bytes32(0),
+            address(tokenIn),
+            address(tokenOut),
+            flashAmount,
+            swapOut
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(regExecutor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: BALANCER_V2,
+            pool: address(secondVault), // pool field is informational for Balancer; router drives the call
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: balancerData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        regExecutor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
+
+        // Only the second vault must have been called.
+        assertEq(secondVault.swapCallCount(), 1, "secondVault must receive exactly one swap call");
+        assertEq(firstVault.swapCallCount(), 0, "firstVault must not be called after router migration");
+        // Approval to the new vault must be reset to 0 after the swap.
+        assertEq(tokenIn.allowance(address(regExecutor), address(secondVault)), 0, "approval not reset");
+    }
+
     function test_setDexRouter_revert_zeroRouter() public {
         vm.expectRevert(AetherExecutor.ZeroRouter.selector);
         executor.setDexRouter(BALANCER_V2, address(0));
@@ -1767,12 +1864,14 @@ contract AetherExecutorTest is Test {
 
     function test_protocolConstants_implicitlyMatch() public view {
         // In-range (1..=6) must all be enabled at construction.
-        assertTrue(executor.protocolEnabled(UNISWAP_V2), "UNISWAP_V2 (1)");
-        assertTrue(executor.protocolEnabled(UNISWAP_V3), "UNISWAP_V3 (2)");
-        assertTrue(executor.protocolEnabled(SUSHISWAP), "SUSHISWAP (3)");
-        assertTrue(executor.protocolEnabled(CURVE), "CURVE (4)");
-        assertTrue(executor.protocolEnabled(BALANCER_V2), "BALANCER_V2 (5)");
-        assertTrue(executor.protocolEnabled(BANCOR_V3), "BANCOR_V3 (6)");
+        // Hardcoded numeric IDs — using the test-file constants here would make
+        // the sentinel circular: if a constant drifted, the test would still pass.
+        assertTrue(executor.protocolEnabled(1), "UNISWAP_V2 (1)");
+        assertTrue(executor.protocolEnabled(2), "UNISWAP_V3 (2)");
+        assertTrue(executor.protocolEnabled(3), "SUSHISWAP (3)");
+        assertTrue(executor.protocolEnabled(4), "CURVE (4)");
+        assertTrue(executor.protocolEnabled(5), "BALANCER_V2 (5)");
+        assertTrue(executor.protocolEnabled(6), "BANCOR_V3 (6)");
 
         // Out-of-range (0 and >=7) must stay default-false.
         assertFalse(executor.protocolEnabled(0), "protocol 0 must be disabled");

@@ -116,7 +116,7 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
     /// @dev Only valid for BALANCER_V2 and BANCOR_V3 in the current implementation; the
     ///      per-swap-pool protocols keep address(0) here.
     function setDexRouter(uint8 protocol, address router) external onlyOwner {
-        if (protocol == 0 || protocol > BANCOR_V3) revert UnknownProtocol(protocol);
+        if (!_isValidProtocol(protocol)) revert UnknownProtocol(protocol);
         if (router == address(0)) revert ZeroRouter();
         protocolRouter[protocol] = router;
         emit DexRouterSet(protocol, router);
@@ -124,7 +124,7 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
 
     /// @notice Per-protocol kill switch. Idempotent — no event on no-op writes.
     function setDexEnabled(uint8 protocol, bool enabled) external onlyOwner {
-        if (protocol == 0 || protocol > BANCOR_V3) revert UnknownProtocol(protocol);
+        if (!_isValidProtocol(protocol)) revert UnknownProtocol(protocol);
         if (protocolEnabled[protocol] == enabled) return;
         protocolEnabled[protocol] = enabled;
         emit DexEnabledSet(protocol, enabled);
@@ -163,7 +163,7 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
         uint256 stepsLen = steps.length;
         for (uint256 i = 0; i < stepsLen;) {
             uint8 p = steps[i].protocol;
-            if (p == 0 || p > BANCOR_V3) revert UnknownProtocol(p);
+            if (!_isValidProtocol(p)) revert UnknownProtocol(p);
             if (!protocolEnabled[p]) revert ProtocolDisabled(p);
             unchecked { ++i; }
         }
@@ -394,6 +394,12 @@ contract AetherExecutor is Ownable2Step, ReentrancyGuard {
         (bool success,) = network.call(step.data);
         if (!success) revert SwapFailed(index);
         IERC20(step.tokenIn).forceApprove(network, 0);
+    }
+
+    /// @dev Returns true iff `protocol` falls in the valid range [UNISWAP_V2, BANCOR_V3].
+    ///      Zero is reserved as "unset" and is always invalid.
+    function _isValidProtocol(uint8 protocol) internal pure returns (bool) {
+        return protocol >= UNISWAP_V2 && protocol <= BANCOR_V3;
     }
 
     /// @notice Emergency rescue - owner only. token==address(0) rescues native ETH.
