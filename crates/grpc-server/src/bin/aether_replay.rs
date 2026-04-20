@@ -24,10 +24,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use aether_common::types::{PoolId, ProtocolType};
+use aether_common::types::{PoolId, ProtocolType, SwapStep};
 use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::gas as gas_model;
 use aether_detector::opportunity::DetectedCycle;
+use aether_simulator::calldata::{
+    build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
+};
+use aether_simulator::fork::{RpcForkedState, SimConfig};
+use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
 
@@ -140,6 +145,21 @@ struct Args {
     /// profit. `sim_net_profit = profit_factor * input - gas_cost`.
     #[arg(long, default_value_t = 1.0)]
     sim_input_weth: f64,
+
+    /// Run each detected cycle through a full on-chain simulation of
+    /// `AetherExecutor.executeArb()` on the replay's Anvil fork (revm under
+    /// the hood). Each detection triggers: `evm_snapshot` → deploy-if-needed
+    /// → impersonate owner → send tx → measure WETH balance delta →
+    /// `evm_revert`. Kills graph-math outliers from drained-liquidity pools
+    /// and reports actual-executable P&L per cycle. Requires the AetherExecutor
+    /// Solidity artifact at `--executor-artifact` (default `contracts/out/AetherExecutor.sol/AetherExecutor.json`).
+    #[arg(long, default_value_t = false)]
+    sim_on_chain: bool,
+
+    /// Path to the compiled `AetherExecutor.json` (forge artifact). Only read
+    /// when `--sim-on-chain` is set.
+    #[arg(long, default_value = "contracts/out/AetherExecutor.sol/AetherExecutor.json")]
+    executor_artifact: PathBuf,
 }
 
 #[derive(serde::Deserialize)]
@@ -792,7 +812,7 @@ async fn run_batch_replay(args: &Args, rpc_url: &str, blocks: &[u64]) -> Result<
                 use std::io::Write;
                 writeln!(
                     f,
-                    "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
+                    "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason"
                 )?;
                 Some(std::cell::RefCell::new(f))
             }
@@ -1022,12 +1042,46 @@ async fn run_full_block_replay(
     // Per-tx replay + detection.
     let mut opp_events: Vec<(u64, usize)> = Vec::new(); // (tx_index, profitable_cycles)
     let mut total_net_profit_eth = 0.0f64;
+    let mut total_sim_profit_eth = 0.0f64;
+    let mut sim_success_count = 0usize;
+    let mut sim_revert_count = 0usize;
+    let mut sim_skip_count = 0usize;
     let mut skipped = 0usize;
     let mut reverted = 0usize;
     let detector = BellmanFord::new(args.max_hops, args.max_time_us);
 
+    // Deploy AetherExecutor once per Anvil instance when on-chain sim is on.
+    // Address is deterministic (CREATE from SIM_OWNER nonce 0), so subsequent
+    // detections reuse the same executor for every cycle in this block.
+    let sim_executor_addr: Option<Address> = if args.sim_on_chain {
+        match load_executor_init_bytecode(&args.executor_artifact) {
+            Ok(init) => match deploy_executor_on_anvil(&anvil_provider, &init).await {
+                Ok(addr) => {
+                    println!("  Sim executor:    deployed at {:#x}", addr);
+                    Some(addr)
+                }
+                Err(e) => {
+                    println!("  Sim executor:    DEPLOY FAILED — on-chain sim disabled ({})", e);
+                    None
+                }
+            },
+            Err(e) => {
+                println!(
+                    "  Sim executor:    artifact load failed — on-chain sim disabled ({})",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        println!("  Sim executor:    off (pass --sim-on-chain to enable)");
+        None
+    };
+
     // Local CSV writer (single-block mode). Batch mode passes `shared_csv`
-    // instead and this stays None.
+    // instead and this stays None. New columns `sim_success / sim_profit_eth /
+    // sim_gas_used / sim_revert_reason` surface the on-chain-sim verdict next
+    // to the offline graph-math estimate.
     let mut local_csv_writer: Option<std::io::BufWriter<std::fs::File>> =
         if shared_csv.is_none() {
             match &args.csv {
@@ -1036,7 +1090,7 @@ async fn run_full_block_replay(
                     use std::io::Write;
                     writeln!(
                         f,
-                        "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
+                        "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason"
                     )?;
                     Some(f)
                 }
@@ -1149,6 +1203,39 @@ async fn run_full_block_replay(
                 total_net_profit_eth += est.net_profit_eth;
             }
 
+            // On-chain sim: run executeArb through revm (via Anvil) for this
+            // cycle and measure actual WETH delivered to the owner. This is
+            // what actually matters — graph-level profit_factor is a lower-
+            // bound radar that needs the revm verdict before we call it P&L.
+            let sim_outcome = if let Some(executor) = sim_executor_addr {
+                let outcome = sim_arb_with_evm_simulator(
+                    &anvil_provider,
+                    executor,
+                    top_cycle,
+                    &graph,
+                    &token_index,
+                    &pools,
+                    args.sim_input_weth,
+                )
+                .await;
+                if outcome.success {
+                    sim_success_count += 1;
+                    total_sim_profit_eth += u256_to_f64(outcome.profit_wei) / 1e18;
+                } else if outcome
+                    .revert_reason
+                    .as_deref()
+                    .map(|r| r.starts_with("skipped"))
+                    .unwrap_or(false)
+                {
+                    sim_skip_count += 1;
+                } else {
+                    sim_revert_count += 1;
+                }
+                Some(outcome)
+            } else {
+                None
+            };
+
             println!(
                 "  tx #{:3}  {}  → {} cycle(s), touched {} pool(s)",
                 i,
@@ -1162,7 +1249,7 @@ async fn run_full_block_replay(
                 path_str
             );
             println!(
-                "           sim @ {:.2} WETH input:  gross {:+.4} ETH  - gas {:.5} ETH  = net {:+.4} ETH  (gas {}, base fee {:.1} gwei)",
+                "           graph @ {:.2} WETH input:  gross {:+.4} ETH  - gas {:.5} ETH  = net {:+.4} ETH  (gas {}, base fee {:.1} gwei)",
                 args.sim_input_weth,
                 est.gross_profit_eth,
                 est.gas_cost_eth,
@@ -1170,6 +1257,32 @@ async fn run_full_block_replay(
                 est.gas_units,
                 est.base_fee_gwei,
             );
+            if let Some(ref sim) = sim_outcome {
+                if sim.success {
+                    println!(
+                        "           revm sim: ✓ SUCCESS — actual profit {:+.6} ETH (gas used {})",
+                        u256_to_f64(sim.profit_wei) / 1e18,
+                        sim.gas_used,
+                    );
+                } else {
+                    let reason = sim
+                        .revert_reason
+                        .as_deref()
+                        .unwrap_or("unknown revert");
+                    println!("           revm sim: ✗ REVERTED — {}", reason);
+                }
+            }
+
+            // CSV row. `sim_*` columns are empty when on-chain sim is off.
+            let (sim_success, sim_profit_eth, sim_gas_used, sim_reason) = match &sim_outcome {
+                Some(s) => (
+                    if s.success { "true" } else { "false" }.to_string(),
+                    format!("{:.8}", u256_to_f64(s.profit_wei) / 1e18),
+                    s.gas_used.to_string(),
+                    s.revert_reason.clone().unwrap_or_default(),
+                ),
+                None => ("".into(), "".into(), "".into(), "".into()),
+            };
 
             // Write the CSV row — either to this run's local file, or into
             // the batch-shared writer if we were called from `run_batch_replay`.
@@ -1178,7 +1291,7 @@ async fn run_full_block_replay(
                 let mut w = cell.borrow_mut();
                 writeln!(
                     w,
-                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6}",
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr}",
                     block = args.block,
                     tx = i,
                     hash = tx_hash,
@@ -1191,12 +1304,16 @@ async fn run_full_block_replay(
                     gc = est.gas_cost_eth,
                     gp = est.gross_profit_eth,
                     np = est.net_profit_eth,
+                    ss = sim_success,
+                    sp = sim_profit_eth,
+                    sg = sim_gas_used,
+                    sr = sim_reason,
                 )?;
             } else if let Some(w) = local_csv_writer.as_mut() {
                 use std::io::Write;
                 writeln!(
                     w,
-                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6}",
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr}",
                     block = args.block,
                     tx = i,
                     hash = tx_hash,
@@ -1209,6 +1326,10 @@ async fn run_full_block_replay(
                     gc = est.gas_cost_eth,
                     gp = est.gross_profit_eth,
                     np = est.net_profit_eth,
+                    ss = sim_success,
+                    sp = sim_profit_eth,
+                    sg = sim_gas_used,
+                    sr = sim_reason,
                 )?;
             }
         }
@@ -1230,9 +1351,19 @@ async fn run_full_block_replay(
     println!("  Txs reverted:              {}", reverted);
     println!("  Detection events:          {}", opp_events.len());
     println!(
-        "  Theoretical net captureable: {:+.4} ETH (at {:.2} WETH input, sum over tx windows)",
+        "  Theoretical net captureable: {:+.4} ETH (graph-level, at {:.2} WETH input, sum over tx windows)",
         total_net_profit_eth, args.sim_input_weth
     );
+    if args.sim_on_chain {
+        println!(
+            "  Revm-sim result:           {} succeeded / {} reverted / {} skipped",
+            sim_success_count, sim_revert_count, sim_skip_count
+        );
+        println!(
+            "  Actually-executable P&L:   {:+.6} ETH (sum of revm-confirmed per-cycle profits at {:.2} WETH input)",
+            total_sim_profit_eth, args.sim_input_weth
+        );
+    }
     println!("  Replay time:               {} ms", replay_ms);
     if let Some(path) = &args.csv {
         println!("  CSV:                       {}", path.display());
@@ -1240,4 +1371,457 @@ async fn run_full_block_replay(
 
     drop(_anvil_handle);
     Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// On-chain simulation via Anvil's snapshot/revert (revm under the hood)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// This closes the gap between Bellman-Ford graph-level profit factors and
+// actually-executable MEV. Per detection we deploy AetherExecutor once per
+// block, then for every cycle: evm_snapshot → build executeArb calldata →
+// impersonate owner → send tx → measure WETH balance delta → evm_revert.
+//
+// Catches what graph math misses:
+//   * INSUFFICIENT_LIQUIDITY on drained pools (the 1M ETH outlier in
+//     post-CoW-exploit blocks)
+//   * UniswapV2 K-invariant violations on partial reserves
+//   * Flashloan repayment shortfalls
+//   * V3 tick-crossing math failures
+//   * Aave premium not covered by round-trip profit
+//   * Cross-hop state consistency bugs in our own executor
+
+// Mainnet infra addresses — constructor args for AetherExecutor. Anvil forks
+// mainnet, so these contracts exist at their mainnet addresses on the fork.
+const AAVE_POOL: Address = address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+const BANCOR_NETWORK: Address = address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB");
+const WETH_ADDR: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+
+/// Deterministic owner/deployer address the replay uses to deploy and then
+/// own the simulated AetherExecutor instance. Value is arbitrary — any
+/// non-mainnet-contract address works — but fixing it keeps logs readable.
+const SIM_OWNER: Address = address!("1111111111111111111111111111111111111111");
+
+// WETH ERC20 `balanceOf(address) -> uint256` — used to measure arb profit
+// post-sim (the executor sweeps profit to `owner()` as WETH via safeTransfer
+// at the end of executeOperation when `asset == WETH`).
+sol! {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+/// Result of a single on-chain sim of `executeArb` for one detected cycle.
+struct SimOutcome {
+    /// True iff the executeArb tx landed successfully AND `minProfitOut`
+    /// would have been met (we pass 0 so any non-negative profit succeeds).
+    success: bool,
+    /// Actual WETH profit delivered to the owner, measured as
+    /// `WETH.balanceOf(owner) after - before`. Zero on revert.
+    profit_wei: U256,
+    /// Gas consumed by the executeArb tx (flashloan callback included since
+    /// Aave V3 charges within the same tx).
+    gas_used: u64,
+    /// Either the revert reason (truncated) or `"skipped: <why>"` for cycles
+    /// we couldn't build valid calldata for.
+    revert_reason: Option<String>,
+}
+
+/// Load AetherExecutor init-bytecode from the forge-compiled JSON artifact.
+/// We use `bytecode.object` (deploy bytecode, runs constructor + installs
+/// runtime) not `deployedBytecode` — the constructor fills `aavePool`
+/// immutable and sets `owner = msg.sender`.
+fn load_executor_init_bytecode(artifact_path: &PathBuf) -> Result<Vec<u8>> {
+    let raw = std::fs::read_to_string(artifact_path)
+        .with_context(|| format!("read executor artifact {}", artifact_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parse executor artifact JSON")?;
+    let hex_str = v
+        .pointer("/bytecode/object")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing /bytecode/object in artifact"))?;
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = alloy::hex::decode(stripped).context("decode bytecode hex")?;
+    if bytes.is_empty() {
+        anyhow::bail!("executor bytecode is empty — artifact may be abstract / interface-only");
+    }
+    Ok(bytes)
+}
+
+/// Deploy `AetherExecutor` on the Anvil fork from `SIM_OWNER` with constructor
+/// args `(AAVE_POOL, BALANCER_VAULT, BANCOR_NETWORK)`. Returns the deployed
+/// contract address. Impersonation + balance seeding are done here so the
+/// caller only needs to invoke once per Anvil instance.
+async fn deploy_executor_on_anvil<P: Provider + Clone>(
+    provider: &P,
+    init_bytecode: &[u8],
+) -> Result<Address> {
+    // 1. Fund the deployer so the deployment tx can pay gas.
+    let hundred_eth = U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+    provider
+        .raw_request::<_, ()>(
+            "anvil_setBalance".into(),
+            (SIM_OWNER, format!("0x{:x}", hundred_eth)),
+        )
+        .await
+        .context("anvil_setBalance for SIM_OWNER")?;
+
+    // 2. Impersonate (auto-impersonate may or may not already cover SIM_OWNER
+    //    — call explicitly to be safe; idempotent on Anvil).
+    provider
+        .raw_request::<_, ()>("anvil_impersonateAccount".into(), (SIM_OWNER,))
+        .await
+        .context("anvil_impersonateAccount SIM_OWNER")?;
+
+    // 3. Encode constructor args after the init-bytecode.
+    use alloy::sol_types::SolValue;
+    let ctor_args = (AAVE_POOL, BALANCER_VAULT, BANCOR_NETWORK).abi_encode_params();
+    let mut deploy_data = init_bytecode.to_vec();
+    deploy_data.extend_from_slice(&ctor_args);
+
+    // 4. Send the deployment tx. `to: None` == CREATE.
+    let tx = TransactionRequest::default()
+        .from(SIM_OWNER)
+        .input(deploy_data.into())
+        .gas_limit(8_000_000);
+
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .context("send AetherExecutor deploy tx")?;
+    let receipt = pending
+        .get_receipt()
+        .await
+        .context("get AetherExecutor deploy receipt")?;
+
+    if !receipt.status() {
+        anyhow::bail!("AetherExecutor deployment reverted");
+    }
+    let addr = receipt
+        .contract_address
+        .ok_or_else(|| anyhow::anyhow!("deploy receipt missing contract_address"))?;
+
+    Ok(addr)
+}
+
+/// Fetch live pool state (reserves for V2/Sushi, sqrtPriceX96 for V3) at the
+/// current Anvil head. Used by `build_steps_from_cycle` to compute expected
+/// output amounts and thus each hop's chained `amount_in`.
+async fn fetch_state_at_head<P: Provider>(
+    provider: &P,
+    pool: &LoadedPool,
+) -> Option<PoolState> {
+    fetch_one_state_latest(provider, pool).await
+}
+
+/// Build `Vec<SwapStep>` matching a detected cycle, ready for
+/// `build_execute_arb_calldata`. Computes each hop's expected output using
+/// the same on-chain math the production engine uses, then fills the
+/// per-protocol inner calldata via the PR #90 builders.
+///
+/// Returns `None` if:
+/// - cycle touches a protocol we don't encode here yet (Curve/Balancer/Bancor)
+/// - expected output would be zero (e.g. drained pool → downstream hop impossible)
+/// - a pool's live state can't be fetched
+async fn build_steps_from_cycle<P: Provider>(
+    provider: &P,
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    executor_addr: Address,
+    flashloan_amount: U256,
+) -> Option<Vec<SwapStep>> {
+    if cycle.path.len() < 2 {
+        return None;
+    }
+
+    let mut current_amount = flashloan_amount;
+    let mut steps: Vec<SwapStep> = Vec::with_capacity(cycle.path.len() - 1);
+
+    for pair in cycle.path.windows(2) {
+        let [from_v, to_v] = [pair[0], pair[1]];
+
+        // Pick the best edge (lowest weight = highest rate) between these
+        // vertices — matches how `estimate_opp` ranks.
+        let edge = graph
+            .edges_from(from_v)
+            .iter()
+            .filter(|e| e.to == to_v)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))?;
+
+        let token_in = *token_index.get_address(from_v)?;
+        let token_out = *token_index.get_address(to_v)?;
+
+        // Find the registry entry (fee_bps + token ordering) for this pool.
+        let pool_entry = pools.iter().find(|p| p.address == edge.pool_address)?;
+
+        // Compute expected output using the same AMM math the on-chain
+        // contract will use. This is a best-effort forecast — the real
+        // executable amount will be whatever `swap()` produces.
+        let state = fetch_state_at_head(provider, pool_entry).await?;
+        let (amount_out, inner_calldata) = match (pool_entry.protocol, state) {
+            (ProtocolType::UniswapV2 | ProtocolType::SushiSwap, PoolState::V2 { r0, r1 }) => {
+                // token0 is always the lower address on-chain (V2 invariant).
+                let (reserve_in, reserve_out, zero_for_one) = if token_in == pool_entry.token0 {
+                    (r0, r1, true)
+                } else {
+                    (r1, r0, false)
+                };
+                let out = uniswap_v2_get_amount_out(current_amount, reserve_in, reserve_out, pool_entry.fee_bps)?;
+                if out.is_zero() {
+                    return None;
+                }
+                // For V2, AetherExecutor receives tokens before the swap and
+                // calls the pool with zero-amount on the input side. Recipient
+                // is the next pool or the executor itself (final hop).
+                let (amount0_out, amount1_out) = if zero_for_one {
+                    (U256::ZERO, out)
+                } else {
+                    (out, U256::ZERO)
+                };
+                // Recipient for the last hop is the executor; intermediate
+                // hops can also use the executor (contract routes internally).
+                let cd = build_univ2_swap_calldata(amount0_out, amount1_out, executor_addr);
+                (out, cd)
+            }
+            (ProtocolType::UniswapV3, PoolState::V3 { .. }) => {
+                // V3 math (tick traversal) is too heavy to replicate here;
+                // approximate output using the graph edge's rate. The on-chain
+                // revm sim will tell us the real executable amount.
+                let rate = (-edge.weight).exp(); // weight = -ln(rate)
+                let approx_out = U256::from((u256_to_f64(current_amount) * rate).max(0.0) as u128);
+                if approx_out.is_zero() {
+                    return None;
+                }
+                let zero_for_one = token_in == pool_entry.token0;
+                // `amount_specified > 0` means exact-input. Price limit set to
+                // (near-)edge values to effectively disable slippage in the sim
+                // — we enforce profit via minProfitOut at the outer level.
+                let sqrt_limit = if zero_for_one {
+                    U256::from(4_295_128_740u64) // MIN_SQRT_RATIO + 1
+                } else {
+                    // MAX_SQRT_RATIO - 1 ≈ 2^160 - 1 - 1.
+                    (U256::from(1u8) << 160) - U256::from(2u8)
+                };
+                let amt_i128 = i128::try_from(current_amount.saturating_to::<u128>()).ok()?;
+                let cd = build_univ3_swap_calldata(executor_addr, zero_for_one, amt_i128, sqrt_limit);
+                (approx_out, cd)
+            }
+            _ => return None, // Curve / Balancer / Bancor not encoded here (tracked in #97).
+        };
+
+        steps.push(SwapStep {
+            protocol: pool_entry.protocol,
+            pool_address: pool_entry.address,
+            token_in,
+            token_out,
+            amount_in: current_amount,
+            min_amount_out: U256::ZERO, // profit enforced at the outer minProfitOut
+            calldata: inner_calldata,
+        });
+
+        current_amount = amount_out;
+    }
+
+    Some(steps)
+}
+
+/// UniswapV2 `getAmountOut` — exact math, no rounding. Returns `None` on
+/// zero-liquidity input (prevents the "drained pool" outlier from producing
+/// a non-zero forecast).
+fn uniswap_v2_get_amount_out(
+    amount_in: U256,
+    reserve_in: U256,
+    reserve_out: U256,
+    fee_bps: u32,
+) -> Option<U256> {
+    if reserve_in.is_zero() || reserve_out.is_zero() || amount_in.is_zero() {
+        return None;
+    }
+    // Default UniV2 fee: 30 bps → multiplier 997/1000.
+    let fee_multiplier = U256::from(10_000u64 - fee_bps as u64);
+    let amount_in_with_fee = amount_in.checked_mul(fee_multiplier)?;
+    let numerator = amount_in_with_fee.checked_mul(reserve_out)?;
+    let denom = reserve_in.checked_mul(U256::from(10_000u64))?.checked_add(amount_in_with_fee)?;
+    if denom.is_zero() {
+        return None;
+    }
+    Some(numerator / denom)
+}
+
+/// WETH's `balanceOf` mapping is at storage slot 3 (verified against mainnet
+/// WETH9 source). Used by `simulate_rpc_with_erc20_profit` to locate the
+/// `balanceOf(SIM_OWNER)` slot for pre/post-sim balance diff.
+const WETH_BALANCE_SLOT: u64 = 3;
+
+/// Run one cycle through the production `EvmSimulator` (revm) against the
+/// replay's Anvil as an RPC backend. Unlike `evm_snapshot`/`evm_revert` on
+/// the same Anvil (which invalidates Anvil's fork cache and starves
+/// subsequent tx-replay state fetches), `simulate_rpc_with_erc20_profit`
+/// runs in an isolated `RpcForkedState::CacheDB` that's discarded after the
+/// call — Anvil's own cache is left alone, so the next tx replay's pool
+/// state fetches still hit warm storage.
+///
+/// The sim uses Anvil's CURRENT head as the fork block (so it sees post-tx
+/// state, including any executor we've deployed there and any pool writes
+/// from earlier txs in the block being replayed). Profit is measured as the
+/// WETH balance delta on `SIM_OWNER` directly out of revm's returned state
+/// diff — no extra RPC round-trips.
+async fn sim_arb_with_evm_simulator<P: Provider + Clone + 'static>(
+    anvil_provider: &P,
+    executor_addr: Address,
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    sim_input_weth: f64,
+) -> SimOutcome {
+    let flashloan_amount = U256::from((sim_input_weth * 1e18) as u128);
+
+    // Build SwapStep[] for this cycle using live on-chain state. Returns
+    // None for unsupported cycles (Curve/Balancer/Bancor hops) or zero-
+    // liquidity intermediate pools.
+    let steps = match build_steps_from_cycle(
+        anvil_provider,
+        cycle,
+        graph,
+        token_index,
+        pools,
+        executor_addr,
+        flashloan_amount,
+    )
+    .await
+    {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return SimOutcome {
+                success: false,
+                profit_wei: U256::ZERO,
+                gas_used: 0,
+                revert_reason: Some("skipped: unsupported protocol or zero-liquidity hop".into()),
+            };
+        }
+    };
+
+    // Build executeArb calldata. `minProfitOut=0` + `tipBps=0` so revm lets
+    // any non-negative profit succeed and 100% of it lands with `SIM_OWNER`
+    // as WETH — our balance-diff observable.
+    let deadline = U256::from(u64::MAX);
+    let calldata = build_execute_arb_calldata(
+        &steps,
+        WETH_ADDR,
+        flashloan_amount,
+        deadline,
+        U256::ZERO,
+        U256::ZERO,
+    );
+
+    // Fetch Anvil's current head block to pin RpcForkedState and extract
+    // the real timestamp + base fee. Aave V3 uses block.timestamp for
+    // reserve-index interest math — passing 0 underflows its
+    // `block.timestamp - lastUpdateTimestamp` subtraction and triggers a
+    // silent revert inside flashLoanSimple, which we'd surface as
+    // `FlashLoanFailed`. Same applies to base_fee for EIP-1559 validation.
+    let head = match anvil_provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return SimOutcome {
+                success: false,
+                profit_wei: U256::ZERO,
+                gas_used: 0,
+                revert_reason: Some("anvil latest block missing".into()),
+            };
+        }
+        Err(e) => {
+            return SimOutcome {
+                success: false,
+                profit_wei: U256::ZERO,
+                gas_used: 0,
+                revert_reason: Some(format!("anvil head fetch failed: {}", truncate_err(&e.to_string()))),
+            };
+        }
+    };
+    let head_block = head.header.number;
+    let head_timestamp = head.header.timestamp;
+    let head_base_fee = head.header.base_fee_per_gas.unwrap_or(1_000_000_000);
+
+    // Construct the fork state. `RpcForkedState::new` returns `None` only if
+    // called outside a multi-threaded tokio runtime — which we're not, so
+    // this branch is effectively dead.
+    let dyn_provider = alloy::providers::DynProvider::new(anvil_provider.clone());
+    // Use `latest` block tag rather than a specific Anvil local block number.
+    // Anvil's local-mined blocks may not resolve cleanly for every kind of
+    // state query (code / storage / balance at an exact block N+K), but the
+    // `latest` tag always serves from Anvil's current state — including any
+    // contract we've deployed and any pool writes from replayed txs.
+    let state = match RpcForkedState::new_at_latest(
+        dyn_provider,
+        head_block,
+        head_timestamp,
+        head_base_fee,
+    ) {
+        Some(s) => s,
+        None => {
+            return SimOutcome {
+                success: false,
+                profit_wei: U256::ZERO,
+                gas_used: 0,
+                revert_reason: Some("RpcForkedState construction failed (not in multi-thread runtime)".into()),
+            };
+        }
+    };
+
+    // Configure the simulator: caller = SIM_OWNER (matches executeArb's
+    // onlyOwner gate), gas headroom generous enough to fit the full
+    // flashloan callback (Aave + swaps + repay).
+    let sim = EvmSimulator::new(SimConfig {
+        gas_limit: 8_000_000,
+        chain_id: 1,
+        caller: SIM_OWNER,
+        value: U256::ZERO,
+    });
+
+    // Run the sim on a blocking thread — revm's `transact` blocks on
+    // `DatabaseRef::storage` / `basic` callbacks that fetch state via
+    // AlloyDB, which internally calls `block_in_place`. Running this
+    // outside a blocking context would panic.
+    let result = tokio::task::spawn_blocking(move || {
+        sim.simulate_rpc_with_erc20_profit(
+            state,
+            executor_addr,
+            calldata,
+            WETH_ADDR,
+            SIM_OWNER,
+            U256::from(WETH_BALANCE_SLOT),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(sim_result) => SimOutcome {
+            success: sim_result.success,
+            profit_wei: sim_result.profit_wei,
+            gas_used: sim_result.gas_used,
+            revert_reason: sim_result.revert_reason.map(|r| truncate_err(&r)),
+        },
+        Err(e) => SimOutcome {
+            success: false,
+            profit_wei: U256::ZERO,
+            gas_used: 0,
+            revert_reason: Some(format!("spawn_blocking failed: {}", e)),
+        },
+    }
+}
+
+/// Truncate alloy/anvil error strings for CSV output. Keep first 240 chars
+/// to preserve the revert selector + any decoded error data while dropping
+/// noisy trailing context (JSON-RPC envelope, source-location chains).
+fn truncate_err(s: &str) -> String {
+    if s.len() <= 240 {
+        s.replace(['\n', ','], " ")
+    } else {
+        format!("{}…", &s.chars().take(240).collect::<String>().replace(['\n', ','], " "))
+    }
 }
