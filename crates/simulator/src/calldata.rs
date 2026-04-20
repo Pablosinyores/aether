@@ -481,6 +481,38 @@ mod tests {
 
     #[test]
     fn test_build_balancer_swap_calldata_selector() {
+        // Declare the canonical Balancer V2 Vault `swap` signature in a local sol! block.
+        // alloy derives `swapCall::SELECTOR` from
+        //   swap((bytes32,uint8,address,address,uint256,bytes),(address,bool,address,bool),uint256,uint256)
+        // which is the ground-truth 4-byte selector. If the builder's sol! block ever has
+        // wrong field order or wrong types, the two SELECTOR constants will diverge and
+        // this assertion fails — catching the bug that the previous self-referential
+        // calldata2 comparison would have missed.
+        sol! {
+            struct SingleSwap {
+                bytes32 poolId;
+                uint8 kind;
+                address assetIn;
+                address assetOut;
+                uint256 amount;
+                bytes userData;
+            }
+
+            struct FundManagement {
+                address sender;
+                bool fromInternalBalance;
+                address recipient;
+                bool toInternalBalance;
+            }
+
+            function swap(
+                SingleSwap singleSwap,
+                FundManagement funds,
+                uint256 limit,
+                uint256 deadline
+            ) returns (uint256);
+        }
+
         let pool_id = [0x42u8; 32];
         let asset_in = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"); // WETH
         let asset_out = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // USDC
@@ -494,18 +526,7 @@ mod tests {
             executor,
             U256::from(1_700_000_000u64 + 120),
         );
-        // Assert the selector is stable by comparing against the first 4 bytes of a
-        // second encoding with the same ABI — any ABI drift inside the builder fails here.
-        let calldata2 = build_balancer_swap_calldata(
-            pool_id,
-            asset_in,
-            asset_out,
-            U256::from(2u64),
-            U256::ZERO,
-            executor,
-            U256::from(1_700_000_000u64 + 120),
-        );
-        assert_eq!(&calldata[0..4], &calldata2[0..4]);
+        assert_eq!(&calldata[0..4], swapCall::SELECTOR.as_slice());
         assert!(calldata.len() > 4);
     }
 
