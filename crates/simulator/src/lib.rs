@@ -329,6 +329,7 @@ mod tests {
     use alloy::primitives::address;
 
     /// Helper: create a basic ForkedState with a funded caller
+    #[allow(dead_code)]
     fn setup_state_with_caller(caller: Address) -> ForkedState {
         let mut state = ForkedState::new_empty(18_000_000, 1_700_000_000, 30);
         state.insert_account_balance(caller, U256::from(100_000_000_000_000_000_000u128));

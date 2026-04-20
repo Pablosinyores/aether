@@ -250,6 +250,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_executor_address_too_short_is_error() {
+        // "0x1234" has the right prefix but is far fewer than 40 hex chars — it should
+        // fall into the invalid-hex bucket and fail, matching the Go side which already
+        // covers this input shape in its table test.
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("EXECUTOR_ADDRESS", "0x1234"); }
+        assert!(parse_executor_address().is_err());
+        unsafe { std::env::remove_var("EXECUTOR_ADDRESS"); }
+    }
+
+    #[test]
     fn parse_executor_address_zero_is_error() {
         let _g = ENV_LOCK.lock().unwrap();
         unsafe {
