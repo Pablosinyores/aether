@@ -72,6 +72,8 @@ mkdir -p "$LOG_DIR" "$BUNDLE_DIR" "$BIN_DIR"
 GRPC_PORT="${GRPC_PORT:-50061}"
 RUST_METRICS_PORT="${RUST_METRICS_PORT:-9094}"
 GO_METRICS_PORT="${GO_METRICS_PORT:-9095}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+DISABLE_DASHBOARD="${DISABLE_DASHBOARD:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
 # Anvil default account 0 — searcher stub key (never used for real submission
@@ -90,11 +92,12 @@ log_step()  { echo -e "\n${CYAN}${BOLD}=== $* ===${NC}"; }
 
 RUST_PID=""
 EXECUTOR_PID=""
+MONITOR_PID=""
 CAFFEINATE_PID=""
 cleanup() {
     echo ""
     log_warn "Shutting down shadow pipeline..."
-    for pid in $EXECUTOR_PID $RUST_PID $CAFFEINATE_PID; do
+    for pid in $MONITOR_PID $EXECUTOR_PID $RUST_PID $CAFFEINATE_PID; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
         fi
@@ -188,7 +191,11 @@ for cmd in cargo go curl lsof; do
     fi
 done
 
-for port in $GRPC_PORT $RUST_METRICS_PORT $GO_METRICS_PORT; do
+PORTS_TO_CLEAR="$GRPC_PORT $RUST_METRICS_PORT $GO_METRICS_PORT"
+if [ "$DISABLE_DASHBOARD" != "1" ]; then
+    PORTS_TO_CLEAR="$PORTS_TO_CLEAR $DASHBOARD_PORT"
+fi
+for port in $PORTS_TO_CLEAR; do
     kill_port "$port"
 done
 
@@ -218,15 +225,34 @@ else
     log_info "go build ./cmd/executor/..."
     CGO_ENABLED=0 go build -o "$BIN_DIR/aether-executor" ./cmd/executor/
     log_ok "Go build complete"
+
+    if [ "$DISABLE_DASHBOARD" != "1" ]; then
+        log_info "go build ./cmd/monitor/..."
+        CGO_ENABLED=0 go build -o "$BIN_DIR/aether-monitor" ./cmd/monitor/
+        log_ok "Dashboard build complete"
+    fi
 fi
 
 AETHER_RUST="$PROJECT_ROOT/target/release/aether-rust"
 AETHER_EXECUTOR="$BIN_DIR/aether-executor"
+AETHER_MONITOR="$BIN_DIR/aether-monitor"
 for bin in "$AETHER_RUST" "$AETHER_EXECUTOR"; do
     if [ ! -x "$bin" ]; then
         log_error "Binary missing: $bin"; exit 1
     fi
 done
+if [ "$DISABLE_DASHBOARD" != "1" ] && [ ! -x "$AETHER_MONITOR" ]; then
+    log_error "Dashboard binary missing: $AETHER_MONITOR"; exit 1
+fi
+
+POOLS_CONFIG="$PROJECT_ROOT/config/pools_shadow.toml"
+if [ ! -f "$POOLS_CONFIG" ]; then
+    log_error "Pool config missing: $POOLS_CONFIG"
+    log_error "Shadow mode needs a multi-pool graph; aborting before the"
+    log_error "engine falls back to an empty registry + degenerate run."
+    exit 1
+fi
+log_info "Pool config: $POOLS_CONFIG ($(grep -c '^\[\[pools\]\]' "$POOLS_CONFIG") pools)"
 
 # ── Phase 2: Start aether-rust against LIVE mainnet WS ──────────────────
 
@@ -236,7 +262,7 @@ ETH_RPC_URL="$ETH_RPC_URL" \
 ETH_WS_URL="$ETH_WS_URL" \
 GRPC_ADDRESS="127.0.0.1:$GRPC_PORT" \
 RUST_LOG="info" \
-AETHER_POOLS_CONFIG="$PROJECT_ROOT/config/pools_historical_replay.toml" \
+AETHER_POOLS_CONFIG="$POOLS_CONFIG" \
 RUST_METRICS_PORT="$RUST_METRICS_PORT" \
     "$AETHER_RUST" > "$LOG_DIR/rust.log" 2>&1 &
 RUST_PID=$!
@@ -260,6 +286,23 @@ EXECUTOR_PID=$!
 
 wait_for_port "$GO_METRICS_PORT" "Executor metrics" 30
 log_ok "aether-executor running in SHADOW mode (PID $EXECUTOR_PID)"
+
+# ── Phase 3.5: Start monitor dashboard ──────────────────────────────────
+
+if [ "$DISABLE_DASHBOARD" != "1" ]; then
+    log_step "Phase 3.5: Start monitor dashboard"
+
+    RUST_METRICS_PORT="$RUST_METRICS_PORT" \
+    GO_METRICS_PORT="$GO_METRICS_PORT" \
+    DASHBOARD_PORT="$DASHBOARD_PORT" \
+        "$AETHER_MONITOR" > "$LOG_DIR/monitor.log" 2>&1 &
+    MONITOR_PID=$!
+
+    wait_for_port "$DASHBOARD_PORT" "Dashboard" 10
+    log_ok "Dashboard up at http://localhost:$DASHBOARD_PORT/ (PID $MONITOR_PID)"
+else
+    log_warn "DISABLE_DASHBOARD=1 — skipping dashboard"
+fi
 
 sleep 3
 
@@ -344,6 +387,9 @@ echo -e "${BOLD}       SHADOW RUN — LIVE MAINNET            ${NC}"
 echo -e "${BOLD}============================================${NC}"
 printf "  %-32s %s\n"  "Duration:"                 "${TOTAL_ELAPSED}s (requested ${DURATION_SEC}s)"
 printf "  %-32s %s\n"  "Run dir:"                  "$RUN_DIR"
+if [ "$DISABLE_DASHBOARD" != "1" ]; then
+    printf "  %-32s %s\n"  "Dashboard:"            "http://localhost:$DASHBOARD_PORT/  (still up — Ctrl-C to stop)"
+fi
 echo ""
 echo -e "${BOLD}  Rust engine (live mainnet)${NC}"
 printf "  %-32s %s\n"  "Blocks processed:"         "$BLOCKS"

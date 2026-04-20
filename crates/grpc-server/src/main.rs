@@ -77,10 +77,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap pools from config file at startup.
     // Supports AETHER_POOLS_CONFIG env var to override the default path,
     // so the binary works regardless of the working directory.
-    let pools_config = std::env::var("AETHER_POOLS_CONFIG")
-        .unwrap_or_else(|_| "config/pools.toml".to_string());
+    let explicit_pools_config = std::env::var("AETHER_POOLS_CONFIG").ok();
+    let pools_config = explicit_pools_config
+        .clone()
+        .unwrap_or_else(|| "config/pools.toml".to_string());
     let pool_count = engine.bootstrap_pools(&pools_config).await;
     info!(pool_count, path = %pools_config, "Pools loaded at startup");
+
+    // Fail fast when the operator explicitly pointed at a config that
+    // produced zero pools — a silent empty registry degrades shadow /
+    // live runs into star-graph discovery-only mode. When the var is
+    // unset (default `config/pools.toml` path), stay permissive so
+    // discovery-only bootstraps still work.
+    if explicit_pools_config.is_some() && pool_count == 0 {
+        error!(
+            path = %pools_config,
+            "AETHER_POOLS_CONFIG points at missing or empty pool config — \
+             refusing to boot with an empty registry. Provide a valid TOML \
+             with at least one `[[pools]]` entry, or unset the env var to \
+             fall back to discovery-only mode."
+        );
+        std::process::exit(1);
+    }
 
     // Fetch initial on-chain reserves so the price graph has real edges.
     engine.fetch_initial_reserves().await;
