@@ -44,6 +44,7 @@ futures = "0.3"
 prometheus = "0.13.4"
 clap = { version = "4", features = ["derive"] }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 prost-build = { workspace = true }
