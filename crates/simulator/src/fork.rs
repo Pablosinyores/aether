@@ -325,7 +325,9 @@ mod tests {
         let info = state.get_account(&addr).expect("Account should exist");
         assert_eq!(info.balance, balance);
         assert_eq!(info.nonce, 0);
-        assert!(info.code.is_none() || info.code.as_ref().map_or(true, |c| c.is_empty()));
+        #[allow(clippy::unnecessary_map_or)]
+        let code_empty = info.code.is_none() || info.code.as_ref().map_or(true, |c| c.is_empty());
+        assert!(code_empty);
     }
 
     #[test]
