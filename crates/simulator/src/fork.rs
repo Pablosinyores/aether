@@ -156,7 +156,7 @@ pub struct RpcForkedState {
 }
 
 impl RpcForkedState {
-    /// Create a new RPC-backed forked state.
+    /// Create a new RPC-backed forked state pinned at `block_number`.
     ///
     /// Returns `None` when called outside a multi-threaded tokio runtime
     /// (required by `WrapDatabaseAsync`).
@@ -176,6 +176,31 @@ impl RpcForkedState {
             block_timestamp,
             base_fee,
             chain_id: 1, // Ethereum mainnet
+        })
+    }
+
+    /// Create a new RPC-backed forked state that queries the provider at the
+    /// `latest` block tag (not a specific block number). Required when the
+    /// backing provider is an Anvil fork whose local-mined block numbers
+    /// ahead of its fork base may or may not resolve cleanly for state
+    /// queries — using `latest` lets Anvil serve from its current state
+    /// unambiguously.
+    pub fn new_at_latest(
+        provider: DynProvider<Ethereum>,
+        block_number: u64,
+        block_timestamp: u64,
+        base_fee: u64,
+    ) -> Option<Self> {
+        let alloy_db = AlloyDB::new(provider, BlockId::latest());
+        let sync_db = WrapDatabaseAsync::new(alloy_db)?;
+        let cache_db = CacheDB::new(sync_db);
+
+        Some(Self {
+            db: cache_db,
+            block_number,
+            block_timestamp,
+            base_fee,
+            chain_id: 1,
         })
     }
 
