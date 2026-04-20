@@ -305,6 +305,7 @@ aether/
 | `aether_gas_price_gwei` | Gauge | >300 → halt |
 | `aether_daily_pnl_eth` | Gauge | <-0.5 ETH → halt |
 | `aether_eth_balance` | Gauge | <0.1 ETH → halt |
+| `aether_decode_errors_total` | Counter | sustained >10/min → warn (ABI drift or malformed event floods) |
 
 ---
 
