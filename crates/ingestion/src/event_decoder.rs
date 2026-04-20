@@ -58,6 +58,18 @@ pub enum PoolEvent {
         reserve0: U256,
         reserve1: U256,
     },
+    /// V2 / Sushi Swap — informational (reserves still reconcile via the
+    /// paired `Sync` event; this variant exposes per-trade amounts and
+    /// participants for downstream analytics).
+    V2Swap {
+        pool: Address,
+        sender: Address,
+        to: Address,
+        amount0_in: U256,
+        amount1_in: U256,
+        amount0_out: U256,
+        amount1_out: U256,
+    },
     /// V3 state update
     V3Update {
         pool: Address,
@@ -114,6 +126,8 @@ pub fn decode_log(
 
     if topic0 == EventSignatures::sync_topic() {
         decode_sync(data, source_address, protocol_hint)
+    } else if topic0 == EventSignatures::swap_v2_topic() {
+        decode_swap_v2(topics, data, source_address)
     } else if topic0 == EventSignatures::swap_v3_topic() {
         decode_swap_v3(topics, data, source_address)
     } else if topic0 == EventSignatures::token_exchange_topic() {
@@ -123,6 +137,41 @@ pub fn decode_log(
     } else {
         None
     }
+}
+
+fn decode_swap_v2(topics: &[B256], data: &[u8], pool: Address) -> Option<PoolEvent> {
+    // V2 Swap(address indexed sender, uint256 amount0In, uint256 amount1In,
+    //        uint256 amount0Out, uint256 amount1Out, address indexed to)
+    //
+    // topics: [topic0, sender (indexed), to (indexed)]
+    // data:   4 × 32-byte words — amount0In | amount1In | amount0Out | amount1Out
+    if topics.len() < 3 || data.len() < 128 {
+        return None;
+    }
+
+    let sender = Address::from_slice(&topics[1].as_slice()[12..]);
+    let to = Address::from_slice(&topics[2].as_slice()[12..]);
+
+    let amount0_in = U256::from_be_slice(&data[0..32]);
+    let amount1_in = U256::from_be_slice(&data[32..64]);
+    let amount0_out = U256::from_be_slice(&data[64..96]);
+    let amount1_out = U256::from_be_slice(&data[96..128]);
+
+    trace!(
+        %pool, %sender, %to,
+        %amount0_in, %amount1_in, %amount0_out, %amount1_out,
+        "V2 Swap decoded"
+    );
+
+    Some(PoolEvent::V2Swap {
+        pool,
+        sender,
+        to,
+        amount0_in,
+        amount1_in,
+        amount0_out,
+        amount1_out,
+    })
 }
 
 fn decode_sync(
@@ -313,6 +362,87 @@ mod tests {
         let data = vec![0u8; 32];
         let event = decode_log(&topics, &data, Address::ZERO, None);
         assert!(event.is_none());
+    }
+
+    // ── V2 Swap event decode tests ──
+
+    #[test]
+    fn test_decode_v2_swap_event() {
+        let pool_addr = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+        let sender = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D"); // UniV2 Router
+        let to = address!("beA0C8daDd4Ec0E6B24ae60e7A5f24d3cE60FEce");
+
+        // topic[1] = sender (indexed, left-padded)
+        let mut topic1 = [0u8; 32];
+        topic1[12..32].copy_from_slice(sender.as_slice());
+
+        // topic[2] = to (indexed, left-padded)
+        let mut topic2 = [0u8; 32];
+        topic2[12..32].copy_from_slice(to.as_slice());
+
+        let topics = vec![
+            EventSignatures::swap_v2_topic(),
+            B256::from(topic1),
+            B256::from(topic2),
+        ];
+
+        let amount0_in = U256::from(1_000_000_000u64); // 1000 USDC (6 dec)
+        let amount1_in = U256::ZERO;
+        let amount0_out = U256::ZERO;
+        let amount1_out = U256::from(500_000_000_000_000_000u64); // 0.5 ETH
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&u256_to_be_bytes(amount0_in));
+        data.extend_from_slice(&u256_to_be_bytes(amount1_in));
+        data.extend_from_slice(&u256_to_be_bytes(amount0_out));
+        data.extend_from_slice(&u256_to_be_bytes(amount1_out));
+
+        let event = decode_log(&topics, &data, pool_addr, None);
+        assert!(event.is_some(), "V2 Swap must decode, not fall through");
+
+        match event.unwrap() {
+            PoolEvent::V2Swap {
+                pool,
+                sender: s,
+                to: t,
+                amount0_in: a0i,
+                amount1_in: a1i,
+                amount0_out: a0o,
+                amount1_out: a1o,
+            } => {
+                assert_eq!(pool, pool_addr);
+                assert_eq!(s, sender);
+                assert_eq!(t, to);
+                assert_eq!(a0i, amount0_in);
+                assert_eq!(a1i, amount1_in);
+                assert_eq!(a0o, amount0_out);
+                assert_eq!(a1o, amount1_out);
+            }
+            other => panic!("Expected V2Swap, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_v2_swap_insufficient_topics() {
+        let topics = vec![
+            EventSignatures::swap_v2_topic(),
+            B256::ZERO,
+            // missing `to` topic
+        ];
+        let data = vec![0u8; 128];
+        assert!(decode_log(&topics, &data, Address::ZERO, None).is_none());
+    }
+
+    #[test]
+    fn test_decode_v2_swap_insufficient_data() {
+        let topics = vec![
+            EventSignatures::swap_v2_topic(),
+            B256::ZERO,
+            B256::ZERO,
+        ];
+        // 96 bytes instead of 128
+        let data = vec![0u8; 96];
+        assert!(decode_log(&topics, &data, Address::ZERO, None).is_none());
     }
 
     // ── V3 Swap event decode tests ──
