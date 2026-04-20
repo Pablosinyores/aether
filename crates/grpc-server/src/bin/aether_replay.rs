@@ -64,16 +64,34 @@ fn token_label(addr: &Address) -> String {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "aether-replay",
     about = "Replay one historical block through Aether's detector. Prints detected cycles."
 )]
 struct Args {
     /// Target block number. Reserves are fetched at `block - 1` (state before
-    /// the block landed).
-    #[arg(long)]
+    /// the block landed). Ignored when `--blocks-file` is set.
+    #[arg(long, default_value_t = 0)]
     block: u64,
+
+    /// Path to a newline-delimited file of block numbers for batch replay.
+    /// Each listed block is replayed independently through the full-block
+    /// pipeline with its own Anvil fork; `--csv` (if set) is appended across
+    /// all blocks. Empty lines and lines starting with `#` are ignored.
+    /// Implies `--full-block`.
+    #[arg(long)]
+    blocks_file: Option<PathBuf>,
+
+    /// Skip state seeding for impersonated senders (intra-block mode).
+    /// By default, before each historical tx replays, the sender's real
+    /// mainnet balances for known ERC20s (USDC / USDT / DAI / WETH) at
+    /// `block - 1` are written into Anvil storage so the tx can actually
+    /// execute — without this, impersonated senders hold zero tokens on the
+    /// fork and most real-world txs revert. Set this flag to reproduce the
+    /// old degenerate-fork behavior.
+    #[arg(long, default_value_t = false)]
+    no_seed_state: bool,
 
     /// Path to the pool registry TOML. When omitted, uses a built-in 7-pool
     /// default set (WETH/USDC/USDT/DAI across UniV2 + Sushi).
@@ -397,8 +415,29 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("ETH_RPC_URL").ok())
         .context("--rpc-url not set and ETH_RPC_URL env var missing")?;
 
+    // Batch mode: --blocks-file overrides --block and implies --full-block.
+    if let Some(path) = args.blocks_file.clone() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read --blocks-file {}", path.display()))?;
+        let blocks: Vec<u64> = content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.parse::<u64>())
+            .collect::<std::result::Result<_, _>>()
+            .with_context(|| format!("parse --blocks-file {}", path.display()))?;
+        if blocks.is_empty() {
+            anyhow::bail!("--blocks-file {} contained no block numbers", path.display());
+        }
+        return run_batch_replay(&args, &rpc_url, &blocks).await;
+    }
+
+    if args.block == 0 {
+        anyhow::bail!("--block is required when --blocks-file is not supplied");
+    }
+
     if args.full_block {
-        return run_full_block_replay(&args, &rpc_url).await;
+        return run_full_block_replay(&args, &rpc_url, None).await;
     }
 
     println!("== Aether Replay ==");
@@ -729,8 +768,178 @@ fn estimate_opp(
     }
 }
 
+/// Batch replay across a list of blocks. Each block spawns its own Anvil
+/// fork. `--csv` output (when set) is opened once at the start with a single
+/// header row and appended across every block.
+async fn run_batch_replay(args: &Args, rpc_url: &str, blocks: &[u64]) -> Result<()> {
+    println!("== Aether Batch Replay ==");
+    println!("  Blocks:          {}", blocks.len());
+    println!("  First / last:    {} .. {}", blocks[0], blocks[blocks.len() - 1]);
+    if let Some(path) = &args.csv {
+        println!("  CSV:             {} (appended across all blocks)", path.display());
+    }
+    if args.no_seed_state {
+        println!("  State seeding:   DISABLED (--no-seed-state)");
+    } else {
+        println!("  State seeding:   enabled (USDC/USDT/DAI/WETH balances + ETH)");
+    }
+
+    // Open the shared CSV once so all per-block runs append to the same file.
+    let shared_csv: Option<std::cell::RefCell<std::io::BufWriter<std::fs::File>>> =
+        match &args.csv {
+            Some(path) => {
+                let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+                use std::io::Write;
+                writeln!(
+                    f,
+                    "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
+                )?;
+                Some(std::cell::RefCell::new(f))
+            }
+            None => None,
+        };
+
+    let t0 = Instant::now();
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for (i, block_num) in blocks.iter().enumerate() {
+        println!(
+            "\n── Block {}/{}  (#{}) ──",
+            i + 1,
+            blocks.len(),
+            block_num
+        );
+        let mut per_block_args = args.clone();
+        per_block_args.block = *block_num;
+        // The shared CSV is written externally; suppress the per-block header.
+        per_block_args.csv = None;
+        match run_full_block_replay(&per_block_args, rpc_url, shared_csv.as_ref()).await {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                tracing::warn!(block = block_num, error = %e, "block replay failed");
+                failed += 1;
+            }
+        }
+    }
+
+    if let Some(cell) = shared_csv {
+        use std::io::Write;
+        cell.borrow_mut().flush()?;
+    }
+
+    println!("\n== Batch Summary ==");
+    println!("  Blocks succeeded:  {}/{}", ok, blocks.len());
+    println!("  Blocks failed:     {}", failed);
+    println!("  Total time:        {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Write the sender's real mainnet balances (ETH + known ERC20s) into Anvil's
+/// fork state so the impersonated historical tx has real assets to work with.
+///
+/// Without this, Anvil's lazy state returns zero for any address that wasn't
+/// touched pre-block, so ERC20.transferFrom reverts and the downstream state
+/// transitions the tx would have caused (pool reserves shift, AAVE drains,
+/// etc.) never happen on the fork — the arbs that depended on them become
+/// invisible to the replay.
+///
+/// This only seeds a small set of known-slot ERC20s (USDC, USDT, DAI, WETH).
+/// Tokens outside this set fall through to the original degenerate-fork
+/// behavior — the tx may revert. Best-effort enrichment; never fatal.
+async fn seed_sender_state<P: Provider>(
+    anvil: &P,
+    archive: &P,
+    sender: Address,
+    fork_block: u64,
+) -> Result<()> {
+    use alloy::primitives::{keccak256, B256};
+    use alloy::rpc::types::serde_helpers::WithOtherFields;
+
+    // Known ERC20 balances mapping slots. Entry format:
+    //   (token, balances_mapping_slot)
+    // Layout: storage_key = keccak256(pad32(owner) ++ pad32(slot))
+    const TOKEN_SLOTS: &[(Address, u64)] = &[
+        // USDC (FiatTokenV2): balances mapping at slot 9.
+        (address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), 9),
+        // USDT (TetherToken): balances mapping at slot 2.
+        (address!("dAC17F958D2ee523a2206206994597C13D831ec7"), 2),
+        // DAI (MakerDAO): balances mapping at slot 2.
+        (address!("6B175474E89094C44Da98b954EedeAC495271d0F"), 2),
+        // WETH9: balanceOf mapping at slot 3.
+        (address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), 3),
+    ];
+
+    // 1. Fund sender with 1,000,000 ETH via anvil_setBalance. Covers both
+    //    gas and any tx.value without additional surgery. Costs nothing —
+    //    the fork is ephemeral.
+    let funding = U256::from(1_000_000u128) * U256::from(10u128).pow(U256::from(18));
+    let eth_hex = format!("0x{:x}", funding);
+    anvil
+        .client()
+        .request::<_, ()>("anvil_setBalance", (sender, eth_hex))
+        .await
+        .context("anvil_setBalance")?;
+
+    // 2. For each known ERC20, read the sender's real mainnet balance at
+    //    `fork_block` and write it into the fork's storage. Done in parallel.
+    let futs = TOKEN_SLOTS.iter().map(|&(token, slot)| async move {
+        // Compute the storage key: keccak256( pad32(sender) || pad32(slot) )
+        let mut buf = [0u8; 64];
+        buf[12..32].copy_from_slice(sender.as_slice());
+        buf[63] = slot as u8;
+        let key = keccak256(buf);
+
+        // Read real mainnet balance at pre-fork block via archive RPC.
+        let balance: Option<U256> = match archive
+            .raw_request::<_, B256>(
+                "eth_getStorageAt".into(),
+                (
+                    token,
+                    U256::from_be_bytes(key.0),
+                    BlockId::from(fork_block),
+                ),
+            )
+            .await
+        {
+            Ok(b256) => {
+                let v = U256::from_be_bytes(b256.0);
+                if v.is_zero() { None } else { Some(v) }
+            }
+            Err(_) => None,
+        };
+
+        (token, key, balance)
+    });
+
+    let results = futures::future::join_all(futs).await;
+
+    for (_token, key, balance) in results.into_iter() {
+        if let Some(val) = balance {
+            let key_hex = format!("0x{:x}", key);
+            let val_hex = format!("0x{:064x}", val);
+            let _ = anvil
+                .client()
+                .request::<_, bool>(
+                    "anvil_setStorageAt",
+                    (_token, key_hex, val_hex),
+                )
+                .await;
+        }
+    }
+
+    // WithOtherFields import kept only if we extend this to non-standard RPC
+    // shapes later — silence unused warning for now.
+    let _ = std::marker::PhantomData::<WithOtherFields<()>>;
+
+    Ok(())
+}
+
 /// Intra-block replay entry point.
-async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
+async fn run_full_block_replay(
+    args: &Args,
+    rpc_url: &str,
+    shared_csv: Option<&std::cell::RefCell<std::io::BufWriter<std::fs::File>>>,
+) -> Result<()> {
     let fork_block = args.block.saturating_sub(1);
 
     println!("== Aether Full-Block Replay ==");
@@ -817,26 +1026,52 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
     let mut reverted = 0usize;
     let detector = BellmanFord::new(args.max_hops, args.max_time_us);
 
-    // Optional CSV writer.
-    let mut csv_writer: Option<std::io::BufWriter<std::fs::File>> = match &args.csv {
-        Some(path) => {
-            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-            use std::io::Write;
-            writeln!(
-                f,
-                "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
-            )?;
-            Some(f)
-        }
-        None => None,
-    };
+    // Local CSV writer (single-block mode). Batch mode passes `shared_csv`
+    // instead and this stays None.
+    let mut local_csv_writer: Option<std::io::BufWriter<std::fs::File>> =
+        if shared_csv.is_none() {
+            match &args.csv {
+                Some(path) => {
+                    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+                    use std::io::Write;
+                    writeln!(
+                        f,
+                        "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth"
+                    )?;
+                    Some(f)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+    // Archive RPC handle reused for balance reads during state seeding.
+    let archive_for_seed: url::Url = rpc_url.parse().context("parse RPC URL")?;
+    let seed_archive = ProviderBuilder::new().connect_http(archive_for_seed);
 
     let t_replay = Instant::now();
+    let mut seeded_senders: std::collections::HashSet<Address> = std::collections::HashSet::new();
     for (i, tx) in txs.iter().enumerate() {
         let Some(req) = build_impersonation_request(tx) else {
             skipped += 1;
             continue;
         };
+
+        // Seed the sender's real mainnet balances into Anvil once per unique
+        // sender, before their first tx in this block replays. Skipped when
+        // --no-seed-state is set (reproduces old degenerate-fork behavior).
+        if !args.no_seed_state {
+            if let Some(from) = req.from {
+                if seeded_senders.insert(from) {
+                    if let Err(e) =
+                        seed_sender_state(&anvil_provider, &seed_archive, from, fork_block).await
+                    {
+                        tracing::debug!(%from, error = %e, "state seeding failed (continuing)");
+                    }
+                }
+            }
+        }
 
         // Impersonate-send. `--auto-impersonate` handles the sig bypass.
         let pending = match anvil_provider.send_transaction(req).await {
@@ -936,7 +1171,28 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
                 est.base_fee_gwei,
             );
 
-            if let Some(w) = csv_writer.as_mut() {
+            // Write the CSV row — either to this run's local file, or into
+            // the batch-shared writer if we were called from `run_batch_replay`.
+            if let Some(cell) = shared_csv {
+                use std::io::Write;
+                let mut w = cell.borrow_mut();
+                writeln!(
+                    w,
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6}",
+                    block = args.block,
+                    tx = i,
+                    hash = tx_hash,
+                    cycles = profitable,
+                    pf = est.profit_factor,
+                    hops = top_cycle.num_hops(),
+                    path = path_str,
+                    gas = est.gas_units,
+                    bf = est.base_fee_gwei,
+                    gc = est.gas_cost_eth,
+                    gp = est.gross_profit_eth,
+                    np = est.net_profit_eth,
+                )?;
+            } else if let Some(w) = local_csv_writer.as_mut() {
                 use std::io::Write;
                 writeln!(
                     w,
@@ -959,8 +1215,9 @@ async fn run_full_block_replay(args: &Args, rpc_url: &str) -> Result<()> {
     }
     let replay_ms = t_replay.elapsed().as_millis();
 
-    // Flush CSV if open.
-    if let Some(mut w) = csv_writer.take() {
+    // Flush local CSV if we opened one (batch shared writer is flushed by
+    // the caller).
+    if let Some(mut w) = local_csv_writer.take() {
         use std::io::Write;
         w.flush()?;
     }
