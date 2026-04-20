@@ -1349,13 +1349,28 @@ impl AetherEngine {
                     let flashloan_label = token_label(&input.flashloan_token);
                     let net_profit_eth = input.net_profit as f64 / 1e18;
 
+                    // Emit BOTH the legacy and new log lines during the transition.
+                    // Downstream Loki / Grafana alert rules key on either the
+                    // "Published validated arb" message or the `net_profit_wei`
+                    // u128 field; dropping either would silently break them.
+                    // Drop the legacy line after E2-gate alerts are ported.
                     info!(
                         id = %input.opp.id,
                         path = %path,
                         hops = hop_count,
                         flashloan = %flashloan_label,
-                        net_profit_eth = format_args!("{:.6}", net_profit_eth),
                         net_profit_wei = input.net_profit,
+                        net_profit_eth = format_args!("{:.6}", net_profit_eth),
+                        sim_us,
+                        "Published validated arb"
+                    );
+                    info!(
+                        id = %input.opp.id,
+                        path = %path,
+                        hops = hop_count,
+                        flashloan = %flashloan_label,
+                        net_profit_wei = input.net_profit,
+                        net_profit_eth = format_args!("{:.6}", net_profit_eth),
                         sim_us,
                         "ARB PUBLISHED"
                     );

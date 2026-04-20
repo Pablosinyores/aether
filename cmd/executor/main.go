@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -544,9 +545,19 @@ func stateToInt(s risk.SystemState) int {
 
 // isShadowMode reports whether AETHER_SHADOW is set to a truthy value.
 // Evaluated on every call so tests can flip the env without restart.
+// Uses strconv.ParseBool to stay in lockstep with Go's stdlib truthy
+// semantics (1/t/T/TRUE/true/True/0/f/F/FALSE/false/False); any garbage
+// input falls through to `false` instead of silently enabling shadow mode.
 func isShadowMode() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("AETHER_SHADOW")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	raw := strings.TrimSpace(os.Getenv("AETHER_SHADOW"))
+	if raw == "" {
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+	return v
 }
 
 // shadowBundleDumpDir returns the target dir for shadow-bundle JSONs.
