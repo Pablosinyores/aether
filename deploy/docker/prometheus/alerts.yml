@@ -71,3 +71,48 @@ groups:
         annotations:
           summary: "Builder {{ $labels.builder }} has no successful submissions"
           description: "Builder {{ $labels.builder }} received submissions but zero succeeded over the last 2m. Check builder endpoint health and auth."
+
+      - alert: AetherServiceDown
+        expr: up{job=~"aether-(go|rust)"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aether service {{ $labels.job }} is down"
+          description: "Job {{ $labels.job }} has been unreachable for >1m. Prometheus scrape target reports up=0."
+
+      - alert: AetherNoBlocksProcessed
+        expr: rate(aether_blocks_processed_total[3m]) == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aether engine {{ $labels.job }} stopped processing blocks"
+          description: "Job {{ $labels.job }} has processed 0 blocks over the last 3m. The Rust ingestion pipeline may be stalled or disconnected from the Ethereum node."
+
+      - alert: AetherHighSimulationLatency
+        expr: histogram_quantile(0.99, sum by(le) (rate(aether_simulation_latency_ms_bucket[5m]))) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aether simulation latency p99 exceeds 100ms"
+          description: "EVM simulation p99 latency is {{ printf \"%.1f\" $value }}ms over the last 5m (target <50ms). revm fork state may be stale or the RPC provider is slow."
+
+      - alert: AetherNegativeDailyPnL
+        expr: aether_daily_pnl_eth < -0.05
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aether daily PnL is negative ({{ printf \"%.4f\" $value }} ETH)"
+          description: "Daily PnL has been below -0.05 ETH for 30m. Review gas costs, tip share, and revert rate."
+
+      - alert: AetherRiskRejectionStorm
+        expr: rate(aether_executor_risk_rejections_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aether risk manager rejecting >1 arb/sec"
+          description: "Risk rejection rate is {{ printf \"%.2f\" $value }} rejections/sec over a 5m window, sustained for 10m. Investigate circuit breaker state, gas, and position limits."
