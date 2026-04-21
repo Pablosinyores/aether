@@ -1,0 +1,16 @@
+{{ define "aether.slack.title" -}}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.severity }})
+{{- end }}
+
+{{ define "aether.slack.body" -}}
+{{ range .Alerts -}}
+*Job:* {{ .Labels.job }}
+*Summary:* {{ .Annotations.summary }}
+*Description:* {{ .Annotations.description }}
+*Starts At:* {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+{{ if .Annotations.runbook_url -}}
+*Runbook:* {{ .Annotations.runbook_url }}
+{{ end }}
+---
+{{ end -}}
+{{- end }}
