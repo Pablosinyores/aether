@@ -673,4 +673,3 @@ func TestLoadExecutorConfig_RejectsUnknownKey(t *testing.T) {
 		t.Errorf("error %q does not name the offending key", err.Error())
 	}
 }
-

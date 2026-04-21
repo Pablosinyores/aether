@@ -113,6 +113,11 @@ services:
     volumes:
       - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
       - loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
     networks:
       - aether-net
@@ -126,7 +131,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - promtail-data:/var/lib/promtail
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - aether-net
