@@ -28,6 +28,7 @@ use aether_common::types::{PoolId, ProtocolType, SwapStep};
 use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::gas as gas_model;
 use aether_detector::opportunity::DetectedCycle;
+use aether_detector::optimizer::ternary_search_optimal_input;
 use aether_simulator::calldata::{
     build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
 };
@@ -162,6 +163,24 @@ struct Args {
     /// when `--sim-on-chain` is set.
     #[arg(long, default_value = "contracts/out/AetherExecutor.sol/AetherExecutor.json")]
     executor_artifact: PathBuf,
+
+    /// Builder tip share in basis points. When > 0, the revm sim calls
+    /// `executeArb` with this tipBps so the contract actually forwards the tip
+    /// to `block.coinbase` and the measured WETH delta on `SIM_OWNER` reflects
+    /// the OWNER-NET profit (what the production owner would receive), not the
+    /// gross pre-tip profit. Production default is 9000 (90%); set to 0 to
+    /// preserve the pre-PR "measure gross profit" behavior.
+    #[arg(long, default_value_t = 9000u64)]
+    tip_bps: u64,
+
+    /// Disable the ternary-search optimizer and fall back to the fixed
+    /// `--sim-input-weth` amount. Kept as a compatibility toggle for
+    /// reproducing old CSVs. With the optimizer on (default), each detected
+    /// cycle is passed through the same `ternary_search_optimal_input` that
+    /// the live gRPC engine runs, so `flashloan_amount` and graph-level
+    /// estimates reflect the *optimal* input rather than a fixed 1 WETH.
+    #[arg(long, default_value_t = false)]
+    no_optimizer: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -767,6 +786,149 @@ struct OppEstimate {
     net_profit_eth: f64,
 }
 
+/// Result of running the production optimizer on one detected cycle.
+///
+/// Mirrors `engine.rs:1027-1065` — same min/max bounds (0.01 ETH → 50 ETH,
+/// capped at path min-liquidity), same per-hop profit function
+/// `output = (dx*fee*y)/(x + dx*fee)`, same 80 ternary-search iterations.
+/// The point of running it here is so the CSV's `flashloan_amount` and the
+/// revm sim's input reflect what production would actually flashloan, not a
+/// CLI-fixed 1 WETH.
+struct OptimizerResult {
+    /// Optimal input amount in WETH (18 decimals).
+    optimal_input_wei: U256,
+    /// Net profit (output − input − gas_cost) at the optimal input, in WETH wei.
+    /// Signed because unprofitable cycles return a negative value.
+    net_profit_wei: i128,
+}
+
+/// Optimize a detected cycle's input amount using the production ternary
+/// search. Returns `None` when per-hop reserves cannot be assembled (e.g. the
+/// cycle touches a Curve/Balancer/Bancor hop whose pool state we don't carry,
+/// or a pool whose state fetch failed earlier in the replay).
+///
+/// For UniV2/Sushi hops we use the real `(r0, r1)` reserves from
+/// `running_states`. For UniV3 hops we fall back to a linear-rate
+/// approximation using the graph edge's weight (same pragmatic compromise
+/// `build_steps_from_cycle` already makes for V3 calldata) — when V3 hops
+/// dominate, the profit function degenerates to linear and the optimizer
+/// correctly clamps to `min_input` or `max_input`.
+fn optimize_cycle_input(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    running_states: &std::collections::HashMap<usize, PoolState>,
+    base_fee_wei: u128,
+) -> Option<OptimizerResult> {
+    if cycle.path.len() < 2 {
+        return None;
+    }
+
+    // Walk the cycle and build per-hop (reserve_in, reserve_out, fee_multiplier,
+    // fallback_rate). `reserve_in`/`reserve_out` are 0.0 when we have no
+    // reserves (V3 approximation) — the closure falls back to the rate.
+    let mut hop_reserves: Vec<(f64, f64)> = Vec::with_capacity(cycle.path.len() - 1);
+    let mut hop_fee_factors: Vec<f64> = Vec::with_capacity(cycle.path.len() - 1);
+    let mut hop_rates: Vec<f64> = Vec::with_capacity(cycle.path.len() - 1);
+    let mut min_liquidity_wei: Option<f64> = None;
+
+    let mut protocols: Vec<ProtocolType> = Vec::with_capacity(cycle.path.len() - 1);
+
+    for pair in cycle.path.windows(2) {
+        let [from_v, to_v] = [pair[0], pair[1]];
+
+        let edge = graph
+            .edges_from(from_v)
+            .iter()
+            .filter(|e| e.to == to_v)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))?;
+
+        let token_in = *token_index.get_address(from_v)?;
+
+        // Find the pool registry entry by address.
+        let (pool_idx, pool_entry) = pools
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.address == edge.pool_address)?;
+
+        let fee_multiplier = (10_000u32 - pool_entry.fee_bps) as f64 / 10_000.0;
+        let rate = (-edge.weight).exp(); // weight = -ln(rate)
+
+        let (rin, rout) = match running_states.get(&pool_idx).copied() {
+            Some(PoolState::V2 { r0, r1 }) => {
+                let (ri, ro) = if token_in == pool_entry.token0 {
+                    (r0, r1)
+                } else {
+                    (r1, r0)
+                };
+                // Track the min-liquidity hop (in WETH-equivalent units — we
+                // don't normalise across decimals here, matching engine.rs's
+                // simpler clamp behavior).
+                let ri_f = u256_to_f64(ri);
+                match min_liquidity_wei {
+                    Some(prev) if prev < ri_f => {}
+                    _ => min_liquidity_wei = Some(ri_f),
+                }
+                (ri_f, u256_to_f64(ro))
+            }
+            Some(PoolState::V3 { .. }) | None => (0.0, 0.0),
+        };
+
+        hop_reserves.push((rin, rout));
+        hop_fee_factors.push(fee_multiplier);
+        hop_rates.push(rate);
+        protocols.push(pool_entry.protocol);
+    }
+
+    // Production optimizer bounds: 0.01 ETH .. min(50 ETH, path min-liquidity).
+    let min_input = U256::from(10_000_000_000_000_000u128); // 0.01 ETH
+    let hard_max = U256::from(50_000_000_000_000_000_000u128); // 50 ETH
+    let max_input = match min_liquidity_wei {
+        Some(liq) if liq > 0.0 => {
+            let liq_u256 = U256::from(liq as u128);
+            if liq_u256 < hard_max { liq_u256 } else { hard_max }
+        }
+        _ => hard_max,
+    };
+
+    // Gas cost model — same path-based estimate production uses.
+    let ticks = vec![0u32; protocols.len()];
+    let gas_units = gas_model::estimate_total_gas(&protocols, &ticks);
+    let base_fee_gwei = base_fee_wei as f64 / 1e9;
+    let gas_cost_wei = gas_model::gas_cost_wei(gas_units, base_fee_gwei);
+
+    let profit_fn = |input: U256| -> i128 {
+        let mut current = u256_to_f64(input);
+        for i in 0..hop_reserves.len() {
+            let (x, y) = hop_reserves[i];
+            let fee = hop_fee_factors[i];
+            if x > 0.0 && y > 0.0 {
+                current = (current * fee * y) / (x + current * fee);
+            } else {
+                current *= hop_rates[i];
+            }
+        }
+        let output = current as i128;
+        let input_i128 = u256_to_f64(input) as i128;
+        output
+            .saturating_sub(input_i128)
+            .saturating_sub(gas_cost_wei as i128)
+    };
+
+    let (optimal_input_wei, net_profit_wei) = if min_input < max_input {
+        ternary_search_optimal_input(min_input, max_input, 80, profit_fn)
+    } else {
+        let p = profit_fn(min_input);
+        (min_input, p)
+    };
+
+    Some(OptimizerResult {
+        optimal_input_wei,
+        net_profit_wei,
+    })
+}
+
 fn estimate_opp(
     cycle: &DetectedCycle,
     graph: &PriceGraph,
@@ -818,7 +980,7 @@ async fn run_batch_replay(args: &Args, rpc_url: &str, blocks: &[u64]) -> Result<
                 use std::io::Write;
                 writeln!(
                     f,
-                    "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason"
+                    "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason,optimal_input_weth,opt_net_profit_eth,revm_gross_profit_eth,revm_owner_net_eth,tip_bps"
                 )?;
                 Some(std::cell::RefCell::new(f))
             }
@@ -1096,7 +1258,7 @@ async fn run_full_block_replay(
                     use std::io::Write;
                     writeln!(
                         f,
-                        "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason"
+                        "block,tx_index,tx_hash,cycles,top_profit_factor,hops,path,est_gas,base_fee_gwei,gas_cost_eth,sim_gross_profit_eth,sim_net_profit_eth,sim_success,sim_profit_eth,sim_gas_used,sim_revert_reason,optimal_input_weth,opt_net_profit_eth,revm_gross_profit_eth,revm_owner_net_eth,tip_bps"
                     )?;
                     Some(f)
                 }
@@ -1204,7 +1366,31 @@ async fn run_full_block_replay(
                 .collect();
             let path_str = path_labels.join(" -> ");
 
-            let est = estimate_opp(top_cycle, &graph, base_fee_wei, args.sim_input_weth);
+            // ── Optimizer: production-identical ternary search ──
+            // Run the same optimizer the live gRPC engine runs. Its output
+            // becomes the effective flashloan amount for both the graph-level
+            // net-profit estimate and the revm sim below. When `--no-optimizer`
+            // is set (compatibility mode), we fall back to the CLI-fixed
+            // `--sim-input-weth` to reproduce pre-PR CSV numbers.
+            let opt_result = if !args.no_optimizer {
+                optimize_cycle_input(
+                    top_cycle,
+                    &graph,
+                    &token_index,
+                    &pools,
+                    &running_states,
+                    base_fee_wei,
+                )
+            } else {
+                None
+            };
+
+            let sim_input_eth = match &opt_result {
+                Some(r) => u256_to_f64(r.optimal_input_wei) / 1e18,
+                None => args.sim_input_weth,
+            };
+
+            let est = estimate_opp(top_cycle, &graph, base_fee_wei, sim_input_eth);
             if est.net_profit_eth > 0.0 {
                 total_net_profit_eth += est.net_profit_eth;
             }
@@ -1221,7 +1407,8 @@ async fn run_full_block_replay(
                     &graph,
                     &token_index,
                     &pools,
-                    args.sim_input_weth,
+                    sim_input_eth,
+                    args.tip_bps,
                 )
                 .await;
                 if outcome.success {
@@ -1263,12 +1450,29 @@ async fn run_full_block_replay(
                 est.gas_units,
                 est.base_fee_gwei,
             );
+            if let Some(ref r) = opt_result {
+                println!(
+                    "           optimizer: input {:.4} WETH  net {:+.6} ETH",
+                    u256_to_f64(r.optimal_input_wei) / 1e18,
+                    r.net_profit_wei as f64 / 1e18,
+                );
+            }
             if let Some(ref sim) = sim_outcome {
                 if sim.success {
+                    let owner_net_eth = u256_to_f64(sim.profit_wei) / 1e18;
+                    // With tipBps>0, revm measures only the owner's share
+                    // (post-tip). Derive the gross for log readability so the
+                    // printed number compares apples-to-apples with the graph
+                    // estimate above.
+                    let tip_frac = (args.tip_bps as f64 / 10_000.0).min(0.9999);
+                    let gross_eth = if tip_frac > 0.0 {
+                        owner_net_eth / (1.0 - tip_frac)
+                    } else {
+                        owner_net_eth
+                    };
                     println!(
-                        "           revm sim: ✓ SUCCESS — actual profit {:+.6} ETH (gas used {})",
-                        u256_to_f64(sim.profit_wei) / 1e18,
-                        sim.gas_used,
+                        "           revm sim: ✓ SUCCESS — owner-net {:+.6} ETH / gross {:+.6} ETH (tip {} bps, gas used {})",
+                        owner_net_eth, gross_eth, args.tip_bps, sim.gas_used,
                     );
                 } else {
                     let reason = sim
@@ -1290,6 +1494,35 @@ async fn run_full_block_replay(
                 None => ("".into(), "".into(), "".into(), "".into()),
             };
 
+            // New columns: production-parity economics.
+            //   optimal_input_weth  — what the production optimizer picked
+            //   opt_net_profit_eth  — graph-level net at the optimal input
+            //   revm_owner_net_eth  — WETH delta measured on SIM_OWNER post-tip
+            //   revm_gross_profit_eth — owner_net / (1 - tip_bps/10000)
+            //                             i.e. pre-tip profit (what the HTML
+            //                             baseline's sim_profit_eth reports)
+            //   tip_bps             — the tipBps actually used in this sim
+            let (optimal_input_weth, opt_net_profit_eth) = match &opt_result {
+                Some(r) => (
+                    format!("{:.8}", u256_to_f64(r.optimal_input_wei) / 1e18),
+                    format!("{:.8}", r.net_profit_wei as f64 / 1e18),
+                ),
+                None => ("".into(), "".into()),
+            };
+            let (revm_gross_profit_eth, revm_owner_net_eth) = match &sim_outcome {
+                Some(s) if s.success => {
+                    let owner_eth = u256_to_f64(s.profit_wei) / 1e18;
+                    let tip_frac = (args.tip_bps as f64 / 10_000.0).min(0.9999);
+                    let gross = if tip_frac > 0.0 {
+                        owner_eth / (1.0 - tip_frac)
+                    } else {
+                        owner_eth
+                    };
+                    (format!("{:.8}", gross), format!("{:.8}", owner_eth))
+                }
+                _ => ("".into(), "".into()),
+            };
+
             // Write the CSV row — either to this run's local file, or into
             // the batch-shared writer if we were called from `run_batch_replay`.
             if let Some(cell) = shared_csv {
@@ -1297,7 +1530,7 @@ async fn run_full_block_replay(
                 let mut w = cell.borrow_mut();
                 writeln!(
                     w,
-                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr}",
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr},{oi},{onp},{rg},{ron},{tb}",
                     block = args.block,
                     tx = i,
                     hash = tx_hash,
@@ -1314,12 +1547,17 @@ async fn run_full_block_replay(
                     sp = sim_profit_eth,
                     sg = sim_gas_used,
                     sr = sim_reason,
+                    oi = optimal_input_weth,
+                    onp = opt_net_profit_eth,
+                    rg = revm_gross_profit_eth,
+                    ron = revm_owner_net_eth,
+                    tb = args.tip_bps,
                 )?;
             } else if let Some(w) = local_csv_writer.as_mut() {
                 use std::io::Write;
                 writeln!(
                     w,
-                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr}",
+                    "{block},{tx},{hash:#x},{cycles},{pf:.6},{hops},{path},{gas},{bf:.4},{gc:.8},{gp:.6},{np:.6},{ss},{sp},{sg},{sr},{oi},{onp},{rg},{ron},{tb}",
                     block = args.block,
                     tx = i,
                     hash = tx_hash,
@@ -1336,6 +1574,11 @@ async fn run_full_block_replay(
                     sp = sim_profit_eth,
                     sg = sim_gas_used,
                     sr = sim_reason,
+                    oi = optimal_input_weth,
+                    onp = opt_net_profit_eth,
+                    rg = revm_gross_profit_eth,
+                    ron = revm_owner_net_eth,
+                    tb = args.tip_bps,
                 )?;
             }
         }
@@ -1350,6 +1593,11 @@ async fn run_full_block_replay(
     }
 
     // Summary.
+    let input_label = if args.no_optimizer {
+        format!("fixed {:.2} WETH input (--no-optimizer)", args.sim_input_weth)
+    } else {
+        "per-cycle optimal input (ternary-search)".to_string()
+    };
     println!("\n== Summary ==");
     println!("  Block:                     {}", args.block);
     println!("  Txs total:                 {}", txs.len());
@@ -1357,17 +1605,30 @@ async fn run_full_block_replay(
     println!("  Txs reverted:              {}", reverted);
     println!("  Detection events:          {}", opp_events.len());
     println!(
-        "  Theoretical net captureable: {:+.4} ETH (graph-level, at {:.2} WETH input, sum over tx windows)",
-        total_net_profit_eth, args.sim_input_weth
+        "  Theoretical net captureable: {:+.4} ETH (graph-level, {}, sum over tx windows)",
+        total_net_profit_eth, input_label
     );
     if args.sim_on_chain {
+        // total_sim_profit_eth is the sum of WETH balance deltas on SIM_OWNER.
+        // With tip_bps > 0 that's already the owner-net. Derive gross for
+        // apples-to-apples comparison with legacy CSVs written at tipBps=0.
+        let tip_frac = (args.tip_bps as f64 / 10_000.0).min(0.9999);
+        let gross_total = if tip_frac > 0.0 {
+            total_sim_profit_eth / (1.0 - tip_frac)
+        } else {
+            total_sim_profit_eth
+        };
         println!(
             "  Revm-sim result:           {} succeeded / {} reverted / {} skipped",
             sim_success_count, sim_revert_count, sim_skip_count
         );
         println!(
-            "  Actually-executable P&L:   {:+.6} ETH (sum of revm-confirmed per-cycle profits at {:.2} WETH input)",
-            total_sim_profit_eth, args.sim_input_weth
+            "  Executable P&L — gross:    {:+.6} ETH  (pre-tip; this is what legacy CSVs reported)",
+            gross_total
+        );
+        println!(
+            "  Executable P&L — owner:    {:+.6} ETH  (post-tip @ {} bps; what production owner receives)",
+            total_sim_profit_eth, args.tip_bps
         );
     }
     println!("  Replay time:               {} ms", replay_ms);
@@ -1672,6 +1933,7 @@ const WETH_BALANCE_SLOT: u64 = 3;
 /// from earlier txs in the block being replayed). Profit is measured as the
 /// WETH balance delta on `SIM_OWNER` directly out of revm's returned state
 /// diff — no extra RPC round-trips.
+#[allow(clippy::too_many_arguments)]
 async fn sim_arb_with_evm_simulator<P: Provider + Clone + 'static>(
     anvil_provider: &P,
     executor_addr: Address,
@@ -1680,6 +1942,7 @@ async fn sim_arb_with_evm_simulator<P: Provider + Clone + 'static>(
     token_index: &TokenIndex,
     pools: &[LoadedPool],
     sim_input_weth: f64,
+    tip_bps: u64,
 ) -> SimOutcome {
     let flashloan_amount = U256::from((sim_input_weth * 1e18) as u128);
 
@@ -1708,9 +1971,14 @@ async fn sim_arb_with_evm_simulator<P: Provider + Clone + 'static>(
         }
     };
 
-    // Build executeArb calldata. `minProfitOut=0` + `tipBps=0` so revm lets
-    // any non-negative profit succeed and 100% of it lands with `SIM_OWNER`
-    // as WETH — our balance-diff observable.
+    // Build executeArb calldata with the same tipBps production uses (default
+    // 9000 = 90%). `minProfitOut=0` so revm lets any non-negative post-tip
+    // delivery succeed. With tipBps>0 the contract forwards the tip to
+    // `block.coinbase` (after unwrapping WETH → ETH for a WETH flashloan), so
+    // the WETH balance delta we measure on SIM_OWNER is the OWNER-NET profit,
+    // not the gross pre-tip profit — which is exactly what the production
+    // owner's wallet sees post-inclusion. Pass `--tip-bps 0` to recover the
+    // old "measure gross" behavior for direct comparison to legacy CSVs.
     let deadline = U256::from(u64::MAX);
     let calldata = build_execute_arb_calldata(
         &steps,
@@ -1718,7 +1986,7 @@ async fn sim_arb_with_evm_simulator<P: Provider + Clone + 'static>(
         flashloan_amount,
         deadline,
         U256::ZERO,
-        U256::ZERO,
+        U256::from(tip_bps),
     );
 
     // Fetch Anvil's current head block to pin RpcForkedState and extract
