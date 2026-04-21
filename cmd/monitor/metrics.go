@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aether-arb/aether/internal/tracing"
 )
 
 // Metrics holds all Prometheus-style metrics
@@ -102,7 +104,7 @@ func main() {
 
 	fmt.Println("aether-monitor: metrics, dashboard, and alerting service")
 
-	shutdownTracer, err := initTracer(context.Background(), "aether-monitor")
+	shutdownTracer, err := tracing.Init(context.Background(), "aether-monitor")
 	if err != nil {
 		slog.Warn("otlp tracer init failed, continuing without traces", "err", err)
 		shutdownTracer = func(context.Context) error { return nil }

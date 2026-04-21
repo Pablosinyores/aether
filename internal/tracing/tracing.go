@@ -1,4 +1,9 @@
-package main
+// Package tracing wires the global OpenTelemetry tracer provider for Aether
+// Go services.
+//
+// Init is designed to be called once from a service's main() and returns a
+// shutdown function that flushes pending span batches.
+package tracing
 
 import (
 	"context"
@@ -13,10 +18,9 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
-// initTracer wires the global OpenTelemetry tracer provider.
+// Init wires the global OpenTelemetry tracer provider.
 //
 // When OTEL_EXPORTER_OTLP_ENDPOINT is unset the function returns a no-op
 // shutdown so local runs stay zero-config. When it is set the exporter pushes
@@ -24,7 +28,7 @@ import (
 //
 // The returned shutdown flushes pending batches and must be deferred from
 // main().
-func initTracer(ctx context.Context, serviceName string) (func(context.Context) error, error) {
+func Init(ctx context.Context, serviceName string) (func(context.Context) error, error) {
 	endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	if endpoint == "" {
 		return func(context.Context) error { return nil }, nil
@@ -42,8 +46,7 @@ func initTracer(ctx context.Context, serviceName string) (func(context.Context) 
 	exporter, err := otlptracegrpc.New(
 		dialCtx,
 		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithDialOption(),
-		otlptracegrpc.WithTLSCredentials(insecure.NewCredentials()),
+		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("otlp exporter: %w", err)
