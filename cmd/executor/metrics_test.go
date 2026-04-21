@@ -253,6 +253,54 @@ func TestRecordBuilderResult_ScrapeLabels(t *testing.T) {
 	}
 }
 
+func TestPreRegisterBuilderLabels_BothSeriesExistAtZero(t *testing.T) {
+	// Use unique builder names so the assertion is not polluted by other
+	// tests that exercise recordBuilderResult against real builder names.
+	names := []string{"prereg_alpha", "prereg_beta"}
+	PreRegisterBuilderLabels(names)
+
+	for _, name := range names {
+		gotSuccess := testutil.ToFloat64(builderSubmissionsTotal.WithLabelValues(name, "success"))
+		if gotSuccess != 0 {
+			t.Errorf("pre-registered %q success: got %f, want 0", name, gotSuccess)
+		}
+		gotFailure := testutil.ToFloat64(builderSubmissionsTotal.WithLabelValues(name, "failure"))
+		if gotFailure != 0 {
+			t.Errorf("pre-registered %q failure: got %f, want 0", name, gotFailure)
+		}
+	}
+
+	// Verify both series are actually exposed on the /metrics scrape (not
+	// just observable via the in-process collector) — this is the property
+	// the AetherBuilderDown alert actually depends on.
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+	payload := string(body)
+
+	required := []string{
+		`aether_executor_builder_submissions_total{builder="prereg_alpha",result="success"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_alpha",result="failure"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_beta",result="success"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_beta",result="failure"} 0`,
+	}
+	for _, want := range required {
+		if !strings.Contains(payload, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
 func TestSetSystemState_LastWriteWins(t *testing.T) {
 	setSystemState(2)
 	setSystemState(3)

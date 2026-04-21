@@ -16,7 +16,7 @@ groups:
         expr: |
           sum(rate(aether_executor_bundles_included_total[1h]))
           /
-          clamp_min(sum(rate(aether_executor_bundles_submitted_total[1h])), 1) < 0.20
+          clamp_min(sum(rate(aether_executor_bundles_submitted_total[1h])), 1e-9) < 0.20
         for: 10m
         labels:
           severity: warning

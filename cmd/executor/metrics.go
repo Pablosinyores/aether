@@ -150,6 +150,19 @@ func recordBuilderResult(builder string, success bool, latency time.Duration) {
 	builderLatencyMs.WithLabelValues(builder).Observe(float64(latency.Milliseconds()))
 }
 
+// PreRegisterBuilderLabels initialises the {builder, result} label pairs for
+// every configured builder to zero. Prometheus CounterVec does not emit a
+// time series until WithLabelValues is called, so without this step the
+// AetherBuilderDown alert (which requires both success and failure series to
+// exist) would never fire for a builder that has only ever failed. Calling
+// this at startup guarantees both series are observable from t=0.
+func PreRegisterBuilderLabels(names []string) {
+	for _, name := range names {
+		builderSubmissionsTotal.WithLabelValues(name, "success").Add(0)
+		builderSubmissionsTotal.WithLabelValues(name, "failure").Add(0)
+	}
+}
+
 func setSystemState(s int) {
 	systemStateGauge.Set(float64(s))
 }
