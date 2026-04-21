@@ -55,4 +55,13 @@ Add finer or higher buckets in the metric definition to get better resolution.
 bash scripts/monitoring_smoke.sh
 ```
 
-Brings up the full stack, fires synthetic versions of all 12 alert rules via `docker cp` + Prometheus lifecycle reload, asserts each alert becomes active in Alertmanager, then tears down. Requires `docker`, `curl`, `jq`.
+Brings up the monitoring stack (prometheus, alertmanager, grafana), waits for readiness, and asserts:
+
+- every expected alert rule was loaded by Prometheus, with `summary`, `description`, `runbook_url`, and `severity` populated;
+- both `aether-go` and `aether-rust` scrape jobs are discovered;
+- Alertmanager accepted its config (slack-default receiver resolved);
+- every expected Grafana dashboard UID is provisioned.
+
+The script tears the stack down on exit. Requires `docker`, `curl`, `jq`.
+
+Synthetic rule injection (`docker cp` + `/-/reload`) is deliberately avoided — main's `prometheus.yml` pins `rule_files` to an explicit path and the compose stack does not pass `--web.enable-lifecycle`, so that approach cannot function without modifying files owned by other workstreams. Asserting rule loadedness via `/api/v1/rules` gives deterministic coverage within this PR's scope.
