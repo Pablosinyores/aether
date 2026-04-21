@@ -167,7 +167,7 @@ if [ -z "${ETH_RPC_URL:-}" ]; then
     exit 1
 fi
 
-for cmd in anvil cargo go curl lsof; do
+for cmd in anvil cargo go curl lsof forge cast; do
     if ! command -v "$cmd" &>/dev/null; then
         log_error "Missing tool: $cmd"
         exit 1
@@ -253,6 +253,73 @@ wait_for_port "$GRPC_PORT" "Rust gRPC" 30
 wait_for_port "$RUST_METRICS_PORT" "Rust metrics" 15
 log_ok "aether-rust running (PID $RUST_PID)"
 
+# ── Phase 3.5: Deploy AetherExecutor to the Anvil fork ──────────────────
+#
+# The Go executor's startup validation (executor.yaml) requires
+# AETHER_EXECUTOR_ADDRESS to point at a contract with real bytecode on the
+# connected node. Our node here is Anvil forked at BLOCK-1, so the mainnet
+# deployment doesn't exist yet on this fork. Deploy a fresh copy using the
+# deployer account (STAGING_KEY — Anvil account 0) so the address is
+# deterministic across runs of the same fork block.
+
+log_step "Phase 3.5: Deploy AetherExecutor to Anvil fork"
+
+# The STAGING_KEY address takes on its real mainnet balance when Anvil forks,
+# which is effectively zero. Top it up to 10,000 ETH via anvil_setBalance so
+# forge script can actually broadcast the deploy.
+STAGING_ADDR=$(cast wallet address --private-key "$STAGING_KEY")
+curl -sf -X POST -H "Content-Type: application/json" \
+    --data "{\"jsonrpc\":\"2.0\",\"method\":\"anvil_setBalance\",\"params\":[\"$STAGING_ADDR\",\"0x21e19e0c9bab2400000\"],\"id\":1}" \
+    "$ANVIL_RPC" > /dev/null || {
+        log_error "anvil_setBalance RPC call failed"
+        exit 1
+    }
+log_info "Funded $STAGING_ADDR with 10000 ETH on the fork"
+
+DEPLOY_LOG="$LOG_DIR/deploy.log"
+(
+    cd "$PROJECT_ROOT/contracts"
+    forge script script/Deploy.s.sol \
+        --rpc-url "$ANVIL_RPC" \
+        --private-key "$STAGING_KEY" \
+        --broadcast \
+        > "$DEPLOY_LOG" 2>&1
+) || true
+
+AETHER_EXECUTOR_ADDRESS=$(grep "AetherExecutor deployed at:" "$DEPLOY_LOG" | awk '{print $NF}' | tail -1)
+if [ -z "$AETHER_EXECUTOR_ADDRESS" ]; then
+    log_warn "forge script did not print an address; falling back to forge create"
+    FALLBACK_LOG="$LOG_DIR/deploy_fallback.log"
+    (
+        cd "$PROJECT_ROOT/contracts"
+        forge create \
+            --rpc-url "$ANVIL_RPC" \
+            --private-key "$STAGING_KEY" \
+            --broadcast \
+            "src/AetherExecutor.sol:AetherExecutor" \
+            --constructor-args \
+                "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2" \
+                "0xBA12222222228d8Ba445958a75a0704d566BF2C8" \
+                "0xeEF417e1D5CC832e619ae18D2F140De2999dD4fB" \
+            > "$FALLBACK_LOG" 2>&1
+    ) || true
+    AETHER_EXECUTOR_ADDRESS=$(grep -E "Deployed to:" "$FALLBACK_LOG" | awk '{print $3}')
+fi
+
+if [ -z "$AETHER_EXECUTOR_ADDRESS" ]; then
+    log_error "Failed to deploy AetherExecutor (see $DEPLOY_LOG)"
+    tail -30 "$DEPLOY_LOG"
+    exit 1
+fi
+
+DEPLOYED_CODE=$(cast code "$AETHER_EXECUTOR_ADDRESS" --rpc-url "$ANVIL_RPC" 2>/dev/null || echo "0x")
+if [ "$DEPLOYED_CODE" = "0x" ] || [ -z "$DEPLOYED_CODE" ]; then
+    log_error "Deployed contract at $AETHER_EXECUTOR_ADDRESS has no bytecode on the fork"
+    exit 1
+fi
+log_ok "AetherExecutor deployed at $AETHER_EXECUTOR_ADDRESS"
+export AETHER_EXECUTOR_ADDRESS
+
 # ── Phase 4: Start Go executor in SHADOW mode ───────────────────────────
 
 log_step "Phase 4: Start aether-executor (AETHER_SHADOW=1)"
@@ -268,6 +335,7 @@ METRICS_PORT="$GO_METRICS_PORT" \
 DASHBOARD_PORT="$DASHBOARD_PORT" \
 AETHER_SHADOW="1" \
 AETHER_SHADOW_DUMP_DIR="$BUNDLE_DUMP_DIR" \
+AETHER_EXECUTOR_ADDRESS="$AETHER_EXECUTOR_ADDRESS" \
     "$AETHER_EXECUTOR" > "$LOG_DIR/executor.log" 2>&1 &
 EXECUTOR_PID=$!
 
