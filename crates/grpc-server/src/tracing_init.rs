@@ -77,6 +77,7 @@ pub fn init() -> TracingGuard {
         Some(
             tracing_subscriber::fmt::layer()
                 .json()
+                .flatten_event(true)
                 .with_current_span(true)
                 .with_span_list(false),
         )
