@@ -12,7 +12,7 @@ Adding a new DEX requires changes in 6 files across 3 languages:
 | 2. Event decoding | `crates/ingestion/src/event_decoder.rs` | Rust |
 | 3. Protocol enum | `crates/common/src/types.rs` | Rust |
 | 4. Swap routing | `contracts/src/AetherExecutor.sol` | Solidity |
-| 5. Gas estimation | `crates/detector/src/gas.rs` | Rust |
+| 5. Gas estimation | `crates/common/src/types.rs` | Rust |
 | 6. Pool config | `config/pools.toml` | TOML |
 
 ## Step 1: Implement the Pool Trait
@@ -156,18 +156,20 @@ Add corresponding tests in `contracts/test/AetherExecutor.t.sol`.
 
 ## Step 5: Add Gas Estimation
 
-In `crates/detector/src/gas.rs`, add the base gas cost for the new protocol:
+In `crates/common/src/types.rs`, add a new arm to the `ProtocolType::base_gas()` method:
 
 ```rust
-pub fn base_gas(protocol: ProtocolType) -> u64 {
-    match protocol {
-        ProtocolType::UniswapV2 => 60_000,
-        ProtocolType::UniswapV3 => 100_000, // + 5000 per tick crossed
-        ProtocolType::SushiSwap => 60_000,
-        ProtocolType::Curve => 130_000,
-        ProtocolType::BalancerV2 => 120_000,
-        ProtocolType::BancorV3 => 150_000,
-        ProtocolType::NewDex => 80_000, // Measure with gas_profiler.py
+impl ProtocolType {
+    pub fn base_gas(&self) -> u64 {
+        match self {
+            ProtocolType::UniswapV2 => 60_000,
+            ProtocolType::UniswapV3 => 180_000, // + 5000 per tick crossed
+            ProtocolType::SushiSwap => 60_000,
+            ProtocolType::Curve => 130_000,
+            ProtocolType::BalancerV2 => 120_000,
+            ProtocolType::BancorV3 => 150_000,
+            ProtocolType::NewDex => 80_000, // Measure with gas_profiler.py
+        }
     }
 }
 ```
