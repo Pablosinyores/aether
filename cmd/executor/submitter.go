@@ -76,9 +76,15 @@ func NewSubmitter(builders []BuilderConfig, searcherKey string) (*Submitter, err
 	}
 
 	metrics := make(map[string]*BuilderMetrics, len(builders))
+	names := make([]string, 0, len(builders))
 	for _, b := range builders {
 		metrics[b.Name] = &BuilderMetrics{}
+		names = append(names, b.Name)
 	}
+	// Ensure both {result="success"} and {result="failure"} series exist
+	// for every configured builder from t=0 so the AetherBuilderDown alert
+	// can reason about builders that have not yet produced either outcome.
+	PreRegisterBuilderLabels(names)
 
 	transport := &http.Transport{
 		MaxIdleConnsPerHost: len(builders),

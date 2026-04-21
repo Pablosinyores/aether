@@ -144,13 +144,22 @@ func (rm *RiskManager) SetMetricsObserver(obs MetricsObserver) {
 }
 
 // notifyTrip transitions state and notifies the observer. Caller holds rm.mu.
+//
+// The OnCircuitBreakerTrip observer is called BEFORE the state transition so
+// every trip is counted even when the transition is rejected (e.g. the bot is
+// already Halted and another bug-revert burst tries to push to Paused). That
+// is exactly the signal we want to preserve: "we're still seeing breaker
+// conditions in a halted state". OnStateChange is only emitted on a real
+// transition, since no state actually changed otherwise.
 func (rm *RiskManager) notifyTrip(reason string, newState SystemState) {
+	if rm.metricsObs != nil {
+		rm.metricsObs.OnCircuitBreakerTrip(reason)
+	}
 	if err := rm.state.Transition(newState); err != nil {
 		log.Printf("CIRCUIT BREAKER: transition to %s failed: %v", newState, err)
 		return
 	}
 	if rm.metricsObs != nil {
-		rm.metricsObs.OnCircuitBreakerTrip(reason)
 		rm.metricsObs.OnStateChange(newState)
 	}
 }

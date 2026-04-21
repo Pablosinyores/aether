@@ -684,6 +684,63 @@ func TestMetricsObserver_DailyLossTrip(t *testing.T) {
 	}
 }
 
+// TestMetricsObserver_TripCountedEvenWhenTransitionRejected asserts that the
+// circuit-breaker trip observer fires even when the underlying state machine
+// rejects the transition — e.g. the bot is already Halted and another
+// bug-revert burst tries to push to Paused. The trip metric must still be
+// bumped so dashboards can show "we're still seeing breaker conditions in a
+// halted state" rather than silently swallowing the signal.
+func TestMetricsObserver_TripCountedEvenWhenTransitionRejected(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.ConsecutiveRevertsPause = 3
+	rm := NewRiskManager(cfg)
+
+	// Force the bot into Halted without going through the breaker path.
+	rm.state.ForceState(StateHalted)
+
+	obs := &fakeMetricsObserver{}
+	rm.SetMetricsObserver(obs)
+
+	// Drain the initial OnStateChange(Halted) that SetMetricsObserver emits.
+	initialStates, initialTrips := obs.snapshot()
+	if len(initialStates) != 1 || initialStates[0] != StateHalted {
+		t.Fatalf("setup: expected one OnStateChange(Halted), got %v", initialStates)
+	}
+	if len(initialTrips) != 0 {
+		t.Fatalf("setup: expected zero trips, got %v", initialTrips)
+	}
+
+	// 3 bug reverts would ordinarily trip Running -> Paused. From Halted the
+	// Paused transition is invalid, so the state does NOT change. We still
+	// expect one 'consecutive_bug_reverts' trip to be observed.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+
+	states, trips := obs.snapshot()
+
+	// No new state changes beyond the initial one.
+	if len(states) != 1 {
+		t.Fatalf("expected no state changes after failed transition, got %v", states)
+	}
+	if rm.State() != StateHalted {
+		t.Fatalf("expected state to remain Halted, got %s", rm.State())
+	}
+
+	// Trip must still have been recorded exactly once.
+	tripCount := 0
+	for _, r := range trips {
+		if r == "consecutive_bug_reverts" {
+			tripCount++
+		}
+	}
+	if tripCount != 1 {
+		t.Fatalf("expected exactly one 'consecutive_bug_reverts' trip even when transition rejected, got trips=%v", trips)
+	}
+}
+
 func TestWeiToETH(t *testing.T) {
 	t.Parallel()
 
