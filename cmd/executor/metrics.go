@@ -20,9 +20,10 @@ import (
 )
 
 // Naming convention:
-//   aether_executor_* — executor-process-specific counters (bundle ops, risk)
-//   aether_*          — system-level spec metrics shared across processes
-//                       (latency, gas price, PnL, ETH balance)
+//
+//	aether_executor_* — executor-process-specific counters (bundle ops, risk)
+//	aether_*          — system-level spec metrics shared across processes
+//	                    (latency, gas price, PnL, ETH balance)
 var (
 	bundlesSubmitted = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aether_executor_bundles_submitted_total",

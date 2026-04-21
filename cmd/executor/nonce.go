@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -52,7 +52,7 @@ func (nm *NonceManager) Sync(onChainNonce uint64) {
 	if onChainNonce > current {
 		nm.current.Store(onChainNonce)
 		nm.pending.Store(0)
-		log.Printf("Nonce synced: %d -> %d", current, onChainNonce)
+		slog.Info("nonce synced", "from", current, "to", onChainNonce)
 	}
 }
 
@@ -93,13 +93,12 @@ func (nm *NonceManager) SyncLoop(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			if nm.client == nil || nm.address == (common.Address{}) {
-				log.Printf("Nonce sync check: current=%d, pending=%d",
-					nm.Current(), nm.PendingCount())
+				slog.Debug("nonce sync check", "current", nm.Current(), "pending", nm.PendingCount())
 				continue
 			}
 
 			if err := nm.SyncFromChain(ctx); err != nil {
-				log.Printf("Nonce sync failed: %v", err)
+				slog.Error("nonce sync failed", "err", err)
 			}
 		}
 	}

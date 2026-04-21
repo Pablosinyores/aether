@@ -138,9 +138,9 @@ func TestContainsTargetToken(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		addr  string
-		want  bool
+		name string
+		addr string
+		want bool
 	}{
 		{"WETH", WETH, true},
 		{"USDC", USDC, true},

@@ -2,7 +2,7 @@ package risk
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 )
 
@@ -46,7 +46,7 @@ func (sm *SystemStateMachine) Transition(newState SystemState) error {
 	}
 
 	sm.state = newState
-	log.Printf("System state: %s -> %s", oldState, newState)
+	slog.Info("system state transition", "from", string(oldState), "to", string(newState))
 	return nil
 }
 
@@ -54,7 +54,7 @@ func (sm *SystemStateMachine) Transition(newState SystemState) error {
 func (sm *SystemStateMachine) ForceState(newState SystemState) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	log.Printf("System state forced: %s -> %s", sm.state, newState)
+	slog.Warn("system state forced", "from", string(sm.state), "to", string(newState))
 	sm.state = newState
 }
 

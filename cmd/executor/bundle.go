@@ -4,8 +4,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -96,7 +97,8 @@ func (bc *BundleConstructor) BuildBundle(
 func GenerateBundleID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		log.Fatalf("crypto/rand failure: %v", err)
+		slog.Error("crypto/rand failure", "err", err)
+		os.Exit(1)
 	}
 	return hex.EncodeToString(b)
 }

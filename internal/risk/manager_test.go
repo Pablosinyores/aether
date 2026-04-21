@@ -301,7 +301,7 @@ func TestRecordRevert_CompetitiveRateAlert(t *testing.T) {
 
 	// Set a low alert threshold to make it easy to trigger.
 	config := DefaultRiskConfig()
-	config.ConsecutiveRevertsPause = 100 // effectively disable CB for this test
+	config.ConsecutiveRevertsPause = 100  // effectively disable CB for this test
 	config.CompetitiveRevertAlertPct = 80 // alert at 80%+
 	rm := NewRiskManager(config)
 

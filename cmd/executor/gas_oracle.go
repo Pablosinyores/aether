@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"math/big"
 	"sync"
 	"time"
@@ -127,7 +127,7 @@ func (go_ *GasOracle) FetchOnce(ctx context.Context) (GasFees, error) {
 		baseFee = feeHistory.BaseFee[len(feeHistory.BaseFee)-1]
 	}
 	if baseFee == nil || baseFee.Sign() == 0 {
-		log.Printf("Gas oracle: WARNING eth_feeHistory returned zero/nil baseFee, keeping last known values")
+		slog.Warn("gas oracle: eth_feeHistory returned zero/nil baseFee, keeping last known values")
 		return go_.CurrentFees(), nil
 	}
 
@@ -156,14 +156,14 @@ func (go_ *GasOracle) UpdateLoop(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			fees, err := go_.FetchOnce(ctx)
 			if err != nil {
-				log.Printf("Gas oracle: RPC error (keeping last known): %v", err)
+				slog.Warn("gas oracle: RPC error, keeping last known", "err", err)
 			} else {
 				recordGasPrice(fees.GasPriceGwei)
 			}
-			log.Printf("Gas oracle: baseFee=%.4f gwei, maxFee=%.4f gwei, priorityFee=%.4f gwei",
-				weiToGwei(fees.BaseFee),
-				weiToGwei(fees.MaxFeePerGas),
-				weiToGwei(fees.MaxPriorityFee))
+			slog.Debug("gas oracle: fees updated",
+				"base_fee_gwei", weiToGwei(fees.BaseFee),
+				"max_fee_gwei", weiToGwei(fees.MaxFeePerGas),
+				"priority_fee_gwei", weiToGwei(fees.MaxPriorityFee))
 		}
 	}
 }

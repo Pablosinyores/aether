@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -135,11 +135,15 @@ func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []Submissio
 	results := make([]SubmissionResult, 0, len(s.builders))
 	for result := range resultCh {
 		if result.Success {
-			log.Printf("Bundle accepted by %s (hash: %s, latency: %v)",
-				result.Builder, result.BundleHash, result.Latency)
+			slog.Info("bundle accepted by builder",
+				"builder", result.Builder,
+				"bundle_hash", result.BundleHash,
+				"latency", result.Latency)
 		} else {
-			log.Printf("Bundle rejected by %s: %v (latency: %v)",
-				result.Builder, result.Error, result.Latency)
+			slog.Warn("bundle rejected by builder",
+				"builder", result.Builder,
+				"err", result.Error,
+				"latency", result.Latency)
 		}
 		results = append(results, result)
 	}
@@ -278,8 +282,7 @@ func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, 
 	}
 	if rpcResp.Result != nil {
 		if err := json.Unmarshal(rpcResp.Result, &result); err != nil {
-			log.Printf("warn: builder %s returned unparseable result (%v): %s",
-				builder.Name, err, string(rpcResp.Result))
+			slog.Warn("builder returned unparseable result", "builder", builder.Name, "err", err, "raw", string(rpcResp.Result))
 		}
 	}
 
