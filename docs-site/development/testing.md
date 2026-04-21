@@ -166,7 +166,7 @@ Profile gas usage per protocol:
 python scripts/gas_profiler.py
 ```
 
-Outputs gas usage per swap type, helping calibrate the gas estimation model in `crates/detector/src/gas.rs`.
+Outputs gas usage per swap type, helping calibrate the per-protocol gas constants in `crates/common/src/types.rs` (`ProtocolType::base_gas()`).
 
 ## Backtesting
 

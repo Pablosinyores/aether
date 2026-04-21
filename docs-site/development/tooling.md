@@ -66,7 +66,7 @@ Outputs:
 - Gas usage per hop count (2-hop, 3-hop, etc.)
 - Comparison against the gas estimation model
 
-Use this to calibrate the gas estimates in `crates/detector/src/gas.rs`. Estimates should be within 10% of actual usage.
+Use this to calibrate the per-protocol gas constants in `crates/common/src/types.rs` (`ProtocolType::base_gas()`). Estimates should be within 10% of actual usage.
 
 ## `staging_test.sh` — Staging Validation
 

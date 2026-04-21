@@ -170,7 +170,7 @@ Per-protocol base gas costs:
 | Protocol | Base Gas | Notes |
 |---|---|---|
 | Uniswap V2 | 60,000 | Constant product, single storage read |
-| Uniswap V3 | 100,000 + 5,000/tick | Varies with ticks crossed |
+| Uniswap V3 | 180,000 + 5,000/tick | Varies with ticks crossed |
 | SushiSwap | 60,000 | Same as UniV2 |
 | Curve | 130,000 | Newton's method iterations |
 | Balancer V2 | 120,000 | Weighted math |
