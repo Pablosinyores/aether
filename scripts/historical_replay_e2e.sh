@@ -14,18 +14,31 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/historical_replay_e2e.sh --block 24643151
+#   ./scripts/historical_replay_e2e.sh --blocks 24643151,24643160,24643170
+#   ./scripts/historical_replay_e2e.sh --blocks-file /tmp/blocks.txt
 #   KEEP_RUNNING=1 ./scripts/historical_replay_e2e.sh --block 24643151
 #       (leaves pipeline up after replay so you can open Grafana)
+#
+# Batch mode: each block runs through its own Anvil fork + fresh stack;
+# preflight and build run once. A combined summary table prints at the end.
 #
 # Requires: anvil, cargo, go, curl, ETH_RPC_URL set in .env or environment.
 
 # ── Args ────────────────────────────────────────────────────────────────
 
-BLOCK=""
+BLOCKS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --block) BLOCK="$2"; shift 2 ;;
-        --block=*) BLOCK="${1#*=}"; shift ;;
+        --block)       BLOCKS+=("$2"); shift 2 ;;
+        --block=*)     BLOCKS+=("${1#*=}"); shift ;;
+        --blocks)      IFS=',' read -ra _b <<< "$2"; BLOCKS+=("${_b[@]}"); shift 2 ;;
+        --blocks=*)    IFS=',' read -ra _b <<< "${1#*=}"; BLOCKS+=("${_b[@]}"); shift ;;
+        --blocks-file)
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+                BLOCKS+=("$(echo "$line" | tr -d '[:space:]')")
+            done < "$2"
+            shift 2 ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# \?//' | head -30
             exit 0
@@ -34,8 +47,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$BLOCK" ]; then
-    echo "Missing --block N" >&2
+if [ ${#BLOCKS[@]} -eq 0 ]; then
+    echo "Missing --block N, --blocks N,N,N, or --blocks-file PATH" >&2
     exit 2
 fi
 
@@ -207,6 +220,33 @@ for bin in "$AETHER_RUST" "$AETHER_REPLAY" "$AETHER_EXECUTOR"; do
         exit 1
     fi
 done
+
+# ── Per-block loop ──────────────────────────────────────────────────────
+#
+# Each block needs its own Anvil fork at `block-1`; we cannot share state
+# across blocks because `anvil_reset` would jump aether-rust's subscribed
+# chain head backwards, which aether-rust has no reorg-rewind for. Between
+# blocks we tear down Anvil / rust / executor and stand them back up.
+
+ALL_BLOCKS=(); ALL_CYCLES=(); ALL_SIMS=(); ALL_ARBS=(); ALL_SHADOW=(); ALL_RISK=()
+ALL_DURATION=(); ALL_DETECT=(); ALL_SIM_MEAN=(); ALL_E2E=(); ALL_GROUND=(); ALL_HIT=()
+
+kill_stack() {
+    for pid in $EXECUTOR_PID $RUST_PID $ANVIL_PID; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    wait 2>/dev/null || true
+    for port in $ANVIL_PORT $GRPC_PORT $RUST_METRICS_PORT $GO_METRICS_PORT $DASHBOARD_PORT; do
+        kill_port "$port"
+    done
+    ANVIL_PID=""; RUST_PID=""; EXECUTOR_PID=""
+}
+
+for BLOCK in "${BLOCKS[@]}"; do
+
+log_step "Block $BLOCK — starting stack"
 
 # ── Phase 2: Spawn Anvil at block-1 ─────────────────────────────────────
 
@@ -555,3 +595,60 @@ print("  Inspect any bundle:  jq . {}/<arb_id>.json".format(bundles_dir))
 PY
 
 log_ok "E2E replay completed successfully (shadow mode held; no real submissions)"
+
+# Capture per-block totals for the batch summary before tearing down.
+ALL_BLOCKS+=("$BLOCK")
+ALL_CYCLES+=("$PEAK_CYCLES")
+ALL_SIMS+=("$PEAK_SIMS")
+ALL_ARBS+=("$PEAK_ARBS")
+ALL_SHADOW+=("$PEAK_SHADOW")
+ALL_RISK+=("$PEAK_RISK_REJ")
+ALL_DURATION+=("$DURATION")
+ALL_DETECT+=("$DETECT_MEAN")
+ALL_SIM_MEAN+=("$SIM_MEAN")
+ALL_E2E+=("$E2E_MEAN")
+
+# Stand down this block's stack before the next iteration. On the last
+# block the cleanup trap at EXIT would do it anyway, but running it here
+# explicitly keeps KEEP_RUNNING=1 honoring "leave the *last* block's stack
+# up for Grafana inspection" rather than every block's.
+# Note: ${BLOCKS[${#BLOCKS[@]}-1]} not ${BLOCKS[-1]} because macOS ships
+# bash 3.2, which doesn't support negative array subscripts.
+LAST_IDX=$(( ${#BLOCKS[@]} - 1 ))
+if [ "$BLOCK" != "${BLOCKS[$LAST_IDX]}" ]; then
+    log_warn "Block $BLOCK done — tearing down stack before next block"
+    kill_stack
+    sleep 2
+fi
+
+done  # ── end per-block loop ─────────────────────────────────────────────
+
+# ── Batch summary ───────────────────────────────────────────────────────
+
+if [ ${#ALL_BLOCKS[@]} -gt 1 ]; then
+    echo ""
+    echo -e "${BOLD}====================================================================${NC}"
+    echo -e "${BOLD}  BATCH SUMMARY — ${#ALL_BLOCKS[@]} blocks                              ${NC}"
+    echo -e "${BOLD}====================================================================${NC}"
+    printf "  %-12s %7s %6s %6s %7s %7s %7s %7s %8s\n" \
+        "Block" "Dur(s)" "Cycles" "Sims" "Arbs" "Shadow" "Det(ms)" "Sim(ms)" "E2E(ms)"
+    for i in "${!ALL_BLOCKS[@]}"; do
+        printf "  %-12s %7s %6s %6s %7s %7s %7s %7s %8s\n" \
+            "${ALL_BLOCKS[$i]}" "${ALL_DURATION[$i]}" "${ALL_CYCLES[$i]}" \
+            "${ALL_SIMS[$i]}" "${ALL_ARBS[$i]}" "${ALL_SHADOW[$i]}" \
+            "${ALL_DETECT[$i]}" "${ALL_SIM_MEAN[$i]}" "${ALL_E2E[$i]}"
+    done
+    # Column totals (duration / cycles / sims / arbs / shadow). Latencies
+    # aren't summed — they're per-block means.
+    TOTAL_DUR=0; TOTAL_CYC=0; TOTAL_SIM=0; TOTAL_ARB=0; TOTAL_SHAD=0
+    for i in "${!ALL_BLOCKS[@]}"; do
+        TOTAL_DUR=$((TOTAL_DUR + ALL_DURATION[i]))
+        TOTAL_CYC=$((TOTAL_CYC + ALL_CYCLES[i]))
+        TOTAL_SIM=$((TOTAL_SIM + ALL_SIMS[i]))
+        TOTAL_ARB=$((TOTAL_ARB + ALL_ARBS[i]))
+        TOTAL_SHAD=$((TOTAL_SHAD + ALL_SHADOW[i]))
+    done
+    printf "  %-12s %7s %6s %6s %7s %7s\n" "TOTAL" "$TOTAL_DUR" \
+        "$TOTAL_CYC" "$TOTAL_SIM" "$TOTAL_ARB" "$TOTAL_SHAD"
+    echo -e "${BOLD}====================================================================${NC}"
+fi
