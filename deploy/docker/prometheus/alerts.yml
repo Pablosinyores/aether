@@ -11,6 +11,7 @@ groups:
         annotations:
           summary: "Aether system is Halted"
           description: "System state gauge reports Halted (3) for >1m. Halted requires manual reset. Check executor logs for the breaker reason."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherHalted.md"
 
       - alert: AetherInclusionRateLow
         expr: |
@@ -23,6 +24,7 @@ groups:
         annotations:
           summary: "Bundle inclusion rate below 20% over the last hour"
           description: "Over the last 1h, fewer than 20% of submitted bundles were included. Current ratio: {{ printf \"%.2f\" $value }}."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherInclusionRateLow.md"
 
       - alert: AetherE2ELatencyHigh
         expr: histogram_quantile(0.99, sum by (le) (rate(aether_end_to_end_latency_ms_bucket[5m]))) > 100
@@ -32,6 +34,7 @@ groups:
         annotations:
           summary: "End-to-end p99 latency above 100ms"
           description: "p99 end-to-end latency = {{ printf \"%.1f\" $value }}ms over last 5m (target <100ms)."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherE2ELatencyHigh.md"
 
       - alert: AetherNoOpportunities
         expr: rate(aether_arbs_published_total[10m]) * 60 < 5
@@ -41,6 +44,7 @@ groups:
         annotations:
           summary: "Fewer than 5 opportunities per minute"
           description: "Arb publish rate = {{ printf \"%.1f\" $value }}/min over last 10m. Detection pipeline may be stalled."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherNoOpportunities.md"
 
       - alert: AetherETHBalanceLow
         expr: aether_eth_balance < 0.15
@@ -50,6 +54,7 @@ groups:
         annotations:
           summary: "Searcher ETH balance below 0.15"
           description: "Hot wallet ETH balance = {{ printf \"%.4f\" $value }}. Top up before bundles start reverting on gas."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherETHBalanceLow.md"
 
       - alert: AetherGasHigh
         expr: aether_gas_price_gwei > 300
@@ -59,6 +64,7 @@ groups:
         annotations:
           summary: "Gas price above 300 gwei"
           description: "Base fee = {{ printf \"%.1f\" $value }} gwei. Executor preflight will reject arbs until this drops."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherGasHigh.md"
 
       - alert: AetherBuilderDown
         expr: |
@@ -71,6 +77,7 @@ groups:
         annotations:
           summary: "Builder {{ $labels.builder }} has no successful submissions"
           description: "Builder {{ $labels.builder }} received submissions but zero succeeded over the last 2m. Check builder endpoint health and auth."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherBuilderDown.md"
 
       - alert: AetherServiceDown
         expr: up{job=~"aether-(go|rust)"} == 0
@@ -80,6 +87,7 @@ groups:
         annotations:
           summary: "Aether service {{ $labels.job }} is down"
           description: "Job {{ $labels.job }} has been unreachable for >1m. Prometheus scrape target reports up=0."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherServiceDown.md"
 
       - alert: AetherNoBlocksProcessed
         expr: rate(aether_blocks_processed_total[3m]) == 0
@@ -89,6 +97,7 @@ groups:
         annotations:
           summary: "Aether engine {{ $labels.job }} stopped processing blocks"
           description: "Job {{ $labels.job }} has processed 0 blocks over the last 3m. The Rust ingestion pipeline may be stalled or disconnected from the Ethereum node."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherNoBlocksProcessed.md"
 
       - alert: AetherHighSimulationLatency
         expr: histogram_quantile(0.99, sum by(le) (rate(aether_simulation_latency_ms_bucket[5m]))) > 100
@@ -98,6 +107,7 @@ groups:
         annotations:
           summary: "Aether simulation latency p99 exceeds 100ms"
           description: "EVM simulation p99 latency is {{ printf \"%.1f\" $value }}ms over the last 5m (target <50ms). revm fork state may be stale or the RPC provider is slow."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherHighSimulationLatency.md"
 
       - alert: AetherNegativeDailyPnL
         expr: aether_daily_pnl_eth < -0.05
@@ -107,6 +117,7 @@ groups:
         annotations:
           summary: "Aether daily PnL is negative ({{ printf \"%.4f\" $value }} ETH)"
           description: "Daily PnL has been below -0.05 ETH for 30m. Review gas costs, tip share, and revert rate."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherNegativeDailyPnL.md"
 
       - alert: AetherRiskRejectionStorm
         expr: rate(aether_executor_risk_rejections_total[5m]) > 1
@@ -116,3 +127,4 @@ groups:
         annotations:
           summary: "Aether risk manager rejecting >1 arb/sec"
           description: "Risk rejection rate is {{ printf \"%.2f\" $value }} rejections/sec over a 5m window, sustained for 10m. Investigate circuit breaker state, gas, and position limits."
+          runbook_url: "https://github.com/Pablosinyores/aether/blob/main/docs/runbooks/AetherRiskRejectionStorm.md"
