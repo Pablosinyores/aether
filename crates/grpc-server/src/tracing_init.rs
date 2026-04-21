@@ -35,7 +35,10 @@ pub fn init() -> TracingGuard {
         .ok()
         .filter(|s| !s.is_empty());
 
-    let otel_layer = otlp_endpoint.as_deref().map(|endpoint| {
+    // Fail-open OTLP exporter init: if the exporter can't be built (endpoint
+    // unreachable, TLS misconfig, etc.), log the error and continue without
+    // OTel. The service must still start — matches the Go side's behaviour.
+    let otel_layer = otlp_endpoint.as_deref().and_then(|endpoint| {
         let service_name = std::env::var("OTEL_SERVICE_NAME")
             .unwrap_or_else(|_| "aether-rust".to_string());
         let resource = Resource::new(vec![
@@ -43,11 +46,19 @@ pub fn init() -> TracingGuard {
             KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
         ]);
 
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+        let exporter = match opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
             .build()
-            .expect("failed to build OTLP span exporter");
+        {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!(
+                    "[tracing_init] failed to build OTLP span exporter for {endpoint}: {err}; continuing without traces"
+                );
+                return None;
+            }
+        };
 
         let provider = sdktrace::TracerProvider::builder()
             .with_batch_exporter(exporter, runtime::Tokio)
@@ -57,7 +68,7 @@ pub fn init() -> TracingGuard {
 
         let tracer = provider.tracer("aether-grpc-server");
         global::set_tracer_provider(provider);
-        tracing_opentelemetry::layer().with_tracer(tracer)
+        Some(tracing_opentelemetry::layer().with_tracer(tracer))
     });
 
     let otel_installed = otel_layer.is_some();

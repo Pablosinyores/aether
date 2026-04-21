@@ -23,6 +23,7 @@ import (
 	aethergrpc "github.com/aether-arb/aether/internal/grpc"
 	pb "github.com/aether-arb/aether/internal/pb"
 	"github.com/aether-arb/aether/internal/risk"
+	"github.com/aether-arb/aether/internal/tracing"
 )
 
 var tracer trace.Tracer = otel.Tracer("aether-executor")
@@ -101,7 +102,7 @@ func main() {
 	// Initialise OTLP tracing. No-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
 	tracerShutdownCtx, tracerShutdownCancel := context.WithCancel(context.Background())
 	defer tracerShutdownCancel()
-	shutdownTracer, err := initTracer(tracerShutdownCtx, "aether-executor")
+	shutdownTracer, err := tracing.Init(tracerShutdownCtx, "aether-executor")
 	if err != nil {
 		slog.Warn("otlp tracer init failed, continuing without traces", "err", err)
 		shutdownTracer = func(context.Context) error { return nil }

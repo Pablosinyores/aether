@@ -1267,22 +1267,24 @@ impl AetherEngine {
             let publish_span = tracing::info_span!(
                 "arb.publish",
                 arb_id = %input.opp.id,
+                hops = input.opp.hops.len(),
                 net_profit_wei = input.net_profit,
                 sim_us,
             );
-            let _entered = publish_span.enter();
-            if let Err(e) = self.arb_tx.send(proto_arb) {
-                debug!(error = %e, "No arb subscribers connected");
-            } else {
-                sim_success += 1;
-                self.metrics.inc_arbs_published(1);
-                info!(
-                    id = %input.opp.id,
-                    net_profit_wei = input.net_profit,
-                    sim_us,
-                    "Published validated arb"
-                );
-            }
+            publish_span.in_scope(|| {
+                if let Err(e) = self.arb_tx.send(proto_arb) {
+                    debug!(error = %e, "No arb subscribers connected");
+                } else {
+                    sim_success += 1;
+                    self.metrics.inc_arbs_published(1);
+                    info!(
+                        id = %input.opp.id,
+                        net_profit_wei = input.net_profit,
+                        sim_us,
+                        "Published validated arb"
+                    );
+                }
+            });
         }
 
         let phase2_us = t_phase2.elapsed().as_micros();

@@ -61,7 +61,7 @@ impl EventChannels {
     }
 
     /// Dispatch a pool update event
-    #[tracing::instrument(skip_all, name = "ingest.pool_update")]
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.pool_update")]
     pub fn dispatch_pool_update(&self, event: PoolEvent) {
         match self.pool_updates_tx.send(event) {
             Ok(_n) => {}
@@ -70,7 +70,7 @@ impl EventChannels {
     }
 
     /// Dispatch a new block event
-    #[tracing::instrument(skip_all, name = "ingest.new_block", fields(block_number = event.block_number))]
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.new_block", fields(block_number = event.block_number))]
     pub fn dispatch_new_block(&self, event: NewBlockEvent) {
         match self.new_block_tx.send(event) {
             Ok(_) => {}
@@ -79,7 +79,7 @@ impl EventChannels {
     }
 
     /// Dispatch a pending tx event
-    #[tracing::instrument(skip_all, name = "ingest.pending_tx")]
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.pending_tx")]
     pub fn dispatch_pending_tx(&self, event: PendingTxEvent) {
         match self.pending_tx_tx.send(event) {
             Ok(_) => {}

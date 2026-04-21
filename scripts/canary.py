@@ -189,6 +189,17 @@ def run(cfg: Config) -> None:
                     file=sys.stderr,
                 )
 
+            # Re-assert the firing alert every cycle. Alertmanager's default
+            # resolve timeout is 5 minutes, so if the canary stops re-asserting
+            # (e.g. because a prior POST was dropped while Alertmanager itself
+            # was restarting) the alert auto-resolves. Belt-and-suspenders
+            # against correlated Alertmanager outages.
+            if target.firing:
+                post_alert(
+                    cfg.alertmanager_url, target, age, resolved=False,
+                    timeout=cfg.probe_timeout_sec,
+                )
+
         elapsed = time.monotonic() - cycle_start
         sleep_for = max(0.0, cfg.probe_interval_sec - elapsed)
         end = time.monotonic() + sleep_for
