@@ -46,8 +46,8 @@ func TestGasOracle_Update(t *testing.T) {
 
 	go_ := NewGasOracle(300.0)
 
-	newBaseFee := big.NewInt(50e9)   // 50 gwei
-	newPriority := big.NewInt(5e9)   // 5 gwei
+	newBaseFee := big.NewInt(50e9) // 50 gwei
+	newPriority := big.NewInt(5e9) // 5 gwei
 	go_.Update(newBaseFee, newPriority)
 
 	fees := go_.CurrentFees()
@@ -118,14 +118,14 @@ func TestGasOracle_IsGasTooHigh(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		maxGwei    float64
+		name        string
+		maxGwei     float64
 		baseFeeGwei int64
-		want       bool
+		want        bool
 	}{
 		{"below threshold", 300, 200, false},
 		{"above threshold", 300, 350, true},
-		{"at threshold", 300, 300, false},      // GasPriceGwei == maxGasGwei → not strictly greater
+		{"at threshold", 300, 300, false}, // GasPriceGwei == maxGasGwei → not strictly greater
 		{"way above", 100, 500, true},
 		{"just below", 300, 299, false},
 		{"just above", 300, 301, true},
@@ -153,16 +153,16 @@ func TestGasOracle_MaxFeeFormula(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name           string
-		baseFeeGwei    int64
-		priorityGwei   int64
+		name            string
+		baseFeeGwei     int64
+		priorityGwei    int64
 		expectedMaxGwei int64
 	}{
-		{"30+2", 30, 2, 62},     // 2*30 + 2
-		{"50+5", 50, 5, 105},    // 2*50 + 5
+		{"30+2", 30, 2, 62},      // 2*30 + 2
+		{"50+5", 50, 5, 105},     // 2*50 + 5
 		{"100+10", 100, 10, 210}, // 2*100 + 10
-		{"1+1", 1, 1, 3},        // 2*1 + 1
-		{"0+0", 0, 0, 0},        // 2*0 + 0
+		{"1+1", 1, 1, 3},         // 2*1 + 1
+		{"0+0", 0, 0, 0},         // 2*0 + 0
 	}
 
 	for _, tc := range tests {
@@ -204,8 +204,8 @@ func TestGasOracle_FetchOnce_RealFees(t *testing.T) {
 	mock := &mockFeeHistoryProvider{
 		result: &ethereum.FeeHistory{
 			OldestBlock:  big.NewInt(100),
-			BaseFee:      []*big.Int{big.NewInt(45e9)},        // 45 gwei
-			Reward:       [][]*big.Int{{big.NewInt(3e9)}},      // 3 gwei priority
+			BaseFee:      []*big.Int{big.NewInt(45e9)},    // 45 gwei
+			Reward:       [][]*big.Int{{big.NewInt(3e9)}}, // 3 gwei priority
 			GasUsedRatio: []float64{0.5},
 		},
 	}
@@ -357,7 +357,7 @@ func TestGasOracle_UpdateLoop_ErrorThenRecover(t *testing.T) {
 	mock := &sequenceMockFeeHistory{
 		results: []*ethereum.FeeHistory{
 			nil, // call 0: error
-			{    // call 1: success
+			{ // call 1: success
 				OldestBlock:  big.NewInt(100),
 				BaseFee:      []*big.Int{big.NewInt(25e9)},
 				Reward:       [][]*big.Int{{big.NewInt(1e9)}},

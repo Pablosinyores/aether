@@ -106,20 +106,20 @@ type MetricsObserver interface {
 
 // RiskManager implements circuit breakers and position limits.
 type RiskManager struct {
-	mu                  sync.RWMutex
-	config              RiskConfig
-	state               *SystemStateMachine
-	tipStrategy         TipStrategy
-	lastTipSharePct     float64
-	recentBugReverts    []time.Time // Only these count toward circuit breaker
-	recentCompReverts   []time.Time // Tracked separately for metrics / stale-data alert
-	dailyVolume         *big.Int    // Wei
-	dailyPnL            *big.Int    // Wei (can be negative)
-	dailyResetTime      time.Time
-	bundleResults      []bool // Sliding window ring buffer
-	bundleResultIdx    int    // Next write position; always increments (never resets)
-	bundleResultCount  int    // Entries filled (capped at window size)
-	lastAdjustedAtIdx  int    // Gate: bundleResultIdx value at last tip adjustment
+	mu                sync.RWMutex
+	config            RiskConfig
+	state             *SystemStateMachine
+	tipStrategy       TipStrategy
+	lastTipSharePct   float64
+	recentBugReverts  []time.Time // Only these count toward circuit breaker
+	recentCompReverts []time.Time // Tracked separately for metrics / stale-data alert
+	dailyVolume       *big.Int    // Wei
+	dailyPnL          *big.Int    // Wei (can be negative)
+	dailyResetTime    time.Time
+	bundleResults     []bool // Sliding window ring buffer
+	bundleResultIdx   int    // Next write position; always increments (never resets)
+	bundleResultCount int    // Entries filled (capped at window size)
+	lastAdjustedAtIdx int    // Gate: bundleResultIdx value at last tip adjustment
 
 	// Prometheus-style counters (read via atomic; no external dependency).
 	BugRevertTotal  atomic.Int64

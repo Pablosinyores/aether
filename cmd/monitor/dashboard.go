@@ -219,16 +219,16 @@ func (d *Dashboard) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (d *Dashboard) handleStats(w http.ResponseWriter, r *http.Request) {
 	m := d.scrapeAll()
 	data := map[string]float64{
-		"blocks":           parseOrZero(m["aether_blocks_processed_total"]),
-		"cycles":           parseOrZero(m["aether_cycles_detected_total"]),
-		"simulations":      parseOrZero(m["aether_simulations_run_total"]),
-		"arbs_published":   parseOrZero(m["aether_arbs_published_total"]),
+		"blocks":            parseOrZero(m["aether_blocks_processed_total"]),
+		"cycles":            parseOrZero(m["aether_cycles_detected_total"]),
+		"simulations":       parseOrZero(m["aether_simulations_run_total"]),
+		"arbs_published":    parseOrZero(m["aether_arbs_published_total"]),
 		"bundles_submitted": parseOrZero(m["aether_executor_bundles_submitted_total"]),
-		"bundles_included": parseOrZero(m["aether_executor_bundles_included_total"]),
-		"risk_rejections":  parseOrZero(m["aether_executor_risk_rejections_total"]),
-		"daily_pnl_eth":    parseOrZero(m["aether_daily_pnl_eth"]),
-		"gas_price_gwei":   parseOrZero(m["aether_gas_price_gwei"]),
-		"eth_balance":      parseOrZero(m["aether_eth_balance"]),
+		"bundles_included":  parseOrZero(m["aether_executor_bundles_included_total"]),
+		"risk_rejections":   parseOrZero(m["aether_executor_risk_rejections_total"]),
+		"daily_pnl_eth":     parseOrZero(m["aether_daily_pnl_eth"]),
+		"gas_price_gwei":    parseOrZero(m["aether_gas_price_gwei"]),
+		"eth_balance":       parseOrZero(m["aether_eth_balance"]),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)

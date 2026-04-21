@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok("json") => {
             tracing_subscriber::fmt()
                 .json()
+                .flatten_event(true)
                 .with_current_span(true)
                 .with_span_list(false)
                 .with_env_filter(env_filter)
