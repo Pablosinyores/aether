@@ -193,7 +193,7 @@ Top-K `ArbOpportunity` structs sorted by net profit descending. Each contains:
 Uses `revm` in fork mode to simulate arbitrage execution before submission:
 
 1. **Fork** — Create a `CacheDB` backed by `EthersDB` with the latest block state
-2. **Build calldata** — ABI-encode `AetherExecutor.executeArb(steps, flashloanToken, flashloanAmount)`
+2. **Build calldata** — ABI-encode `AetherExecutor.executeArb(steps, flashloanToken, flashloanAmount, deadline, minProfitOut, tipBps)`
 3. **Execute** — Run the transaction in the forked EVM
 4. **Validate** — Check result: `Success` / `Revert` / `Halt`
 5. **Extract** — Actual profit, gas used, revert reason (if any)
@@ -207,7 +207,8 @@ Simulation **must** use the same block state as the execution target block. Stal
 Generates the exact calldata that will be submitted on-chain:
 
 ```rust
-// ABI-encodes: executeArb(SwapStep[] steps, address flashloanToken, uint256 flashloanAmount)
+// ABI-encodes: executeArb(SwapStep[] steps, address flashloanToken,
+//   uint256 flashloanAmount, uint256 deadline, uint256 minProfitOut, uint256 tipBps)
 fn build_calldata(opportunity: &ValidatedArb) -> Bytes
 ```
 

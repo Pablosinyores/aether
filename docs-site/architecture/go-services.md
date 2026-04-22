@@ -141,13 +141,13 @@ HTTP dashboard server on `:8080` providing:
 
 ### Alerter (`alerter.go`)
 
-Dispatches alerts to multiple channels based on severity:
+Dispatches alerts to **Slack** with severity-based channel routing:
 
 | Channel | Severity | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml → alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml → alerting.telegram` |
-| Discord | All | `config/risk.yaml → alerting.discord` |
+| `#aether-alerts-sev1` | SEV1 | `config/risk.yaml → alerting.slack` |
+| `#aether-alerts-sev2` | SEV2 | `config/risk.yaml → alerting.slack` |
+| `#aether-alerts` | SEV3, SEV4 | `config/risk.yaml → alerting.slack` |
 
 ## Runtime Configuration
 

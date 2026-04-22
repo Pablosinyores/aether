@@ -121,7 +121,7 @@ State machine: Running / Degraded / Paused / Halted. Circuit breakers for gas pr
   </AccordionItem>
   <AccordionItem title="Monitor — Prometheus and alerting">
 
-Exposes all metrics on `:9090/metrics`. HTTP dashboard on `:8080`. Alert dispatch to PagerDuty, Telegram, Discord.
+Exposes all metrics on `:9090/metrics`. HTTP dashboard on `:8080`. Alert dispatch to Slack with severity-based channel routing.
 
   </AccordionItem>
 </Accordion>

@@ -4,7 +4,7 @@ This guide walks through adding support for a new DEX protocol to Aether. The sy
 
 ## Overview
 
-Adding a new DEX requires changes in 6 files across 3 languages:
+Adding a new DEX requires changes in 5 files across 3 languages (steps 3 and 5 edit the same file):
 
 | Step | File | Language |
 |---|---|---|
@@ -142,7 +142,7 @@ In `contracts/src/AetherExecutor.sol`, add a routing case in `_executeSwap()`:
 ```solidity
 uint8 constant NEW_DEX = 7;
 
-function _executeSwap(SwapStep calldata step) internal {
+function _executeSwap(SwapStep memory step, uint256 index) internal {
     // ... existing cases ...
     else if (step.protocol == NEW_DEX) {
         // Protocol-specific swap logic

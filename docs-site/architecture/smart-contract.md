@@ -19,7 +19,7 @@ sequenceDiagram
     participant DEX2 as DEX Pool 2
     participant DEXN as DEX Pool N
 
-    EOA->>EX: executeArb(steps, token, amount)
+    EOA->>EX: executeArb(steps, token, amount, deadline, minProfitOut, tipBps)
     EX->>AAVE: flashLoanSimple(token, amount)
     AAVE->>EX: Transfer loan amount
     AAVE->>EX: executeOperation() callback
@@ -44,16 +44,29 @@ sequenceDiagram
 function executeArb(
     SwapStep[] calldata steps,
     address flashloanToken,
-    uint256 flashloanAmount
+    uint256 flashloanAmount,
+    uint256 deadline,
+    uint256 minProfitOut,
+    uint256 tipBps
 ) external onlyOwner nonReentrant
 ```
 
+| Parameter | Description |
+|---|---|
+| `steps` | Ordered array of swap hops to execute |
+| `flashloanToken` | Token to borrow from Aave V3 |
+| `flashloanAmount` | Amount to borrow |
+| `deadline` | Block timestamp after which the transaction reverts (`DeadlineExpired`) |
+| `minProfitOut` | Minimum profit floor — reverts if net profit is below this |
+| `tipBps` | Basis points (0–10,000) of profit sent to `block.coinbase` as builder tip |
+
 This is the main entry point, called by the searcher's EOA. It:
 
-1. Encodes the swap steps into the flash loan params
-2. Calls `POOL.flashLoanSimple()` on the Aave V3 lending pool
-3. Aave sends `flashloanAmount` of `flashloanToken` to this contract
-4. Aave then calls back into `executeOperation()`
+1. Validates `deadline` (reverts if `block.timestamp > deadline`) and `tipBps` (reverts if >10,000)
+2. Encodes the swap steps, gas snapshot, `tipBps`, and `minProfitOut` into the flash loan params
+3. Calls `POOL.flashLoanSimple()` on the Aave V3 lending pool
+4. Aave sends `flashloanAmount` of `flashloanToken` to this contract
+5. Aave then calls back into `executeOperation()`
 
 ## Aave Callback: `executeOperation()`
 
@@ -82,7 +95,7 @@ The `initiator` must be `address(this)` — the contract validates it received t
 Routes each swap step to the correct DEX based on the protocol enum:
 
 ```solidity
-function _executeSwap(SwapStep calldata step) internal {
+function _executeSwap(SwapStep memory step, uint256 index) internal {
     if (step.protocol == UNISWAP_V2) { ... }
     else if (step.protocol == UNISWAP_V3) { ... }
     else if (step.protocol == SUSHISWAP) { ... }
@@ -91,6 +104,8 @@ function _executeSwap(SwapStep calldata step) internal {
     else if (step.protocol == BANCOR_V3) { ... }
 }
 ```
+
+The `index` parameter identifies the hop position and is used in revert messages for debugging failed swaps.
 
 ### Protocol Constants
 

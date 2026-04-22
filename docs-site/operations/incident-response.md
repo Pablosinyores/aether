@@ -196,11 +196,13 @@ sudo iptables -I OUTPUT -d 127.0.0.1 -j ACCEPT
 
 ### Alert Channels
 
-| Channel | Used For | Configuration |
+All alerts route through **Slack** with severity-based channel routing:
+
+| Channel | Severity | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml` → `alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml` → `alerting.telegram` |
-| Discord | All severities | `config/risk.yaml` → `alerting.discord` |
+| `#aether-alerts-sev1` | SEV1 | `config/risk.yaml` → `alerting.slack` |
+| `#aether-alerts-sev2` | SEV2 | `config/risk.yaml` → `alerting.slack` |
+| `#aether-alerts` | SEV3, SEV4 | `config/risk.yaml` → `alerting.slack` |
 
 ### Escalation Path
 
