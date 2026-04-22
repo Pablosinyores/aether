@@ -59,6 +59,43 @@ fn infer_node_type(url: &str) -> NodeType {
     }
 }
 
+/// Pick the HTTP-fallback polling interval for a given RPC endpoint.
+///
+/// Mainnet RPC providers are 12 s/block, so polling once per second gives an
+/// OK trade-off between latency and RPC cost. But the e2e replay setup runs
+/// against a local Anvil fork that processes an entire historical block in
+/// hundreds of milliseconds, and the 1 s cadence collapses all intra-block
+/// state transitions into a single batched scrape — the detector never sees
+/// per-tx state, so short-lived arb windows (post-exploit AAVE/WETH drain,
+/// etc.) are missed by the pipeline even though the underlying txs replay
+/// correctly.
+///
+/// Resolution order:
+/// 1. `AETHER_HTTP_POLL_MS` env var (if set and parses as u64) — explicit
+///    override for tests.
+/// 2. Local endpoint heuristic: 127.0.0.1, localhost, or host.docker.internal
+///    in the URL → 100 ms.
+/// 3. Default: 1 000 ms (pre-existing behaviour for mainnet HTTP fallback).
+fn resolve_http_poll_interval(url: &str) -> Duration {
+    if let Ok(raw) = std::env::var("AETHER_HTTP_POLL_MS") {
+        if let Ok(ms) = raw.trim().parse::<u64>() {
+            return Duration::from_millis(ms);
+        }
+    }
+    if is_local_rpc(url) {
+        return Duration::from_millis(100);
+    }
+    Duration::from_secs(1)
+}
+
+fn is_local_rpc(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("127.0.0.1")
+        || lower.contains("localhost")
+        || lower.contains("host.docker.internal")
+        || lower.contains("[::1]")
+}
+
 /// RPC provider that bridges Ethereum events to the ingestion EventChannels.
 ///
 /// Supports WebSocket (native subscriptions), IPC (native subscriptions),
@@ -324,14 +361,29 @@ impl RpcProvider {
     /// Connect via HTTP and run the polling-based event loop.
     ///
     /// HTTP does not support native subscriptions, so this falls back to
-    /// polling `eth_getBlockByNumber` and `eth_getLogs` every second.
+    /// polling `eth_getBlockByNumber` and `eth_getLogs`. Polling cadence is
+    /// adaptive:
+    ///
+    /// * Local endpoints (127.0.0.1 / localhost / host.docker.internal) —
+    ///   the e2e replay setup, where Anvil processes an entire mainnet block
+    ///   of txs in hundreds of milliseconds — poll every 100 ms. Real
+    ///   mainnet blocks are 12 s so this faster cadence is wasted there, but
+    ///   on a fork it recovers per-tx detection precision without adding a
+    ///   separate ingestion path. Also overridable via the
+    ///   `AETHER_HTTP_POLL_MS` env var.
+    /// * Everything else polls once per second, matching pre-existing
+    ///   mainnet-HTTP fallback behaviour.
     async fn connect_http(
         &self,
         url: &str,
         node: &Arc<RwLock<NodeConnection>>,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        warn!("HTTP transport detected -- falling back to polling mode (latency ~1s)");
+        let poll_interval = resolve_http_poll_interval(url);
+        warn!(
+            poll_ms = poll_interval.as_millis(),
+            "HTTP transport detected -- falling back to polling mode"
+        );
 
         let parsed_url: url::Url = url.parse()?;
         let provider = ProviderBuilder::new().connect_http(parsed_url);
@@ -339,8 +391,6 @@ impl RpcProvider {
         let initial_block = provider.get_block_number().await?;
         info!(block = initial_block, "HTTP provider connected (polling mode)");
         node.write().await.record_success(0, initial_block);
-
-        let poll_interval = Duration::from_secs(1);
         let mut last_block = initial_block;
         let event_topics = self.event_topics();
 
@@ -540,6 +590,56 @@ mod tests {
         assert!(config.monitored_pools.is_empty());
         assert_eq!(config.reconnect_delay, Duration::from_secs(1));
         assert_eq!(config.max_reconnect_attempts, 10);
+    }
+
+    #[test]
+    fn test_is_local_rpc() {
+        assert!(is_local_rpc("http://127.0.0.1:8545"));
+        assert!(is_local_rpc("http://localhost:8547"));
+        assert!(is_local_rpc("http://host.docker.internal:8547"));
+        assert!(is_local_rpc("http://[::1]:8547"));
+        assert!(is_local_rpc("HTTP://LOCALHOST:8547")); // case-insensitive
+        assert!(!is_local_rpc("https://eth-mainnet.g.alchemy.com/v2/KEY"));
+        assert!(!is_local_rpc("wss://ethereum.publicnode.com"));
+    }
+
+    #[test]
+    fn test_resolve_http_poll_interval_defaults() {
+        std::env::remove_var("AETHER_HTTP_POLL_MS");
+        assert_eq!(
+            resolve_http_poll_interval("http://127.0.0.1:8547"),
+            Duration::from_millis(100),
+            "local endpoint should use 100ms"
+        );
+        assert_eq!(
+            resolve_http_poll_interval("https://eth-mainnet.g.alchemy.com/v2/KEY"),
+            Duration::from_secs(1),
+            "remote endpoint should stay at 1s"
+        );
+    }
+
+    #[test]
+    fn test_resolve_http_poll_interval_env_override() {
+        std::env::set_var("AETHER_HTTP_POLL_MS", "250");
+        assert_eq!(
+            resolve_http_poll_interval("https://eth-mainnet.g.alchemy.com/v2/KEY"),
+            Duration::from_millis(250),
+            "env override should win over default"
+        );
+        assert_eq!(
+            resolve_http_poll_interval("http://127.0.0.1:8547"),
+            Duration::from_millis(250),
+            "env override should win over localhost heuristic too"
+        );
+        std::env::remove_var("AETHER_HTTP_POLL_MS");
+
+        std::env::set_var("AETHER_HTTP_POLL_MS", "nonsense");
+        assert_eq!(
+            resolve_http_poll_interval("https://eth-mainnet.g.alchemy.com/v2/KEY"),
+            Duration::from_secs(1),
+            "unparseable env var should fall through to default"
+        );
+        std::env::remove_var("AETHER_HTTP_POLL_MS");
     }
 
     #[test]
