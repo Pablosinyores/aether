@@ -14,7 +14,6 @@ export default withMermaid(
     ],
 
     themeConfig: {
-      logo: '/logo.svg',
       siteTitle: 'Aether',
 
       nav: [

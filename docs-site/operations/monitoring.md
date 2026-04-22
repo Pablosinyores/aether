@@ -4,6 +4,10 @@ Aether exposes metrics from two processes. The Rust engine serves histograms and
 
 ## Prometheus Setup
 
+::: warning Port Collision
+Both the Go executor (`cmd/executor/`) and Go monitor (`cmd/monitor/`) default to `:9090` for their metrics server. If running both services on the same host, set `METRICS_PORT=9091` on one of them to avoid a `ListenAndServe` bind failure.
+:::
+
 Prometheus needs to scrape **both** endpoints:
 
 ```yaml
@@ -125,11 +129,13 @@ Alerts are triggered by the Go monitor/risk manager based on metric thresholds. 
 
 ### Alert Channels
 
-| Channel | Used For | Configuration |
+All alerts route through a single **Slack webhook** with severity-based channel routing:
+
+| Channel | Severity | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml` → `alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml` → `alerting.telegram` |
-| Discord | All severities | `config/risk.yaml` → `alerting.discord` |
+| `#aether-alerts-sev1` | SEV1 | `config/risk.yaml` → `alerting.slack` |
+| `#aether-alerts-sev2` | SEV2 | `config/risk.yaml` → `alerting.slack` |
+| `#aether-alerts` | SEV3, SEV4 | `config/risk.yaml` → `alerting.slack` |
 
 ## Log Aggregation
 

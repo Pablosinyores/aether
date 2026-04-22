@@ -22,7 +22,7 @@ features:
   - title: Zero Capital Risk
     details: Every trade is flash loan-backed via Aave V3. Unprofitable transactions revert atomically on-chain. No capital ever at risk.
   - title: 6 DEX Protocols
-    details: Uniswap V2/V3, SushiSwap, Curve, Balancer, and Bancor. Adding a new DEX is a single trait implementation.
+    details: Uniswap V2/V3, SushiSwap, Curve, Balancer V2, and Bancor V3. Adding a new DEX is a single trait implementation.
   - title: Rust + Go + Solidity
     details: Rust for the latency-critical hot path. Go for coordination and monitoring. Solidity for on-chain settlement.
   - title: Multi-Builder Submission

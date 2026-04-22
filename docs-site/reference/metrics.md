@@ -22,6 +22,10 @@ These are real Prometheus histograms that emit `_bucket`, `_sum`, and `_count` s
 | `aether_arbs_published_total` | Total validated arbs published to Go via gRPC |
 | `aether_blocks_processed_total` | Total blocks processed |
 
+::: warning Port Collision
+Both the Go executor (`cmd/executor/`) and Go monitor (`cmd/monitor/`) default to `:9090` for their metrics server. If running both services on the same host, set `METRICS_PORT=9091` on one of them to avoid a `ListenAndServe` bind failure.
+:::
+
 ## Go Executor Metrics (`:9090`)
 
 ### Counters
