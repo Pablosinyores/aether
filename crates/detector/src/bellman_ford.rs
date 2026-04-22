@@ -641,7 +641,7 @@ mod tests {
             // All cycle vertices should be in component 2 (vertices 3, 4, 5)
             for &v in &cycle.path {
                 assert!(
-                    v >= 3 && v <= 5,
+                    (3..=5).contains(&v),
                     "cycle vertex {} should be in component 2 (3-5)",
                     v
                 );

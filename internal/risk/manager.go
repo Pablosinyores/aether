@@ -2,7 +2,7 @@ package risk
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -96,22 +96,30 @@ type PreflightResult struct {
 	Reason   string
 }
 
+// MetricsObserver is notified on state changes and breaker trips. Optional;
+// nil observer is a no-op. Implementations must be goroutine-safe. Called
+// under rm.mu — keep callbacks non-blocking (Prometheus primitives are fine).
+type MetricsObserver interface {
+	OnStateChange(state SystemState)
+	OnCircuitBreakerTrip(reason string)
+}
+
 // RiskManager implements circuit breakers and position limits.
 type RiskManager struct {
-	mu                  sync.RWMutex
-	config              RiskConfig
-	state               *SystemStateMachine
-	tipStrategy         TipStrategy
-	lastTipSharePct     float64
-	recentBugReverts    []time.Time // Only these count toward circuit breaker
-	recentCompReverts   []time.Time // Tracked separately for metrics / stale-data alert
-	dailyVolume         *big.Int    // Wei
-	dailyPnL            *big.Int    // Wei (can be negative)
-	dailyResetTime      time.Time
-	bundleResults      []bool // Sliding window ring buffer
-	bundleResultIdx    int    // Next write position; always increments (never resets)
-	bundleResultCount  int    // Entries filled (capped at window size)
-	lastAdjustedAtIdx  int    // Gate: bundleResultIdx value at last tip adjustment
+	mu                sync.RWMutex
+	config            RiskConfig
+	state             *SystemStateMachine
+	tipStrategy       TipStrategy
+	lastTipSharePct   float64
+	recentBugReverts  []time.Time // Only these count toward circuit breaker
+	recentCompReverts []time.Time // Tracked separately for metrics / stale-data alert
+	dailyVolume       *big.Int    // Wei
+	dailyPnL          *big.Int    // Wei (can be negative)
+	dailyResetTime    time.Time
+	bundleResults     []bool // Sliding window ring buffer
+	bundleResultIdx   int    // Next write position; always increments (never resets)
+	bundleResultCount int    // Entries filled (capped at window size)
+	lastAdjustedAtIdx int    // Gate: bundleResultIdx value at last tip adjustment
 
 	// Prometheus-style counters (read via atomic; no external dependency).
 	BugRevertTotal  atomic.Int64
@@ -119,6 +127,41 @@ type RiskManager struct {
 
 	// Rate-limit: last time the competitive-rate alert was emitted.
 	lastCompAlertTime time.Time
+
+	// Decoupled from Prometheus: executor wraps its own metrics as an observer.
+	metricsObs MetricsObserver
+}
+
+// SetMetricsObserver installs an observer and immediately emits OnStateChange
+// so the metrics layer sees the initial state. Call once at startup.
+func (rm *RiskManager) SetMetricsObserver(obs MetricsObserver) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.metricsObs = obs
+	if obs != nil {
+		obs.OnStateChange(rm.state.Current())
+	}
+}
+
+// notifyTrip transitions state and notifies the observer. Caller holds rm.mu.
+//
+// The OnCircuitBreakerTrip observer is called BEFORE the state transition so
+// every trip is counted even when the transition is rejected (e.g. the bot is
+// already Halted and another bug-revert burst tries to push to Paused). That
+// is exactly the signal we want to preserve: "we're still seeing breaker
+// conditions in a halted state". OnStateChange is only emitted on a real
+// transition, since no state actually changed otherwise.
+func (rm *RiskManager) notifyTrip(reason string, newState SystemState) {
+	if rm.metricsObs != nil {
+		rm.metricsObs.OnCircuitBreakerTrip(reason)
+	}
+	if err := rm.state.Transition(newState); err != nil {
+		slog.Error("circuit breaker transition failed", "new_state", newState, "err", err)
+		return
+	}
+	if rm.metricsObs != nil {
+		rm.metricsObs.OnStateChange(newState)
+	}
 }
 
 // NewRiskManager creates a new risk manager.
@@ -172,8 +215,13 @@ func (rm *RiskManager) CalculateTipShare(profitWei *big.Int, gasGwei float64) fl
 
 	tipShare = clampTip(tipShare, rm.config.MinTipSharePct, rm.config.MaxTipSharePct)
 	if tipShare != rm.lastTipSharePct {
-		log.Printf("TIP STRATEGY: tip share adjusted %.1f%% -> %.1f%% (inclusion %.1f%%, miss %.1f%%, gas %.1f gwei)",
-			rm.lastTipSharePct, tipShare, inclusionRate, missRate, gasGwei)
+		slog.Info("tip strategy adjusted",
+			"from_pct", rm.lastTipSharePct,
+			"to_pct", tipShare,
+			"inclusion_pct", inclusionRate,
+			"miss_pct", missRate,
+			"gas_gwei", gasGwei,
+		)
 	}
 
 	rm.lastAdjustedAtIdx = rm.bundleResultIdx
@@ -276,9 +324,11 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 
 	// --- Bug-revert circuit breaker ---
 	if len(rm.recentBugReverts) >= rm.config.ConsecutiveRevertsPause {
-		log.Printf("CIRCUIT BREAKER: %d bug reverts in %d minutes, pausing",
-			len(rm.recentBugReverts), rm.config.RevertWindowMinutes)
-		rm.state.Transition(StatePaused)
+		slog.Error("circuit breaker: consecutive bug reverts, pausing",
+			"count", len(rm.recentBugReverts),
+			"window_min", rm.config.RevertWindowMinutes,
+		)
+		rm.notifyTrip("consecutive_bug_reverts", StatePaused)
 	}
 
 	// --- Competitive-revert stale-data alert (rate-limited: once per window) ---
@@ -287,8 +337,11 @@ func (rm *RiskManager) RecordRevert(revertType RevertType) {
 	if totalReverts > 0 && now.Sub(rm.lastCompAlertTime) >= window {
 		compPct := float64(len(rm.recentCompReverts)) / float64(totalReverts) * 100
 		if compPct >= rm.config.CompetitiveRevertAlertPct {
-			log.Printf("ALERT: competitive revert rate %.0f%% (>= %.0f%%) in last %d min — possible stale data",
-				compPct, rm.config.CompetitiveRevertAlertPct, rm.config.RevertWindowMinutes)
+			slog.Warn("high competitive revert rate, possible stale data",
+				"comp_pct", compPct,
+				"threshold_pct", rm.config.CompetitiveRevertAlertPct,
+				"window_min", rm.config.RevertWindowMinutes,
+			)
 			rm.lastCompAlertTime = now
 		}
 	}
@@ -306,9 +359,11 @@ func (rm *RiskManager) RecordTrade(volumeWei *big.Int, pnlWei *big.Int) {
 	// Check daily loss halt
 	lossETH := WeiToETH(new(big.Int).Neg(rm.dailyPnL))
 	if lossETH > rm.config.DailyLossHaltETH {
-		log.Printf("CIRCUIT BREAKER: daily loss %.4f ETH exceeds threshold %.4f ETH, halting",
-			lossETH, rm.config.DailyLossHaltETH)
-		rm.state.Transition(StateHalted)
+		slog.Error("circuit breaker: daily loss threshold exceeded, halting",
+			"loss_eth", lossETH,
+			"threshold_eth", rm.config.DailyLossHaltETH,
+		)
+		rm.notifyTrip("daily_loss_exceeded", StateHalted)
 	}
 }
 
@@ -353,7 +408,7 @@ func (rm *RiskManager) maybeResetDaily() {
 		rm.dailyVolume = big.NewInt(0)
 		rm.dailyPnL = big.NewInt(0)
 		rm.dailyResetTime = time.Now().Truncate(24 * time.Hour).Add(24 * time.Hour)
-		log.Println("Daily counters reset")
+		slog.Info("daily counters reset")
 	}
 }
 

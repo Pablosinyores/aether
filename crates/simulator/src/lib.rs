@@ -321,19 +321,157 @@ impl EvmSimulator {
             }
         }
     }
+
+    /// Simulate a transaction against RPC-backed state and measure the ERC20
+    /// balance delta of `profit_recipient` for `profit_token` as profit.
+    ///
+    /// Implementation detail: we cannot observe storage writes by re-reading
+    /// through `RpcDB` after `transact` consumes the context, so we inspect
+    /// the returned `result_and_state.state` map directly. The ERC20 balance
+    /// slot for most tokens (WETH / USDC / DAI / USDT) is `mapping(address
+    /// => uint256) _balances` at slot 3 (WETH), 9 (USDC), or 2 (USDT / DAI).
+    /// The caller passes `balance_slot` to select the right slot for the
+    /// token of interest.
+    ///
+    /// Pre-sim balance is read via `db.storage(...)` which either serves
+    /// from cache or triggers an AlloyDB RPC fetch; post-sim balance is read
+    /// from `result_and_state.state[token].storage[slot]` — and falls back
+    /// to pre-sim balance if the sim didn't touch that slot (e.g. revert).
+    pub fn simulate_rpc_with_erc20_profit(
+        &self,
+        state: RpcForkedState,
+        to: Address,
+        calldata: Vec<u8>,
+        profit_token: Address,
+        profit_recipient: Address,
+        balance_slot: U256,
+    ) -> SimulationResult {
+        use revm::database::DatabaseRef;
+
+        // Compute the balanceOf(recipient) storage key:
+        //   slot = keccak256(pad32(recipient) ++ pad32(balance_slot))
+        let mut key_input = [0u8; 64];
+        key_input[12..32].copy_from_slice(profit_recipient.as_slice());
+        key_input[32..64].copy_from_slice(&balance_slot.to_be_bytes::<32>());
+        let storage_key = U256::from_be_slice(
+            alloy::primitives::keccak256(key_input).as_slice(),
+        );
+
+        // Pre-sim balance via DatabaseRef::storage_ref (fetches from RPC on
+        // first access, then serves from cache). `state.db` implements
+        // DatabaseRef from revm. We destructure state so that we can use db
+        // after transact consumes the context.
+        let RpcForkedState {
+            db,
+            block_number,
+            block_timestamp,
+            base_fee,
+            chain_id,
+        } = state;
+
+        let pre_balance = db
+            .storage_ref(profit_token, storage_key)
+            .unwrap_or_default();
+
+        let block = BlockEnv {
+            number: U256::from(block_number),
+            timestamp: U256::from(block_timestamp),
+            basefee: base_fee,
+            ..Default::default()
+        };
+
+        let tx = TxEnv::builder()
+            .caller(self.config.caller)
+            .kind(revm::primitives::TxKind::Call(to))
+            .data(revm::primitives::Bytes::copy_from_slice(&calldata))
+            .value(self.config.value)
+            .gas_limit(self.config.gas_limit)
+            .gas_price(base_fee as u128)
+            .nonce(0)
+            .chain_id(Some(chain_id))
+            .build_fill();
+
+        let ctx = Context::<BlockEnv, TxEnv, _, RpcDB, revm::context::Journal<RpcDB>, ()>::new(
+            db, SpecId::CANCUN,
+        )
+        .with_block(block)
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.disable_nonce_check = true;
+            // Replay sims run from an impersonated SIM_OWNER that may not
+            // have ETH on the *pinned* RPC block even when `anvil_setBalance`
+            // has bumped it on Anvil's current head; revm's balance check
+            // would then fail pre-flight. Disable it — we're measuring
+            // executability, not caller solvency.
+            cfg.disable_balance_check = true;
+            // Likewise skip base-fee floor; our nominal gas_price doesn't
+            // need to match the pinned block's EIP-1559 base fee.
+            cfg.disable_base_fee = true;
+        });
+
+        let mut evm = ctx.build_mainnet();
+
+        match evm.transact(tx) {
+            Ok(result_and_state) => match result_and_state.result {
+                ExecutionResult::Success { gas_used, .. } => {
+                    // Extract post-sim balance from the state diff. If the
+                    // sim didn't touch the token's balance slot for our
+                    // recipient, the diff will lack an entry and we fall
+                    // back to pre-sim balance → profit = 0.
+                    let post_balance = result_and_state
+                        .state
+                        .get(&profit_token)
+                        .and_then(|acc| acc.storage.get(&storage_key))
+                        .map(|slot| slot.present_value)
+                        .unwrap_or(pre_balance);
+
+                    let profit = post_balance.saturating_sub(pre_balance);
+                    debug!(gas_used, %profit, "RPC simulation with ERC20 profit succeeded");
+                    SimulationResult {
+                        success: true,
+                        profit_wei: profit,
+                        gas_used,
+                        revert_reason: None,
+                    }
+                }
+                ExecutionResult::Revert { gas_used, output } => {
+                    let reason = format!("0x{}", alloy::hex::encode(&output));
+                    debug!(gas_used, reason = %reason, "RPC simulation reverted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason),
+                    }
+                }
+                ExecutionResult::Halt { reason, gas_used } => {
+                    let reason_str = format!("{:?}", reason);
+                    debug!(gas_used, reason = %reason_str, "RPC simulation halted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason_str),
+                    }
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "RPC EVM transact error");
+                SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some(format!("EVM error: {}", e)),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::address;
-
-    /// Helper: create a basic ForkedState with a funded caller
-    fn setup_state_with_caller(caller: Address) -> ForkedState {
-        let mut state = ForkedState::new_empty(18_000_000, 1_700_000_000, 30);
-        state.insert_account_balance(caller, U256::from(100_000_000_000_000_000_000u128));
-        state
-    }
 
     #[test]
     fn test_evm_simulator_creation() {

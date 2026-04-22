@@ -26,3 +26,6 @@ out/
 /build/bin
 
 /contracts/broadcast
+
+# Replay / backtest output (generated)
+/reports/

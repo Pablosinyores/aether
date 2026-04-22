@@ -1,0 +1,73 @@
+groups:
+  - name: aether.rules
+    interval: 30s
+    rules:
+
+      - alert: AetherHalted
+        expr: aether_system_state == 3
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aether system is Halted"
+          description: "System state gauge reports Halted (3) for >1m. Halted requires manual reset. Check executor logs for the breaker reason."
+
+      - alert: AetherInclusionRateLow
+        expr: |
+          sum(rate(aether_executor_bundles_included_total[1h]))
+          /
+          clamp_min(sum(rate(aether_executor_bundles_submitted_total[1h])), 1e-9) < 0.20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bundle inclusion rate below 20% over the last hour"
+          description: "Over the last 1h, fewer than 20% of submitted bundles were included. Current ratio: {{ printf \"%.2f\" $value }}."
+
+      - alert: AetherE2ELatencyHigh
+        expr: histogram_quantile(0.99, sum by (le) (rate(aether_end_to_end_latency_ms_bucket[5m]))) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "End-to-end p99 latency above 100ms"
+          description: "p99 end-to-end latency = {{ printf \"%.1f\" $value }}ms over last 5m (target <100ms)."
+
+      - alert: AetherNoOpportunities
+        expr: rate(aether_arbs_published_total[10m]) * 60 < 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fewer than 5 opportunities per minute"
+          description: "Arb publish rate = {{ printf \"%.1f\" $value }}/min over last 10m. Detection pipeline may be stalled."
+
+      - alert: AetherETHBalanceLow
+        expr: aether_eth_balance < 0.15
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Searcher ETH balance below 0.15"
+          description: "Hot wallet ETH balance = {{ printf \"%.4f\" $value }}. Top up before bundles start reverting on gas."
+
+      - alert: AetherGasHigh
+        expr: aether_gas_price_gwei > 300
+        for: 30s
+        labels:
+          severity: info
+        annotations:
+          summary: "Gas price above 300 gwei"
+          description: "Base fee = {{ printf \"%.1f\" $value }} gwei. Executor preflight will reject arbs until this drops."
+
+      - alert: AetherBuilderDown
+        expr: |
+          sum by (builder) (rate(aether_executor_builder_submissions_total{result="success"}[2m])) == 0
+          and on (builder)
+          sum by (builder) (rate(aether_executor_builder_submissions_total[2m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Builder {{ $labels.builder }} has no successful submissions"
+          description: "Builder {{ $labels.builder }} received submissions but zero succeeded over the last 2m. Check builder endpoint health and auth."

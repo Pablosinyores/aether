@@ -301,7 +301,7 @@ func TestRecordRevert_CompetitiveRateAlert(t *testing.T) {
 
 	// Set a low alert threshold to make it easy to trigger.
 	config := DefaultRiskConfig()
-	config.ConsecutiveRevertsPause = 100 // effectively disable CB for this test
+	config.ConsecutiveRevertsPause = 100  // effectively disable CB for this test
 	config.CompetitiveRevertAlertPct = 80 // alert at 80%+
 	rm := NewRiskManager(config)
 
@@ -574,6 +574,171 @@ func TestCalculateTipShare_ConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// fakeMetricsObserver records observer callbacks under its own lock so tests
+// can assert ordering and contents without racing the risk manager's mu.
+type fakeMetricsObserver struct {
+	mu     sync.Mutex
+	states []SystemState
+	trips  []string
+}
+
+func (f *fakeMetricsObserver) OnStateChange(s SystemState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states = append(f.states, s)
+}
+
+func (f *fakeMetricsObserver) OnCircuitBreakerTrip(reason string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.trips = append(f.trips, reason)
+}
+
+func (f *fakeMetricsObserver) snapshot() ([]SystemState, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	states := append([]SystemState(nil), f.states...)
+	trips := append([]string(nil), f.trips...)
+	return states, trips
+}
+
+func TestMetricsObserver_InitialStateReported(t *testing.T) {
+	t.Parallel()
+
+	rm := NewRiskManager(DefaultRiskConfig())
+	obs := &fakeMetricsObserver{}
+	rm.SetMetricsObserver(obs)
+
+	states, trips := obs.snapshot()
+	if len(states) != 1 || states[0] != StateRunning {
+		t.Fatalf("expected one OnStateChange(Running), got %v", states)
+	}
+	if len(trips) != 0 {
+		t.Fatalf("expected no trips, got %v", trips)
+	}
+}
+
+func TestMetricsObserver_BugRevertTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.ConsecutiveRevertsPause = 3
+	rm := NewRiskManager(cfg)
+
+	obs := &fakeMetricsObserver{}
+	rm.SetMetricsObserver(obs)
+
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+
+	states, trips := obs.snapshot()
+
+	// Expect initial Running + Paused after trip.
+	if len(states) < 2 || states[0] != StateRunning || states[len(states)-1] != StatePaused {
+		t.Fatalf("expected states to start at Running and end at Paused, got %v", states)
+	}
+
+	foundTrip := false
+	for _, r := range trips {
+		if r == "consecutive_bug_reverts" {
+			foundTrip = true
+			break
+		}
+	}
+	if !foundTrip {
+		t.Fatalf("expected 'consecutive_bug_reverts' trip, got %v", trips)
+	}
+}
+
+func TestMetricsObserver_DailyLossTrip(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.DailyLossHaltETH = 0.1 // low threshold — 0.2 ETH loss trips it
+	rm := NewRiskManager(cfg)
+
+	obs := &fakeMetricsObserver{}
+	rm.SetMetricsObserver(obs)
+
+	largeLoss := new(big.Int).Neg(fracETHWei(t, 2, 10)) // -0.2 ETH
+	rm.RecordTrade(ethWei(t, 1), largeLoss)
+
+	states, trips := obs.snapshot()
+
+	if len(states) < 2 || states[0] != StateRunning || states[len(states)-1] != StateHalted {
+		t.Fatalf("expected states to start at Running and end at Halted, got %v", states)
+	}
+
+	foundTrip := false
+	for _, r := range trips {
+		if r == "daily_loss_exceeded" {
+			foundTrip = true
+			break
+		}
+	}
+	if !foundTrip {
+		t.Fatalf("expected 'daily_loss_exceeded' trip, got %v", trips)
+	}
+}
+
+// TestMetricsObserver_TripCountedEvenWhenTransitionRejected asserts that the
+// circuit-breaker trip observer fires even when the underlying state machine
+// rejects the transition — e.g. the bot is already Halted and another
+// bug-revert burst tries to push to Paused. The trip metric must still be
+// bumped so dashboards can show "we're still seeing breaker conditions in a
+// halted state" rather than silently swallowing the signal.
+func TestMetricsObserver_TripCountedEvenWhenTransitionRejected(t *testing.T) {
+	t.Parallel()
+
+	cfg := DefaultRiskConfig()
+	cfg.ConsecutiveRevertsPause = 3
+	rm := NewRiskManager(cfg)
+
+	// Force the bot into Halted without going through the breaker path.
+	rm.state.ForceState(StateHalted)
+
+	obs := &fakeMetricsObserver{}
+	rm.SetMetricsObserver(obs)
+
+	// Drain the initial OnStateChange(Halted) that SetMetricsObserver emits.
+	initialStates, initialTrips := obs.snapshot()
+	if len(initialStates) != 1 || initialStates[0] != StateHalted {
+		t.Fatalf("setup: expected one OnStateChange(Halted), got %v", initialStates)
+	}
+	if len(initialTrips) != 0 {
+		t.Fatalf("setup: expected zero trips, got %v", initialTrips)
+	}
+
+	// 3 bug reverts would ordinarily trip Running -> Paused. From Halted the
+	// Paused transition is invalid, so the state does NOT change. We still
+	// expect one 'consecutive_bug_reverts' trip to be observed.
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+	rm.RecordRevert(RevertBug)
+
+	states, trips := obs.snapshot()
+
+	// No new state changes beyond the initial one.
+	if len(states) != 1 {
+		t.Fatalf("expected no state changes after failed transition, got %v", states)
+	}
+	if rm.State() != StateHalted {
+		t.Fatalf("expected state to remain Halted, got %s", rm.State())
+	}
+
+	// Trip must still have been recorded exactly once.
+	tripCount := 0
+	for _, r := range trips {
+		if r == "consecutive_bug_reverts" {
+			tripCount++
+		}
+	}
+	if tripCount != 1 {
+		t.Fatalf("expected exactly one 'consecutive_bug_reverts' trip even when transition rejected, got trips=%v", trips)
+	}
 }
 
 func TestWeiToETH(t *testing.T) {

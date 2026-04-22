@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "aether-rust"
 path = "src/main.rs"
 
+[[bin]]
+name = "aether-replay"
+path = "src/bin/aether_replay.rs"
+
 [dependencies]
 aether-common = { path = "../common" }
 aether-ingestion = { path = "../ingestion" }
@@ -25,6 +29,11 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
 bytes = "1"
 serde = { workspace = true }
@@ -33,6 +42,9 @@ url = "2"
 dotenvy = "0.15.7"
 futures = "0.3"
 prometheus = "0.13.4"
+clap = { version = "4", features = ["derive"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 prost-build = { workspace = true }

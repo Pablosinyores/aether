@@ -1,5 +1,11 @@
 # Aether Incident Response
 
+## Contract ABI Notes (E4/WS-3)
+
+- **Ownership is now two-step (OZ `Ownable2Step`).** Rotating owner requires `transferOwnership(newOwner)` followed by `acceptOwnership()` from `newOwner`. See SEV1 playbook below.
+- **Revert signature change.** The old `NotOwner()` error (selector `0x30cd7471`) is replaced by OZ `OwnableUnauthorizedAccount(address)` (selector `0x118cdaa7`). Any Alertmanager or Loki rules parsing revert data from failed bundles must be updated.
+- **Pause is now a first-class circuit breaker.** `setPaused(true)` from the owner halts `executeArb` without touching ownership. For SEV1 where the owner key is compromised, pause is **not** an option (attacker holds the key); go straight to ownership transfer. For SEV2/SEV3 where the key is safe but execution should stop, `setPaused(true)` is the preferred action.
+
 ## Severity Levels
 
 | Level | Description | Response Time | Examples |
@@ -22,13 +28,28 @@
    sudo systemctl stop aether-go aether-rust
    ```
 
-2. **Revoke contract permissions**
+2. **Revoke contract permissions** (two-step — OZ `Ownable2Step`)
    ```bash
-   # Transfer AetherExecutor ownership to null address
-   # This must be done from the cold wallet (current owner)
-   cast send <EXECUTOR_ADDRESS> "transferOwnership(address)" 0x0000000000000000000000000000000000000001 \
+   # Step A: outgoing owner initiates the transfer (sets pendingOwner).
+   # Use a dedicated incident cold wallet here, not address(1) — address(1)
+   # cannot call acceptOwnership() so the transfer will never complete and
+   # the compromised owner can still cancel by re-calling transferOwnership.
+   cast send <EXECUTOR_ADDRESS> "transferOwnership(address)" <INCIDENT_COLD_WALLET> \
        --private-key <COLD_WALLET_KEY> --rpc-url <RPC_URL>
+
+   # Step B: incoming owner verifies pendingOwner before accepting.
+   cast call <EXECUTOR_ADDRESS> "pendingOwner()(address)" --rpc-url <RPC_URL>
+   # Must equal <INCIDENT_COLD_WALLET>. If not, abort — compromised owner
+   # may have re-pointed the transfer.
+
+   # Step C: incoming owner accepts.
+   cast send <EXECUTOR_ADDRESS> "acceptOwnership()" \
+       --private-key <INCIDENT_COLD_WALLET_KEY> --rpc-url <RPC_URL>
    ```
+   **Note:** passing `address(0)` to `transferOwnership` is now a no-op cancel
+   (clears `pendingOwner`), not a permanent lock. To renounce, use OZ's
+   `renounceOwnership()` — but prefer the two-step transfer to an incident
+   cold wallet so `rescue()` and `setPaused()` remain callable.
 
 3. **Sweep remaining funds from searcher wallet**
    ```bash
@@ -215,9 +236,7 @@
 
 | Channel | Used For | Configuration |
 |---|---|---|
-| PagerDuty | SEV1, SEV2 | `config/risk.yaml` → `alerting.pagerduty` |
-| Telegram | SEV2, SEV3 | `config/risk.yaml` → `alerting.telegram` |
-| Discord | All severities | `config/risk.yaml` → `alerting.discord` |
+| Slack | All severities | `config/risk.yaml` → `alerting.slack` |
 
 ### Escalation Path
 

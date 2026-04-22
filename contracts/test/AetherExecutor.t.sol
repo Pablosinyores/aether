@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {AetherExecutor} from "../src/AetherExecutor.sol";
 
 /// @dev Mock Aave pool that reverts on flashLoanSimple (used to test FlashLoanFailed)
@@ -166,6 +167,28 @@ contract MockBalancerVault {
     }
 }
 
+/// @dev Counting Balancer Vault — tracks swap call count to assert routing target
+contract CountingBalancerVault {
+    MockERC20 public immutable tokenIn;
+    MockERC20 public immutable tokenOut;
+    uint256 public immutable amountOut;
+    uint256 public swapCallCount;
+
+    constructor(MockERC20 _tokenIn, MockERC20 _tokenOut, uint256 _amountOut) {
+        tokenIn = _tokenIn;
+        tokenOut = _tokenOut;
+        amountOut = _amountOut;
+    }
+
+    fallback() external {
+        swapCallCount += 1;
+        uint256 approved = tokenIn.allowance(msg.sender, address(this));
+        require(approved > 0, "CountingVault: no approval");
+        tokenIn.transferFrom(msg.sender, address(this), approved);
+        tokenOut.transfer(msg.sender, amountOut);
+    }
+}
+
 /// @dev Mock Bancor router — pulls tokenIn via transferFrom, sends tokenOut
 contract MockBancorRouter {
     MockERC20 public immutable tokenIn;
@@ -254,6 +277,11 @@ contract MockWETH {
         require(sent, "ETH transfer failed");
     }
 
+    /// @dev Simulates WETH.deposit: mints WETH to sender equal to msg.value
+    function deposit() external payable {
+        balanceOf[msg.sender] += msg.value;
+    }
+
     receive() external payable {}
 }
 
@@ -270,6 +298,44 @@ contract MockSwapPool {
     fallback() external {
         // Simulate profitable swap: mint outAmount of tokenOut to caller
         MockERC20(tokenOut).mint(msg.sender, outAmount);
+    }
+}
+
+/// @dev Mock Aave pool that tracks flashLoanSimple call count so tests can prove
+///      the pre-flashloan validation short-circuits before Aave is invoked.
+contract CountingAavePool {
+    uint256 public flashLoanCallCount;
+
+    function flashLoanSimple(
+        address receiver,
+        address asset,
+        uint256 amount,
+        bytes calldata params,
+        uint16 /* referralCode */
+    ) external {
+        flashLoanCallCount += 1;
+
+        MockERC20(asset).mint(receiver, amount);
+        uint256 premium = (amount * 5) / 10000;
+
+        AetherExecutor(payable(receiver)).executeOperation(
+            asset,
+            amount,
+            premium,
+            receiver,
+            params
+        );
+
+        uint256 totalDebt = amount + premium;
+        MockERC20(asset).transferFrom(receiver, address(this), totalDebt);
+    }
+}
+
+/// @dev Helper whose receive() always reverts — simulates a contract-coinbase that
+///      refuses plain ETH transfers (forces the WETH fallback path in _repayAndDistribute).
+contract RevertingCoinbase {
+    receive() external payable {
+        revert("no eth");
     }
 }
 
@@ -306,6 +372,10 @@ contract AetherExecutorTest is Test {
         token2 = new MockERC20();
     }
 
+    /// @dev Accept native ETH. Needed for test_rescue_eth where the owner (this contract)
+    ///      receives native ETH via executor.rescue(address(0), amount).
+    receive() external payable {}
+
     // -------------------------------------------------------------------------
     // Basic state
     // -------------------------------------------------------------------------
@@ -319,24 +389,47 @@ contract AetherExecutorTest is Test {
     }
 
     // -------------------------------------------------------------------------
-    // transferOwnership
+    // transferOwnership (Ownable2Step — two-step handoff)
     // -------------------------------------------------------------------------
 
     function test_transferOwnership() public {
+        // Ownable2Step: transferOwnership only nominates pendingOwner; the new owner
+        // must call acceptOwnership() to complete the handoff.
         address newOwner = address(0x123);
         executor.transferOwnership(newOwner);
+
+        // Owner unchanged after step 1
+        assertEq(executor.owner(), owner);
+        assertEq(executor.pendingOwner(), newOwner);
+
+        // Step 2: new owner accepts
+        vm.prank(newOwner);
+        executor.acceptOwnership();
+
         assertEq(executor.owner(), newOwner);
+        assertEq(executor.pendingOwner(), address(0));
     }
 
     function test_transferOwnership_revert_notOwner() public {
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.transferOwnership(address(0x789));
     }
 
-    function test_transferOwnership_revert_zeroAddress() public {
-        vm.expectRevert(AetherExecutor.ZeroAddress.selector);
+    /// @dev Ownable2Step allows transferOwnership(address(0)) — it CANCELS a pending
+    ///      transfer by clearing pendingOwner. It does NOT revert.
+    function test_transferOwnership_cancel_withZeroAddress() public {
+        // First nominate a new owner
+        address pending = address(0x123);
+        executor.transferOwnership(pending);
+        assertEq(executor.pendingOwner(), pending);
+
+        // Now cancel by passing address(0). This does NOT revert on Ownable2Step.
         executor.transferOwnership(address(0));
+        assertEq(executor.pendingOwner(), address(0), "pendingOwner should be cleared");
+        assertEq(executor.owner(), owner, "owner unchanged after cancel");
     }
 
     // -------------------------------------------------------------------------
@@ -354,7 +447,9 @@ contract AetherExecutorTest is Test {
 
     function test_rescue_revert_notOwner() public {
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.rescue(address(token), 100);
     }
 
@@ -365,7 +460,9 @@ contract AetherExecutorTest is Test {
     function test_executeArb_revert_notOwner() public {
         AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](0);
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 9000);
     }
 
@@ -437,7 +534,9 @@ contract AetherExecutorTest is Test {
         spenders[0] = address(aavePool);
 
         vm.prank(address(0x456));
-        vm.expectRevert(AetherExecutor.NotOwner.selector);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(0x456))
+        );
         executor.setApprovals(tokens, spenders);
     }
 
@@ -1270,5 +1369,513 @@ contract AetherExecutorTest is Test {
         // Pool received tokens via direct transfer (same as UniV2)
         assertEq(tokenIn.balanceOf(address(pool)), flashAmount);
         assertGt(tokenIn.balanceOf(owner), 0);
+    }
+
+    // =========================================================================
+    //                    DEX REGISTRY + PAUSE + OWNABLE2STEP
+    //                    + SECURITY-FIX COVERAGE (PR1 / E4-WS3)
+    // =========================================================================
+    //
+    // This block covers the runtime DEX registry (setDexRouter/setDexEnabled),
+    // the pause circuit breaker, the full Ownable2Step handoff, and the three
+    // security fixes that shipped with the registry change:
+    //   1) rescue() now sends native ETH when token==address(0)
+    //   2) _executeSwap caps UniV2/Sushi amountIn at the executor's live balance
+    //   3) coinbase tip falls back to WETH-transfer when block.coinbase rejects ETH
+    // Protocol-constant parity with the Rust ProtocolType enum is sentinel-checked
+    // here; the authoritative discriminant test lives in crates/common (PR2).
+    // =========================================================================
+
+    // Re-declare registry events for vm.expectEmit matching
+    event DexRouterSet(uint8 indexed protocol, address router);
+    event DexEnabledSet(uint8 indexed protocol, bool enabled);
+    event PausedSet(bool paused);
+
+    // -------------------------------------------------------------------------
+    // Registry — setDexRouter
+    // -------------------------------------------------------------------------
+
+    function test_setDexRouter_onlyOwner() public {
+        address intruder = address(0x456);
+        vm.prank(intruder);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, intruder)
+        );
+        executor.setDexRouter(BALANCER_V2, address(0xBEEF));
+    }
+
+    function test_setDexRouter_updatesMappingAndEmits() public {
+        address newVault = address(0xB0B);
+
+        vm.expectEmit(true, false, false, true);
+        emit DexRouterSet(BALANCER_V2, newVault);
+
+        executor.setDexRouter(BALANCER_V2, newVault);
+
+        assertEq(executor.protocolRouter(BALANCER_V2), newVault, "router not updated");
+    }
+
+    /// @dev End-to-end: setDexRouter(BALANCER_V2, secondVault) must route the next Balancer
+    ///      hop to the NEW vault and leave the original vault untouched.
+    function test_setDexRouter_balancerV2_routesToNewVault() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        uint256 flashAmount = 1000;
+        uint256 swapOut = 1100;
+        uint256 premium = flashAmount * 5 / 10000;
+
+        // Deploy two vaults — both can serve the swap; we assert only the second is called.
+        CountingBalancerVault firstVault = new CountingBalancerVault(tokenIn, tokenOut, swapOut);
+        CountingBalancerVault secondVault = new CountingBalancerVault(tokenIn, tokenOut, swapOut);
+
+        // Seed both vaults with enough tokenOut to complete the swap.
+        tokenOut.mint(address(firstVault), swapOut);
+        tokenOut.mint(address(secondVault), swapOut);
+
+        // Deploy executor pointing at firstVault.
+        AetherExecutor regExecutor = new AetherExecutor(address(aavePool), address(firstVault), address(0xBAAC));
+
+        // Migrate to secondVault — this is the action under test.
+        regExecutor.setDexRouter(BALANCER_V2, address(secondVault));
+        assertEq(regExecutor.protocolRouter(BALANCER_V2), address(secondVault), "router not updated");
+
+        // Return pool to close the arb loop.
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory balancerData = abi.encodeWithSignature(
+            "swap(bytes32,address,address,uint256,uint256)",
+            bytes32(0),
+            address(tokenIn),
+            address(tokenOut),
+            flashAmount,
+            swapOut
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0),
+            returnAmount,
+            address(regExecutor),
+            ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: BALANCER_V2,
+            pool: address(secondVault), // pool field is informational for Balancer; router drives the call
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: flashAmount,
+            minAmountOut: swapOut,
+            data: balancerData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        regExecutor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
+
+        // Only the second vault must have been called.
+        assertEq(secondVault.swapCallCount(), 1, "secondVault must receive exactly one swap call");
+        assertEq(firstVault.swapCallCount(), 0, "firstVault must not be called after router migration");
+        // Approval to the new vault must be reset to 0 after the swap.
+        assertEq(tokenIn.allowance(address(regExecutor), address(secondVault)), 0, "approval not reset");
+    }
+
+    function test_setDexRouter_revert_zeroRouter() public {
+        vm.expectRevert(AetherExecutor.ZeroRouter.selector);
+        executor.setDexRouter(BALANCER_V2, address(0));
+    }
+
+    function test_setDexRouter_revert_unknownProtocol() public {
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(0)));
+        executor.setDexRouter(0, address(0xBEEF));
+
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(7)));
+        executor.setDexRouter(7, address(0xBEEF));
+    }
+
+    // -------------------------------------------------------------------------
+    // Registry — setDexEnabled
+    // -------------------------------------------------------------------------
+
+    function test_setDexEnabled_onlyOwner() public {
+        address intruder = address(0x456);
+        vm.prank(intruder);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, intruder)
+        );
+        executor.setDexEnabled(CURVE, false);
+    }
+
+    function test_setDexEnabled_togglesAndEmits() public {
+        // Default is true; flip off, then back on. Each transition emits exactly one event.
+        vm.expectEmit(true, false, false, true);
+        emit DexEnabledSet(CURVE, false);
+        executor.setDexEnabled(CURVE, false);
+        assertFalse(executor.protocolEnabled(CURVE), "curve should be disabled");
+
+        vm.expectEmit(true, false, false, true);
+        emit DexEnabledSet(CURVE, true);
+        executor.setDexEnabled(CURVE, true);
+        assertTrue(executor.protocolEnabled(CURVE), "curve should be re-enabled");
+    }
+
+    function test_setDexEnabled_idempotent_noEvent() public {
+        // CURVE defaults to true in the constructor. Writing true again must be a no-op:
+        // no storage write, no event.
+        vm.recordLogs();
+        executor.setDexEnabled(CURVE, true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 0, "idempotent setDexEnabled must not emit");
+        assertTrue(executor.protocolEnabled(CURVE), "curve still enabled");
+    }
+
+    function test_setDexEnabled_revert_unknownProtocol() public {
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(0)));
+        executor.setDexEnabled(0, true);
+
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(7)));
+        executor.setDexEnabled(7, true);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pre-flashloan validation (CRITICAL — disabled/unknown protocol must fail
+    // fast before Aave fires, otherwise we owe premium on a doomed tx)
+    // -------------------------------------------------------------------------
+
+    function test_executeArb_revert_protocolDisabled_preFlashloan() public {
+        // Use a counting Aave pool so we can prove the revert fired BEFORE flashLoanSimple.
+        CountingAavePool countingPool = new CountingAavePool();
+        AetherExecutor gatedExecutor = new AetherExecutor(
+            address(countingPool), address(0xBA12), address(0xBAAC)
+        );
+
+        gatedExecutor.setDexEnabled(CURVE, false);
+
+        // 3-hop arb with CURVE in the middle hop — revert should cite hop-2's protocol.
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](3);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(0xAA01),
+            tokenIn: address(token),
+            tokenOut: address(token2),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: CURVE,
+            pool: address(0xAA02),
+            tokenIn: address(token2),
+            tokenOut: address(token),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+        steps[2] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(0xAA03),
+            tokenIn: address(token),
+            tokenOut: address(token2),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.ProtocolDisabled.selector, CURVE));
+        gatedExecutor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 0);
+
+        assertEq(countingPool.flashLoanCallCount(), 0, "flashloan must not fire when pre-check rejects");
+    }
+
+    function test_executeArb_revert_unknownProtocol_preFlashloan() public {
+        CountingAavePool countingPool = new CountingAavePool();
+        AetherExecutor gatedExecutor = new AetherExecutor(
+            address(countingPool), address(0xBA12), address(0xBAAC)
+        );
+
+        // protocol = 0 rejected
+        AetherExecutor.SwapStep[] memory stepsZero = new AetherExecutor.SwapStep[](1);
+        stepsZero[0] = AetherExecutor.SwapStep({
+            protocol: 0,
+            pool: address(0xAA01),
+            tokenIn: address(token),
+            tokenOut: address(token2),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(0)));
+        gatedExecutor.executeArb(stepsZero, address(token), 1000, block.timestamp + 1000, 0, 0);
+
+        // protocol = 7 rejected
+        AetherExecutor.SwapStep[] memory stepsSeven = new AetherExecutor.SwapStep[](1);
+        stepsSeven[0] = AetherExecutor.SwapStep({
+            protocol: 7,
+            pool: address(0xAA01),
+            tokenIn: address(token),
+            tokenOut: address(token2),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+        vm.expectRevert(abi.encodeWithSelector(AetherExecutor.UnknownProtocol.selector, uint8(7)));
+        gatedExecutor.executeArb(stepsSeven, address(token), 1000, block.timestamp + 1000, 0, 0);
+
+        assertEq(countingPool.flashLoanCallCount(), 0, "flashloan must not fire on unknown protocol");
+    }
+
+    // -------------------------------------------------------------------------
+    // Pause circuit breaker
+    // -------------------------------------------------------------------------
+
+    function test_setPaused_onlyOwner() public {
+        address intruder = address(0x456);
+        vm.prank(intruder);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, intruder)
+        );
+        executor.setPaused(true);
+    }
+
+    function test_setPaused_emitsEvent_and_idempotent() public {
+        assertFalse(executor.paused(), "starts unpaused");
+
+        // false -> true emits
+        vm.expectEmit(false, false, false, true);
+        emit PausedSet(true);
+        executor.setPaused(true);
+        assertTrue(executor.paused(), "paused after flip");
+
+        // true -> true is a no-op (no event)
+        vm.recordLogs();
+        executor.setPaused(true);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 0, "idempotent setPaused must not emit");
+
+        // true -> false emits
+        vm.expectEmit(false, false, false, true);
+        emit PausedSet(false);
+        executor.setPaused(false);
+        assertFalse(executor.paused(), "unpaused after flip-back");
+    }
+
+    function test_executeArb_revert_whenPaused() public {
+        executor.setPaused(true);
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](1);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(0xAA01),
+            tokenIn: address(token),
+            tokenOut: address(token2),
+            amountIn: 1,
+            minAmountOut: 1,
+            data: ""
+        });
+
+        vm.expectRevert(AetherExecutor.Paused.selector);
+        executor.executeArb(steps, address(token), 1000, block.timestamp + 1000, 0, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Ownable2Step — two-step transfer semantics
+    // -------------------------------------------------------------------------
+
+    function test_twoStep_transfer_requires_acceptance() public {
+        address newOwner = address(0xAAA1);
+
+        // Step 1: nominate
+        executor.transferOwnership(newOwner);
+        assertEq(executor.owner(), owner, "owner unchanged by step 1");
+        assertEq(executor.pendingOwner(), newOwner, "pendingOwner set");
+
+        // Step 2: accept (must be called by nominee)
+        vm.prank(newOwner);
+        executor.acceptOwnership();
+
+        assertEq(executor.owner(), newOwner, "owner updated after acceptance");
+        assertEq(executor.pendingOwner(), address(0), "pendingOwner cleared");
+    }
+
+    function test_acceptOwnership_revert_notPending() public {
+        // No pending transfer in flight — any caller is "not pending".
+        address randomAddr = address(0xD00D);
+        vm.prank(randomAddr);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, randomAddr)
+        );
+        executor.acceptOwnership();
+    }
+
+    // -------------------------------------------------------------------------
+    // Security fix 1 — rescue() handles native ETH
+    // -------------------------------------------------------------------------
+
+    function test_rescue_eth() public {
+        vm.deal(address(executor), 1 ether);
+        assertEq(address(executor).balance, 1 ether);
+
+        uint256 ownerBalBefore = owner.balance;
+        executor.rescue(address(0), 1 ether);
+
+        assertEq(address(executor).balance, 0, "executor should have no ETH left");
+        assertEq(owner.balance - ownerBalBefore, 1 ether, "owner delta must equal rescued ETH");
+    }
+
+    function test_rescue_eth_onlyOwner() public {
+        vm.deal(address(executor), 1 ether);
+        address intruder = address(0x456);
+        vm.prank(intruder);
+        vm.expectRevert(
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, intruder)
+        );
+        executor.rescue(address(0), 1 ether);
+    }
+
+    // -------------------------------------------------------------------------
+    // Security fix 2 — _executeSwap caps UniV2/Sushi transfer at live balance
+    //
+    // If the off-chain optimizer over-spec's amountIn, executor must clamp to its
+    // actual balance rather than reverting or transferring more than it owns.
+    // -------------------------------------------------------------------------
+
+    function test_swapUniV2_capsAtBalance_whenAmountInExceedsBalance() public {
+        MockERC20 tokenIn = new MockERC20();
+        MockERC20 tokenOut = new MockERC20();
+
+        // Flash-loan amount = what the executor actually receives from Aave.
+        uint256 flashAmount = 500;
+        // Over-spec: claim we can swap 1000 but only 500 are on-hand.
+        uint256 overSpecAmountIn = 1000;
+
+        uint256 swapOut = 1100;
+        uint256 premium = (flashAmount * 5) / 10000;
+
+        MockV2Pool pool = new MockV2Pool(tokenIn, tokenOut, swapOut);
+        tokenOut.mint(address(pool), swapOut);
+
+        // Return hop converts tokenOut -> tokenIn with enough output to repay + leave profit.
+        uint256 returnAmount = flashAmount + premium + 10;
+        MockV2Pool returnPool = new MockV2Pool(tokenOut, tokenIn, returnAmount);
+        tokenIn.mint(address(returnPool), returnAmount);
+
+        bytes memory swapData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0), swapOut, address(executor), ""
+        );
+        bytes memory returnData = abi.encodeWithSignature(
+            "swap(uint256,uint256,address,bytes)",
+            uint256(0), returnAmount, address(executor), ""
+        );
+
+        AetherExecutor.SwapStep[] memory steps = new AetherExecutor.SwapStep[](2);
+        steps[0] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(pool),
+            tokenIn: address(tokenIn),
+            tokenOut: address(tokenOut),
+            amountIn: overSpecAmountIn, // 1000 requested, only 500 live
+            minAmountOut: swapOut,
+            data: swapData
+        });
+        steps[1] = AetherExecutor.SwapStep({
+            protocol: UNISWAP_V2,
+            pool: address(returnPool),
+            tokenIn: address(tokenOut),
+            tokenOut: address(tokenIn),
+            amountIn: swapOut,
+            minAmountOut: returnAmount,
+            data: returnData
+        });
+
+        executor.executeArb(steps, address(tokenIn), flashAmount, block.timestamp + 1000, 0, 0);
+
+        // Cap kicked in: pool received the live balance, not the over-spec figure.
+        assertEq(tokenIn.balanceOf(address(pool)), flashAmount, "pool should receive capped (live-balance) amount");
+        assertTrue(flashAmount < overSpecAmountIn, "sanity: over-spec > live balance");
+    }
+
+    // -------------------------------------------------------------------------
+    // Security fix 3 — coinbase tip falls back to WETH on reverting coinbase
+    //
+    // Some builders run contract-coinbases whose receive() reverts. The executor
+    // must recover by re-wrapping the ETH and transferring WETH to the coinbase.
+    // We assert the fallback ran by checking the coinbase's post-tx WETH balance.
+    // -------------------------------------------------------------------------
+
+    function test_coinbaseTip_fallsBackToWeth_onRevertingCoinbase() public {
+        address WETH_ADDR = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+        _deployMockWethAt(WETH_ADDR);
+
+        (AetherExecutor wethExecutor, AetherExecutor.SwapStep[] memory steps) =
+            _buildWethArbFixture(WETH_ADDR, 1000);
+
+        // Contract coinbase whose receive() reverts — forces the WETH fallback path.
+        RevertingCoinbase revertingCB = new RevertingCoinbase();
+        vm.coinbase(address(revertingCB));
+
+        vm.deal(WETH_ADDR, 10_000);
+
+        uint256 tipBps = 9000; // tip = 900
+        uint256 expectedTip = 900;
+        uint256 expectedOwner = 100;
+
+        wethExecutor.executeArb(steps, WETH_ADDR, 100_000, block.timestamp + 1000, 0, tipBps);
+
+        // Native ETH transfer to the reverting coinbase must have failed, so executor
+        // re-wrapped and ERC20-transferred WETH instead. Balance proves the fallback ran.
+        assertEq(
+            MockWETH(payable(WETH_ADDR)).balanceOf(address(revertingCB)),
+            expectedTip,
+            "coinbase should receive WETH via fallback"
+        );
+        assertEq(address(revertingCB).balance, 0, "no native ETH should reach reverting coinbase");
+        assertEq(
+            MockWETH(payable(WETH_ADDR)).balanceOf(address(this)),
+            expectedOwner,
+            "owner WETH profit incorrect"
+        );
+        assertEq(
+            MockWETH(payable(WETH_ADDR)).balanceOf(address(wethExecutor)),
+            0,
+            "executor should have zero WETH leftover"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Solidity ↔ Rust invariant sentinel
+    //
+    // The Solidity protocol constants are private, so we can't read them directly.
+    // Instead we assert the constructor-seeded enabled set exactly matches the
+    // expected range [1..=BANCOR_V3]. This is a weak-but-nonzero sentinel; the
+    // authoritative check lives Rust-side in crates/common/src/types.rs (PR2) via
+    // a discriminant-equality test against these same ids.
+    // -------------------------------------------------------------------------
+
+    function test_protocolConstants_implicitlyMatch() public view {
+        // In-range (1..=6) must all be enabled at construction.
+        // Hardcoded numeric IDs — using the test-file constants here would make
+        // the sentinel circular: if a constant drifted, the test would still pass.
+        assertTrue(executor.protocolEnabled(1), "UNISWAP_V2 (1)");
+        assertTrue(executor.protocolEnabled(2), "UNISWAP_V3 (2)");
+        assertTrue(executor.protocolEnabled(3), "SUSHISWAP (3)");
+        assertTrue(executor.protocolEnabled(4), "CURVE (4)");
+        assertTrue(executor.protocolEnabled(5), "BALANCER_V2 (5)");
+        assertTrue(executor.protocolEnabled(6), "BANCOR_V3 (6)");
+
+        // Out-of-range (0 and >=7) must stay default-false.
+        assertFalse(executor.protocolEnabled(0), "protocol 0 must be disabled");
+        assertFalse(executor.protocolEnabled(7), "protocol 7 must be disabled");
+        assertFalse(executor.protocolEnabled(255), "protocol 255 must be disabled");
     }
 }

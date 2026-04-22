@@ -25,8 +25,9 @@ use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
 
 // Import the proto ValidatedArb type from service module
+use aether_grpc_server::EngineMetrics;
+
 use crate::pipeline;
-use crate::metrics::EngineMetrics;
 use crate::service::aether_proto::ValidatedArb as ProtoValidatedArb;
 
 /// Configuration for the AetherEngine.
@@ -137,6 +138,49 @@ pub struct BlockInfo {
 
 /// Convert a U256 to f64 approximation (used for exchange rate calculations).
 /// Uses limb-based conversion to handle values larger than u128::MAX.
+/// Human-readable label for a well-known mainnet token.
+/// Keep in sync with `tokenLabels` in cmd/executor/main.go and `token_label`
+/// in crates/grpc-server/src/bin/aether_replay.rs so the same symbols show up
+/// in every log / CSV / JSON the e2e pipeline produces.
+fn token_label(addr: &Address) -> String {
+    use alloy::primitives::address;
+    const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+    const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
+    const AAVE: Address = address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9");
+    match *addr {
+        WETH => "WETH".into(),
+        USDC => "USDC".into(),
+        USDT => "USDT".into(),
+        DAI => "DAI".into(),
+        WBTC => "WBTC".into(),
+        AAVE => "AAVE".into(),
+        _ => {
+            let hex = format!("{:#x}", addr);
+            if hex.len() > 10 {
+                format!("{}…", &hex[..10])
+            } else {
+                hex
+            }
+        }
+    }
+}
+
+/// Build a path like "WETH -> AAVE -> WETH" from an `ArbOpportunity`'s hop list.
+fn arb_path_labels(opp: &ArbOpportunity) -> String {
+    if opp.hops.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(opp.hops.len() + 1);
+    parts.push(token_label(&opp.hops[0].token_in));
+    for hop in &opp.hops {
+        parts.push(token_label(&hop.token_out));
+    }
+    parts.join(" -> ")
+}
+
 fn u256_to_f64(val: U256) -> f64 {
     let limbs = val.as_limbs();
     limbs[0] as f64
@@ -680,6 +724,26 @@ impl AetherEngine {
                     }
                 }
             }
+            PoolEvent::V2Swap {
+                pool,
+                sender,
+                to,
+                amount0_in,
+                amount1_in,
+                amount0_out,
+                amount1_out,
+            } => {
+                // Informational only — reserves reconcile via the paired
+                // `Sync` event, which arrives in the same log batch and
+                // drives `ReserveUpdate` above. This arm exists so the
+                // match stays exhaustive and downstream trade analytics
+                // have a hook.
+                debug!(
+                    %pool, %sender, %to,
+                    %amount0_in, %amount1_in, %amount0_out, %amount1_out,
+                    "V2 swap (informational)"
+                );
+            }
             PoolEvent::V3Update {
                 pool,
                 sqrt_price_x96,
@@ -737,6 +801,7 @@ impl AetherEngine {
     }
 
     /// Run a detection cycle: scan for negative cycles, simulate, publish.
+    #[tracing::instrument(skip_all, name = "engine.detection_cycle")]
     async fn run_detection_cycle(&self) {
         let t_cycle = Instant::now();
 
@@ -769,11 +834,16 @@ impl AetherEngine {
             let affected = graph.affected_vertices();
 
             let t_detect = Instant::now();
-            let cycles = if affected.is_empty() {
-                // Full scan (e.g., on first run).
-                self.detector.detect_negative_cycles(graph)
-            } else {
-                self.detector.detect_from_affected(graph, &affected)
+            let detect_span =
+                tracing::info_span!("detect", affected = affected.len(), block_number);
+            let cycles = {
+                let _entered = detect_span.enter();
+                if affected.is_empty() {
+                    // Full scan (e.g., on first run).
+                    self.detector.detect_negative_cycles(graph)
+                } else {
+                    self.detector.detect_from_affected(graph, &affected)
+                }
             };
             let detect_us = t_detect.elapsed().as_micros();
             self.metrics.observe_detection_latency_us(detect_us);
@@ -1257,18 +1327,55 @@ impl AetherEngine {
                 input.calldata,
             );
 
-            if let Err(e) = self.arb_tx.send(proto_arb) {
-                debug!(error = %e, "No arb subscribers connected");
-            } else {
-                sim_success += 1;
-                self.metrics.inc_arbs_published(1);
-                info!(
-                    id = %input.opp.id,
-                    net_profit_wei = input.net_profit,
-                    sim_us,
-                    "Published validated arb"
-                );
-            }
+            let publish_span = tracing::info_span!(
+                "arb.publish",
+                arb_id = %input.opp.id,
+                hops = input.opp.hops.len(),
+                net_profit_wei = input.net_profit,
+                sim_us,
+            );
+            publish_span.in_scope(|| {
+                if let Err(e) = self.arb_tx.send(proto_arb) {
+                    debug!(error = %e, "No arb subscribers connected");
+                } else {
+                    sim_success += 1;
+                    self.metrics.inc_arbs_published(1);
+
+                    // Human-readable path: WETH -> AAVE -> WETH
+                    // Built from the simulator's own input/hops so it matches
+                    // exactly what Go will see (same hop order, same token_in/out).
+                    let path = arb_path_labels(&input.opp);
+                    let hop_count = input.opp.hops.len();
+                    let flashloan_label = token_label(&input.flashloan_token);
+                    let net_profit_eth = input.net_profit as f64 / 1e18;
+
+                    // Emit BOTH the legacy and new log lines during the transition.
+                    // Downstream Loki / Grafana alert rules key on either the
+                    // "Published validated arb" message or the `net_profit_wei`
+                    // u128 field; dropping either would silently break them.
+                    // Drop the legacy line after E2-gate alerts are ported.
+                    info!(
+                        id = %input.opp.id,
+                        path = %path,
+                        hops = hop_count,
+                        flashloan = %flashloan_label,
+                        net_profit_wei = input.net_profit,
+                        net_profit_eth = format_args!("{:.6}", net_profit_eth),
+                        sim_us,
+                        "Published validated arb"
+                    );
+                    info!(
+                        id = %input.opp.id,
+                        path = %path,
+                        hops = hop_count,
+                        flashloan = %flashloan_label,
+                        net_profit_wei = input.net_profit,
+                        net_profit_eth = format_args!("{:.6}", net_profit_eth),
+                        sim_us,
+                        "ARB PUBLISHED"
+                    );
+                }
+            });
         }
 
         let phase2_us = t_phase2.elapsed().as_micros();

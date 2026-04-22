@@ -61,6 +61,7 @@ impl EventChannels {
     }
 
     /// Dispatch a pool update event
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.pool_update")]
     pub fn dispatch_pool_update(&self, event: PoolEvent) {
         match self.pool_updates_tx.send(event) {
             Ok(_n) => {}
@@ -69,6 +70,7 @@ impl EventChannels {
     }
 
     /// Dispatch a new block event
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.new_block", fields(block_number = event.block_number))]
     pub fn dispatch_new_block(&self, event: NewBlockEvent) {
         match self.new_block_tx.send(event) {
             Ok(_) => {}
@@ -77,6 +79,7 @@ impl EventChannels {
     }
 
     /// Dispatch a pending tx event
+    #[tracing::instrument(level = "debug", skip_all, name = "ingest.pending_tx")]
     pub fn dispatch_pending_tx(&self, event: PendingTxEvent) {
         match self.pending_tx_tx.send(event) {
             Ok(_) => {}
@@ -142,15 +145,14 @@ mod tests {
         channels.dispatch_pool_update(event);
 
         let received = rx.recv().await.expect("should receive pool update");
-        match received {
-            PoolEvent::ReserveUpdate {
-                reserve0, reserve1, ..
-            } => {
-                assert_eq!(reserve0, U256::from(1000u64));
-                assert_eq!(reserve1, U256::from(2000u64));
-            }
-            other => panic!("Expected ReserveUpdate, got {:?}", other),
-        }
+        let PoolEvent::ReserveUpdate {
+            reserve0, reserve1, ..
+        } = received
+        else {
+            panic!("dispatch returned unexpected variant: {received:?}");
+        };
+        assert_eq!(reserve0, U256::from(1000u64));
+        assert_eq!(reserve1, U256::from(2000u64));
     }
 
     // ── Subscribe/dispatch new block ──
@@ -226,13 +228,11 @@ mod tests {
         let r3 = rx3.recv().await.expect("rx3 should receive");
 
         for received in [r1, r2, r3] {
-            match received {
-                PoolEvent::V3Update { tick, liquidity, .. } => {
-                    assert_eq!(tick, -50);
-                    assert_eq!(liquidity, 12345);
-                }
-                other => panic!("Expected V3Update, got {:?}", other),
-            }
+            let PoolEvent::V3Update { tick, liquidity, .. } = received else {
+                panic!("dispatch returned unexpected variant: {received:?}");
+            };
+            assert_eq!(tick, -50);
+            assert_eq!(liquidity, 12345);
         }
     }
 

@@ -16,7 +16,15 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use aether_grpc_server::provider::{ProviderConfig, RpcProvider};
+use aether_grpc_server::EngineMetrics;
 use aether_ingestion::subscription::EventChannels;
+
+/// Fresh metrics handle for tests that don't care about counter values —
+/// each `EngineMetrics::new()` builds its own registry so concurrent
+/// tests don't collide.
+fn test_metrics() -> Arc<EngineMetrics> {
+    Arc::new(EngineMetrics::new())
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -106,7 +114,7 @@ async fn test_ws_subscription_receives_blocks() {
         max_reconnect_attempts: 5,
         ..ProviderConfig::default()
     };
-    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels)));
+    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels), test_metrics()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let provider_clone = Arc::clone(&provider);
@@ -167,7 +175,7 @@ async fn test_ws_reconnection_on_disconnect() {
         max_reconnect_attempts: 20,
         ..ProviderConfig::default()
     };
-    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels)));
+    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels), test_metrics()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let provider_clone = Arc::clone(&provider);
@@ -258,7 +266,7 @@ async fn test_http_fallback_still_works() {
         max_reconnect_attempts: 5,
         ..ProviderConfig::default()
     };
-    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels)));
+    let provider = Arc::new(RpcProvider::new(config, Arc::clone(&channels), test_metrics()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let provider_clone = Arc::clone(&provider);

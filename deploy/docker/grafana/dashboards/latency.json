@@ -1,0 +1,68 @@
+{
+  "uid": "aether-latency",
+  "title": "Aether — Latency",
+  "tags": ["aether", "latency"],
+  "schemaVersion": 38,
+  "version": 0,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Detection latency (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(aether_detection_latency_ms_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_detection_latency_ms_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(aether_detection_latency_ms_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 2 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Simulation latency (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(aether_simulation_latency_ms_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_simulation_latency_ms_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(aether_simulation_latency_ms_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 2 }, "overrides": [] },
+      "options": { "legend": { "showLegend": true } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "End-to-end latency (ms) — p50 / p95 / p99",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(aether_end_to_end_latency_ms_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_end_to_end_latency_ms_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(aether_end_to_end_latency_ms_bucket[5m])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "showLegend": true } }
+    }
+  ]
+}

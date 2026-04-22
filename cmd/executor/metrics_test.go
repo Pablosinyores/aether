@@ -7,12 +7,105 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
+
+// LiveBalance is read on the arb hot path and written by balanceWatchLoop.
+// These tests pin the atomic-float64 contract — round-trip correctness for
+// edge values and race-free concurrent Get/Set — so a future refactor that
+// silently replaces the atomic.Uint64 with a plain float64 (which would
+// tear reads under contention) fails loudly.
+
+func TestLiveBalance_ZeroValue(t *testing.T) {
+	lb := NewLiveBalance()
+	if got := lb.Get(); got != 0 {
+		t.Fatalf("fresh LiveBalance.Get() = %v, want 0", got)
+	}
+}
+
+func TestLiveBalance_SetGetRoundTrip(t *testing.T) {
+	cases := []float64{
+		0,
+		1,
+		0.5,
+		1e18,
+		1e-18,
+		math.MaxFloat64,
+		math.SmallestNonzeroFloat64,
+	}
+	lb := NewLiveBalance()
+	for _, v := range cases {
+		lb.Set(v)
+		if got := lb.Get(); got != v {
+			t.Errorf("round-trip %v: got %v", v, got)
+		}
+	}
+}
+
+func TestLiveBalance_OverwritesPreviousValue(t *testing.T) {
+	lb := NewLiveBalance()
+	lb.Set(3.14)
+	lb.Set(2.71)
+	if got := lb.Get(); got != 2.71 {
+		t.Fatalf("after two Sets, Get() = %v, want 2.71", got)
+	}
+}
+
+func TestLiveBalance_ConcurrentSetGet(t *testing.T) {
+	// The contract is: Get always returns a value that was passed to Set by
+	// some goroutine. Float64 tearing (observing a bit pattern that was
+	// never written) must not happen.
+	lb := NewLiveBalance()
+	const writers = 8
+	const readers = 8
+	const iters = 10_000
+
+	// Valid write values. Every observed read must match one of these.
+	values := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8}
+	valid := make(map[float64]struct{}, len(values)+1)
+	for _, v := range values {
+		valid[v] = struct{}{}
+	}
+	valid[0] = struct{}{} // zero-value is also valid (never-written state)
+
+	var wg sync.WaitGroup
+	wg.Add(writers + readers)
+
+	for w := 0; w < writers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				lb.Set(values[(id+i)%len(values)])
+			}
+		}(w)
+	}
+
+	var tearCount int64
+	var tearMu sync.Mutex
+	for r := 0; r < readers; r++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				v := lb.Get()
+				if _, ok := valid[v]; !ok {
+					tearMu.Lock()
+					tearCount++
+					tearMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	if tearCount != 0 {
+		t.Fatalf("observed %d torn reads out of %d, atomic contract broken", tearCount, readers*iters)
+	}
+}
 
 func TestMetricsEndpoint_ContainsRequiredMetrics(t *testing.T) {
 	server := httptest.NewServer(promhttp.Handler())
@@ -126,4 +219,130 @@ func TestEndToEndLatency(t *testing.T) {
 
 	// Zero time should be a no-op
 	recordEndToEndLatency(time.Time{})
+}
+
+func TestRecordBuilderResult_ScrapeLabels(t *testing.T) {
+	recordBuilderResult("flashbots", true, 42*time.Millisecond)
+	recordBuilderResult("titan", false, 123*time.Millisecond)
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+	payload := string(body)
+
+	required := []string{
+		`aether_executor_builder_submissions_total{builder="flashbots",result="success"}`,
+		`aether_executor_builder_submissions_total{builder="titan",result="failure"}`,
+		`aether_executor_builder_latency_ms_count{builder="flashbots"}`,
+		`aether_executor_builder_latency_ms_count{builder="titan"}`,
+	}
+	for _, want := range required {
+		if !strings.Contains(payload, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+func TestPreRegisterBuilderLabels_BothSeriesExistAtZero(t *testing.T) {
+	// Use unique builder names so the assertion is not polluted by other
+	// tests that exercise recordBuilderResult against real builder names.
+	names := []string{"prereg_alpha", "prereg_beta"}
+	PreRegisterBuilderLabels(names)
+
+	for _, name := range names {
+		gotSuccess := testutil.ToFloat64(builderSubmissionsTotal.WithLabelValues(name, "success"))
+		if gotSuccess != 0 {
+			t.Errorf("pre-registered %q success: got %f, want 0", name, gotSuccess)
+		}
+		gotFailure := testutil.ToFloat64(builderSubmissionsTotal.WithLabelValues(name, "failure"))
+		if gotFailure != 0 {
+			t.Errorf("pre-registered %q failure: got %f, want 0", name, gotFailure)
+		}
+	}
+
+	// Verify both series are actually exposed on the /metrics scrape (not
+	// just observable via the in-process collector) — this is the property
+	// the AetherBuilderDown alert actually depends on.
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+	payload := string(body)
+
+	required := []string{
+		`aether_executor_builder_submissions_total{builder="prereg_alpha",result="success"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_alpha",result="failure"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_beta",result="success"} 0`,
+		`aether_executor_builder_submissions_total{builder="prereg_beta",result="failure"} 0`,
+	}
+	for _, want := range required {
+		if !strings.Contains(payload, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+func TestSetSystemState_LastWriteWins(t *testing.T) {
+	setSystemState(2)
+	setSystemState(3)
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+
+	if !strings.Contains(string(body), "aether_system_state 3") {
+		t.Fatalf("expected 'aether_system_state 3' in payload, got: %s", string(body))
+	}
+}
+
+func TestRecordCircuitBreakerTrip(t *testing.T) {
+	recordCircuitBreakerTrip("daily_loss_exceeded")
+
+	server := httptest.NewServer(promhttp.Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL)
+	if err != nil {
+		t.Fatalf("metrics endpoint request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("metrics endpoint read failed: %v", err)
+	}
+
+	want := `aether_circuit_breaker_trips_total{reason="daily_loss_exceeded"}`
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("metrics output missing %q", want)
+	}
 }

@@ -15,6 +15,7 @@ pub struct EngineMetrics {
     simulations_run: IntCounter,
     arbs_published: IntCounter,
     blocks_processed: IntCounter,
+    decode_errors: IntCounter,
 }
 
 impl EngineMetrics {
@@ -57,6 +58,11 @@ impl EngineMetrics {
             "Total blocks processed",
         )
         .expect("aether_blocks_processed_total counter");
+        let decode_errors = IntCounter::new(
+            "aether_decode_errors_total",
+            "Total logs the event decoder could not parse",
+        )
+        .expect("aether_decode_errors_total counter");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -76,6 +82,9 @@ impl EngineMetrics {
         registry
             .register(Box::new(blocks_processed.clone()))
             .expect("register aether_blocks_processed_total");
+        registry
+            .register(Box::new(decode_errors.clone()))
+            .expect("register aether_decode_errors_total");
 
         Self {
             registry,
@@ -85,6 +94,7 @@ impl EngineMetrics {
             simulations_run,
             arbs_published,
             blocks_processed,
+            decode_errors,
         }
     }
 
@@ -120,7 +130,14 @@ impl EngineMetrics {
         self.blocks_processed.inc();
     }
 
-    fn render(&self) -> Vec<u8> {
+    pub fn inc_decode_errors(&self) {
+        self.decode_errors.inc();
+    }
+
+    /// Render the registered metrics in Prometheus text exposition format.
+    /// `pub(crate)` so sibling modules (`provider::tests`) can assert on
+    /// rendered counter values without exposing the whole registry.
+    pub(crate) fn render(&self) -> Vec<u8> {
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -128,6 +145,12 @@ impl EngineMetrics {
             return b"".to_vec();
         }
         buffer
+    }
+}
+
+impl Default for EngineMetrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -224,6 +247,7 @@ mod tests {
         metrics.inc_simulations_run(3);
         metrics.inc_arbs_published(4);
         metrics.inc_blocks_processed();
+        metrics.inc_decode_errors();
 
         let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
 
@@ -234,6 +258,7 @@ mod tests {
             "aether_simulations_run_total",
             "aether_arbs_published_total",
             "aether_blocks_processed_total",
+            "aether_decode_errors_total",
         ] {
             assert!(output.contains(name), "missing metric {name}");
         }
@@ -247,5 +272,6 @@ mod tests {
         assert!(output.contains("aether_simulations_run_total 3"));
         assert!(output.contains("aether_arbs_published_total 4"));
         assert!(output.contains("aether_blocks_processed_total 1"));
+        assert!(output.contains("aether_decode_errors_total 1"));
     }
 }

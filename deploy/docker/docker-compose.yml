@@ -14,11 +14,14 @@ services:
       - reth-ipc:/tmp
     environment:
       - RUST_LOG=info
+      - LOG_FORMAT=json
       - AETHER_CONFIG_DIR=/app/config
       - GRPC_ADDRESS=0.0.0.0:50051
       - ETH_RPC_URL=${ETH_RPC_URL:-}
       - AETHER_NODES_CONFIG=/app/config/nodes.yaml
       - RUST_METRICS_PORT=9092
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_SERVICE_NAME=aether-rust
     env_file:
       - path: ../../.env
         required: false
@@ -38,6 +41,8 @@ services:
       - GRPC_ADDRESS=aether-rust:50051
       - METRICS_PORT=9090
       - DASHBOARD_PORT=8080
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317
+      - OTEL_SERVICE_NAME=aether-go
     env_file:
       - path: ../../.env
         required: false
@@ -54,6 +59,34 @@ services:
       - "9091:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      - alertmanager
+    networks:
+      - aether-net
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: aether-alertmanager
+    ports:
+      - "9093:9093"
+    environment:
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml.tpl:ro
+      - alertmanager-data:/alertmanager
+    # Substitute the webhook URL from the environment at startup so the
+    # secret never lands in the committed config file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        sed "s|__SLACK_WEBHOOK_URL__|${SLACK_WEBHOOK_URL}|g" \
+          /etc/alertmanager/alertmanager.yml.tpl > /tmp/alertmanager.yml
+        exec /bin/alertmanager \
+          --config.file=/tmp/alertmanager.yml \
+          --storage.path=/alertmanager
+    restart: unless-stopped
     networks:
       - aether-net
 
@@ -69,12 +102,74 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
     networks:
       - aether-net
 
-  # Loki: deferred — logs available via `docker logs`, Loki planned for production deployment
+  loki:
+    image: grafana/loki:2.9.4
+    container_name: aether-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - aether-net
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    container_name: aether-promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-data:/var/lib/promtail
+    depends_on:
+      loki:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - aether-net
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: aether-tempo
+    command: -config.file=/etc/tempo/tempo-config.yml
+    ports:
+      - "3200:3200"   # HTTP API (Grafana datasource)
+      - "4317:4317"   # OTLP gRPC
+    volumes:
+      - ./tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempo-data:/var/tempo
+    restart: unless-stopped
+    networks:
+      - aether-net
+
+  canary:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/canary.Dockerfile
+    container_name: aether-canary
+    environment:
+      - CANARY_TARGETS=aether-rust:9092/metrics,aether-go:9090/metrics,aether-go:8080/api/stats
+      - ALERTMANAGER_URL=http://alertmanager:9093
+      - PROBE_INTERVAL_SEC=60
+      - STALE_AFTER_SEC=180
+    depends_on:
+      - alertmanager
+    restart: unless-stopped
+    networks:
+      - aether-net
 
   # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
   # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
@@ -97,6 +192,10 @@ services:
 
 volumes:
   grafana-data:
+  alertmanager-data:
+  loki-data:
+  promtail-data:
+  tempo-data:
   reth-data:
   reth-ipc:
 

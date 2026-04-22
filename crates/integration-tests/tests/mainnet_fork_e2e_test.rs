@@ -56,7 +56,7 @@ async fn test_mainnet_fork_e2e_pipeline() {
             .expect("block should exist");
 
         let timestamp = block.header.timestamp;
-        let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000) as u64;
+        let base_fee = block.header.base_fee_per_gas.unwrap_or(30_000_000_000);
 
         eprintln!("=== Mainnet Fork E2E Test ===");
         eprintln!("Block: {block_number}  Timestamp: {timestamp}  BaseFee: {base_fee}");

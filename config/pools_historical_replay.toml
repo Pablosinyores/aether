@@ -1,0 +1,194 @@
+# Pool registry for scripts/historical_replay_e2e.sh
+#
+# Mirrors the built-in 21-pool default set of `aether-replay --full-block`
+# so the live pipeline's price graph matches what the Phase 1b replay
+# detects. Keep this file in sync with `default_pool_set()` in
+# crates/grpc-server/src/bin/aether_replay.rs.
+#
+# Token order follows UniswapV2/V3 convention: token0 < token1 by address.
+
+# ── UniswapV2 / SushiSwap majors ────────────────────────────────────────
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"
+token0 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0x397FF1542f962076d0BFE58eA045FfA2d347ACa0"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0x06da0fd433C1A5d7a4faa01111c044910A184553"
+token0 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # DAI
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0xC3D03e4F041Fd4cD388c549Ee2A29a9E5075882f"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # DAI
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x3041CbD36888bECc7bbCBc0045E3B1f144466f5f"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 30
+tier = "hot"
+
+# ── UniswapV3 majors ────────────────────────────────────────────────────
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 5
+tier = "hot"
+tick_spacing = 10
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+tick_spacing = 60
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x11b815efB8f581194ae79006d24E0d814B7697F6"
+token0 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+fee_bps = 5
+tier = "hot"
+tick_spacing = 10
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"
+token0 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+fee_bps = 30
+tier = "hot"
+tick_spacing = 60
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0xC2e9F25Be6257c210d7Adf0D4Cd6E3E881ba25f8"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+tick_spacing = 60
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x60594a405d53811d3BC4766596EFD80fd545A270"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 5
+tier = "hot"
+tick_spacing = 10
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x3416cF6C708Da44DB2624D63ea0AAef7113527C6"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+fee_bps = 1
+tier = "hot"
+tick_spacing = 1
+
+# ── WBTC pairs ──────────────────────────────────────────────────────────
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
+token0 = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"  # WBTC
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0xCEfF51756c56CeFFCA006cD410B03FFC46dd3a58"
+token0 = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x4585FE77225b41b697C938B018E2Ac67Ac5a20c0"
+token0 = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 5
+tier = "hot"
+tick_spacing = 10
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD"
+token0 = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+tick_spacing = 60
+
+# ── AAVE pairs (token0 = AAVE by address order) ────────────────────────
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xDFC14d2Af169B0D36C4EFF567Ada9b2E0CAE044f"
+token0 = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"  # AAVE
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "sushiswap"
+address = "0xD75EA151a61d06868E31F8988D28DFE5E9df57B4"
+token0 = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"
+token0 = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+fee_bps = 30
+tier = "hot"
+tick_spacing = 60

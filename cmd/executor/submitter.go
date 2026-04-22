@@ -7,11 +7,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // BuilderConfig holds configuration for a block builder.
@@ -76,9 +80,15 @@ func NewSubmitter(builders []BuilderConfig, searcherKey string) (*Submitter, err
 	}
 
 	metrics := make(map[string]*BuilderMetrics, len(builders))
+	names := make([]string, 0, len(builders))
 	for _, b := range builders {
 		metrics[b.Name] = &BuilderMetrics{}
+		names = append(names, b.Name)
 	}
+	// Ensure both {result="success"} and {result="failure"} series exist
+	// for every configured builder from t=0 so the AetherBuilderDown alert
+	// can reason about builders that have not yet produced either outcome.
+	PreRegisterBuilderLabels(names)
 
 	transport := &http.Transport{
 		MaxIdleConnsPerHost: len(builders),
@@ -98,7 +108,20 @@ func NewSubmitter(builders []BuilderConfig, searcherKey string) (*Submitter, err
 
 // SubmitToAll sends the bundle to all enabled builders concurrently.
 func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []SubmissionResult {
+	enabled := 0
+	for _, b := range s.builders {
+		if b.Enabled {
+			enabled++
+		}
+	}
+
+	ctx, fanoutSpan := tracer.Start(ctx, "submit.fanout",
+		trace.WithAttributes(attribute.Int("builders_enabled", enabled)),
+	)
+	defer fanoutSpan.End()
+
 	if s.submitFn == nil && len(bundle.RawTxs) == 0 {
+		fanoutSpan.SetStatus(codes.Error, "no signed transactions in bundle")
 		return []SubmissionResult{{
 			Builder: "all",
 			Success: false,
@@ -118,9 +141,19 @@ func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []Submissio
 			defer wg.Done()
 			start := time.Now()
 
-			result := s.submitToBuilder(ctx, b, bundle)
+			builderCtx, builderSpan := tracer.Start(ctx, "submit.builder",
+				trace.WithAttributes(attribute.String("builder", b.Name)),
+			)
+			result := s.submitToBuilder(builderCtx, b, bundle)
 			result.Latency = time.Since(start)
 			s.recordMetrics(b.Name, result)
+			if result.Success {
+				builderSpan.SetAttributes(attribute.String("bundle_hash", result.BundleHash))
+			} else if result.Error != nil {
+				builderSpan.RecordError(result.Error)
+				builderSpan.SetStatus(codes.Error, "builder rejected bundle")
+			}
+			builderSpan.End()
 
 			resultCh <- result
 		}(builder)
@@ -135,11 +168,15 @@ func (s *Submitter) SubmitToAll(ctx context.Context, bundle *Bundle) []Submissio
 	results := make([]SubmissionResult, 0, len(s.builders))
 	for result := range resultCh {
 		if result.Success {
-			log.Printf("Bundle accepted by %s (hash: %s, latency: %v)",
-				result.Builder, result.BundleHash, result.Latency)
+			slog.Info("bundle accepted by builder",
+				"builder", result.Builder,
+				"bundle_hash", result.BundleHash,
+				"latency", result.Latency)
 		} else {
-			log.Printf("Bundle rejected by %s: %v (latency: %v)",
-				result.Builder, result.Error, result.Latency)
+			slog.Warn("bundle rejected by builder",
+				"builder", result.Builder,
+				"err", result.Error,
+				"latency", result.Latency)
 		}
 		results = append(results, result)
 	}
@@ -277,7 +314,9 @@ func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, 
 		BundleHash string `json:"bundleHash"`
 	}
 	if rpcResp.Result != nil {
-		_ = json.Unmarshal(rpcResp.Result, &result)
+		if err := json.Unmarshal(rpcResp.Result, &result); err != nil {
+			slog.Warn("builder returned unparseable result", "builder", builder.Name, "err", err, "raw", string(rpcResp.Result))
+		}
 	}
 
 	bundleHash := result.BundleHash
@@ -330,6 +369,8 @@ func (s *Submitter) recordMetrics(builder string, result SubmissionResult) {
 	latencyUs := result.Latency.Microseconds()
 	m.LastLatency.Store(latencyUs)
 	m.TotalLatency.Add(latencyUs)
+
+	recordBuilderResult(builder, result.Success, result.Latency)
 }
 
 // Metrics returns a snapshot of per-builder metrics.

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -19,9 +20,10 @@ import (
 )
 
 // Naming convention:
-//   aether_executor_* — executor-process-specific counters (bundle ops, risk)
-//   aether_*          — system-level spec metrics shared across processes
-//                       (latency, gas price, PnL, ETH balance)
+//
+//	aether_executor_* — executor-process-specific counters (bundle ops, risk)
+//	aether_*          — system-level spec metrics shared across processes
+//	                    (latency, gas price, PnL, ETH balance)
 var (
 	bundlesSubmitted = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aether_executor_bundles_submitted_total",
@@ -60,6 +62,27 @@ var (
 		Name: "aether_eth_balance",
 		Help: "Current ETH balance of the searcher wallet",
 	})
+	builderSubmissionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aether_executor_builder_submissions_total",
+		Help: "Per-builder bundle submission attempts by result",
+	}, []string{"builder", "result"})
+	builderLatencyMs = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "aether_executor_builder_latency_ms",
+		Help:    "Per-builder submission round-trip latency in ms",
+		Buckets: []float64{10, 25, 50, 100, 250, 500, 1000, 2000, 5000},
+	}, []string{"builder"})
+	systemStateGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "aether_system_state",
+		Help: "Current system state (0=Running, 1=Degraded, 2=Paused, 3=Halted)",
+	})
+	circuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "aether_circuit_breaker_trips_total",
+		Help: "Circuit breaker trip count by reason",
+	}, []string{"reason"})
+	shadowBundles = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aether_executor_shadow_bundles_total",
+		Help: "Bundles built+logged but not submitted (AETHER_SHADOW=1)",
+	})
 )
 
 func init() {
@@ -73,7 +96,16 @@ func init() {
 		gasPriceGwei,
 		dailyPnlEth,
 		ethBalanceGauge,
+		builderSubmissionsTotal,
+		builderLatencyMs,
+		systemStateGauge,
+		circuitBreakerTripsTotal,
+		shadowBundles,
 	)
+}
+
+func recordShadowBundle() {
+	shadowBundles.Inc()
 }
 
 func startMetricsServer() {
@@ -117,6 +149,36 @@ func recordBundleIncluded(profitWei *big.Int, gasGwei float64, gasUsed uint64) {
 
 func recordRiskRejection() {
 	riskRejections.Inc()
+}
+
+func recordBuilderResult(builder string, success bool, latency time.Duration) {
+	result := "failure"
+	if success {
+		result = "success"
+	}
+	builderSubmissionsTotal.WithLabelValues(builder, result).Inc()
+	builderLatencyMs.WithLabelValues(builder).Observe(float64(latency.Milliseconds()))
+}
+
+// PreRegisterBuilderLabels initialises the {builder, result} label pairs for
+// every configured builder to zero. Prometheus CounterVec does not emit a
+// time series until WithLabelValues is called, so without this step the
+// AetherBuilderDown alert (which requires both success and failure series to
+// exist) would never fire for a builder that has only ever failed. Calling
+// this at startup guarantees both series are observable from t=0.
+func PreRegisterBuilderLabels(names []string) {
+	for _, name := range names {
+		builderSubmissionsTotal.WithLabelValues(name, "success").Add(0)
+		builderSubmissionsTotal.WithLabelValues(name, "failure").Add(0)
+	}
+}
+
+func setSystemState(s int) {
+	systemStateGauge.Set(float64(s))
+}
+
+func recordCircuitBreakerTrip(reason string) {
+	circuitBreakerTripsTotal.WithLabelValues(reason).Inc()
 }
 
 func addBigIntCounter(counter prometheus.Counter, value *big.Int) {
@@ -199,7 +261,55 @@ func addPnl(profitWei *big.Int, gasCostWei float64) {
 
 // --- ETH balance watcher ---
 
-func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration) {
+// LiveBalance holds the most recent searcher ETH balance in a lock-free
+// readable form. balanceWatchLoop writes it on every successful poll;
+// processArb reads it on every inbound arb to feed the risk manager.
+//
+// Stored as the IEEE-754 bit representation of a float64 inside an
+// atomic.Uint64 so Get/Set are single atomic ops with no mutex contention on
+// the hot path.
+type LiveBalance struct {
+	bits atomic.Uint64
+}
+
+func NewLiveBalance() *LiveBalance {
+	return &LiveBalance{}
+}
+
+func (b *LiveBalance) Get() float64 {
+	return math.Float64frombits(b.bits.Load())
+}
+
+func (b *LiveBalance) Set(v float64) {
+	b.bits.Store(math.Float64bits(v))
+}
+
+// fetchAndStoreBalance does a single eth_getBalance call, updates both the
+// Prometheus gauge and the shared LiveBalance, and returns any error from
+// the RPC. Used at startup to seed the balance before the first arb and
+// inside balanceWatchLoop to refresh it periodically.
+func fetchAndStoreBalance(ctx context.Context, client *ethclient.Client, addr common.Address, live *LiveBalance) error {
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	bal, err := client.BalanceAt(fetchCtx, addr, nil)
+	if err != nil {
+		return err
+	}
+	ethVal, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(bal),
+		new(big.Float).SetFloat64(1e18),
+	).Float64()
+	ethBalanceGauge.Set(ethVal)
+	if live != nil {
+		live.Set(ethVal)
+	}
+	return nil
+}
+
+// balanceWatchLoop periodically refreshes the searcher's ETH balance. rpcURL
+// is used only to strip the embedded API key from logged errors (Alchemy /
+// QuickNode / Infura all put the key in the URL path).
+func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common.Address, interval time.Duration, live *LiveBalance, rpcURL string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -207,18 +317,9 @@ func balanceWatchLoop(ctx context.Context, client *ethclient.Client, addr common
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			bal, err := client.BalanceAt(fetchCtx, addr, nil)
-			cancel()
-			if err != nil {
-				log.Printf("WARNING: eth_getBalance failed: %v", err)
-				continue
+			if err := fetchAndStoreBalance(ctx, client, addr, live); err != nil {
+				log.Printf("WARNING: eth_getBalance failed: %v", redactRPCError(err, rpcURL))
 			}
-			ethVal, _ := new(big.Float).Quo(
-				new(big.Float).SetInt(bal),
-				new(big.Float).SetFloat64(1e18),
-			).Float64()
-			ethBalanceGauge.Set(ethVal)
 		}
 	}
 }

@@ -4,12 +4,24 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
 )
+
+// decodeStrictYAML unmarshals YAML with unknown-key rejection enabled so typos
+// like `expected_chainid:` surface as a decoder error instead of silently
+// leaving the typed field at its zero value.
+func decodeStrictYAML(data []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	return dec.Decode(out)
+}
 
 // ConfigDir returns the config directory path.
 // Uses AETHER_CONFIG_DIR env var, falls back to "./config".
@@ -222,6 +234,68 @@ type NodeEntry struct {
 type NodesFileConfig struct {
 	Nodes           []NodeEntry `yaml:"nodes"`
 	MinHealthyNodes int         `yaml:"min_healthy_nodes"`
+}
+
+// ---------------------------------------------------------------------------
+// Executor config (config/executor.yaml)
+// ---------------------------------------------------------------------------
+
+// ExecutorFileConfig maps the executor.yaml file structure.
+type ExecutorFileConfig struct {
+	ExecutorAddress string `yaml:"executor_address"`
+	ExpectedChainID int64  `yaml:"expected_chain_id"`
+}
+
+// LoadExecutorConfig reads and parses an executor YAML config file.
+// Environment variables in ${VAR} format are expanded before parsing,
+// so AETHER_EXECUTOR_ADDRESS can be injected via the yaml itself.
+func LoadExecutorConfig(path string) (ExecutorFileConfig, error) {
+	var cfg ExecutorFileConfig
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("read executor config %s: %w", path, err)
+	}
+
+	data = expandEnvVars(data)
+
+	if err := decodeStrictYAML(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse executor config %s: %w", path, err)
+	}
+
+	// Normalize whitespace before validation so downstream consumers and log
+	// sites see the clean address without padding.
+	cfg.ExecutorAddress = strings.TrimSpace(cfg.ExecutorAddress)
+
+	if err := ValidateExecutorConfig(cfg); err != nil {
+		return cfg, fmt.Errorf("validate executor config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// ValidateExecutorConfig ensures required fields are present and well-formed.
+// Address syntax is validated here; on-chain bytecode check happens at runtime
+// against the connected Ethereum node.
+func ValidateExecutorConfig(cfg ExecutorFileConfig) error {
+	addr := strings.TrimSpace(cfg.ExecutorAddress)
+	if addr == "" {
+		return fmt.Errorf("executor_address must not be empty")
+	}
+	// Require the 0x prefix explicitly; common.IsHexAddress accepts bare 40-
+	// char hex too, but the YAML contract here is always 0x-prefixed.
+	// IsHexAddress catches wrong length and non-hex characters — defense-in-
+	// depth on top of the runtime eth_getCode check.
+	if !strings.HasPrefix(addr, "0x") || !common.IsHexAddress(addr) {
+		return fmt.Errorf("executor_address must be a 0x-prefixed 20-byte hex string, got %q", addr)
+	}
+	if common.HexToAddress(addr) == (common.Address{}) {
+		return fmt.Errorf("executor_address must not be the zero address")
+	}
+	if cfg.ExpectedChainID <= 0 {
+		return fmt.Errorf("expected_chain_id must be > 0, got %d", cfg.ExpectedChainID)
+	}
+	return nil
 }
 
 // expandEnvVars replaces ${VAR} patterns in the input with their

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -13,13 +12,13 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 
 mod engine;
-mod metrics;
 mod pipeline;
 mod service;
+mod tracing_init;
 
 use aether_grpc_server::provider::{ProviderConfig, RpcProvider};
+use aether_grpc_server::{start_metrics_server, EngineMetrics};
 use engine::{AetherEngine, EngineConfig};
-use metrics::{start_metrics_server, EngineMetrics};
 use service::aether_proto::arb_service_server::ArbServiceServer;
 use service::aether_proto::control_service_server::ControlServiceServer;
 use service::aether_proto::health_service_server::HealthServiceServer;
@@ -31,13 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // up ETH_RPC_URL, ALCHEMY_API_KEY, etc. Silently ignored if .env is missing.
     let _ = dotenvy::dotenv();
 
-    // Initialize structured logging with tracing.
-    // Respects RUST_LOG env var; defaults to `info` level.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // Initialise logging + optional OTLP span export to Tempo.
+    // RUST_LOG controls level (default info), LOG_FORMAT=json picks the JSON
+    // fmt layer, OTEL_EXPORTER_OTLP_ENDPOINT (when set) wires the span exporter.
+    let _tracing_guard = tracing_init::init();
 
     info!("Starting Aether gRPC server");
 
@@ -95,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = Arc::new(RpcProvider::new(
         provider_config,
         Arc::clone(engine.event_channels()),
+        Arc::clone(&metrics),
     ));
 
     // Shutdown coordination via watch channel.

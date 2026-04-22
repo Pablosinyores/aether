@@ -11,7 +11,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -85,7 +85,7 @@ func NewPoolDiscoverer(rpcURL string, limit int) *PoolDiscoverer {
 // In production this would make real eth_call RPC requests to factory contracts.
 // Currently returns well-known high-liquidity pools for the configured protocols.
 func (pd *PoolDiscoverer) DiscoverPools() ([]PoolEntry, error) {
-	log.Printf("Discovering pools from %s (limit: %d)", pd.rpcURL, pd.limit)
+	slog.Info("discovering pools", "rpc_url", pd.rpcURL, "limit", pd.limit)
 
 	var allPools []PoolEntry
 
@@ -93,7 +93,7 @@ func (pd *PoolDiscoverer) DiscoverPools() ([]PoolEntry, error) {
 	for _, factory := range pd.factories {
 		pools, err := pd.discoverV2Pools(factory)
 		if err != nil {
-			log.Printf("Warning: failed to discover %s pools: %v", factory.Name, err)
+			slog.Warn("failed to discover pools", "factory", factory.Name, "err", err)
 			continue
 		}
 		allPools = append(allPools, pools...)
@@ -102,7 +102,7 @@ func (pd *PoolDiscoverer) DiscoverPools() ([]PoolEntry, error) {
 	// Discover UniswapV3 pools (different factory interface, multiple fee tiers)
 	v3Pools, err := pd.discoverV3Pools()
 	if err != nil {
-		log.Printf("Warning: failed to discover Uniswap V3 pools: %v", err)
+		slog.Warn("failed to discover pools", "factory", "Uniswap V3", "err", err)
 	} else {
 		allPools = append(allPools, v3Pools...)
 	}
@@ -115,7 +115,7 @@ func (pd *PoolDiscoverer) DiscoverPools() ([]PoolEntry, error) {
 		filtered = filtered[:pd.limit]
 	}
 
-	log.Printf("Discovered %d pools total, %d after filtering", len(allPools), len(filtered))
+	slog.Info("pool discovery complete", "total", len(allPools), "filtered", len(filtered))
 	return filtered, nil
 }
 
@@ -124,7 +124,7 @@ func (pd *PoolDiscoverer) DiscoverPools() ([]PoolEntry, error) {
 // then token0() and token1() on each pair contract.
 // Currently: returns well-known high-liquidity pairs for this protocol.
 func (pd *PoolDiscoverer) discoverV2Pools(factory FactoryConfig) ([]PoolEntry, error) {
-	log.Printf("Querying %s factory at %s", factory.Name, factory.Address)
+	slog.Info("querying factory", "factory", factory.Name, "addr", factory.Address)
 
 	// In production, this would be:
 	// 1. Call factory.allPairsLength() to get total count
@@ -142,7 +142,7 @@ func (pd *PoolDiscoverer) discoverV2Pools(factory FactoryConfig) ([]PoolEntry, e
 // getPool(token0, token1, fee) for known token pairs and fee tiers.
 // Currently: returns well-known V3 pools.
 func (pd *PoolDiscoverer) discoverV3Pools() ([]PoolEntry, error) {
-	log.Printf("Querying Uniswap V3 factory at %s", UniswapV3FactoryAddr)
+	slog.Info("querying factory", "factory", "Uniswap V3", "addr", UniswapV3FactoryAddr)
 
 	// V3 fee tiers: 100 (0.01%), 500 (0.05%), 3000 (0.30%), 10000 (1.00%)
 	// In production, this would query PoolCreated events or call getPool()
@@ -274,6 +274,8 @@ func FormatTOML(pools []PoolEntry) string {
 }
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	rpcURL := flag.String("rpc-url", "", "Ethereum JSON-RPC endpoint URL")
 	output := flag.String("output", "config/pools.toml", "Output file path for pools.toml")
 	limit := flag.Int("limit", 100, "Maximum number of pools to discover")
@@ -284,31 +286,31 @@ func main() {
 		*rpcURL = os.Getenv("ETH_RPC_URL")
 	}
 	if *rpcURL == "" {
-		log.Println("Warning: no --rpc-url or ETH_RPC_URL set, using simulated discovery")
+		slog.Warn("no --rpc-url or ETH_RPC_URL set, using simulated discovery")
 		*rpcURL = "simulated"
 	}
 
 	fmt.Println("aether-pooldiscovery: DEX pool discovery utility")
-	log.Printf("RPC URL: %s", *rpcURL)
-	log.Printf("Output: %s", *output)
-	log.Printf("Limit: %d", *limit)
+	slog.Info("pool discovery starting", "rpc_url", *rpcURL, "output", *output, "limit", *limit)
 
 	discoverer := NewPoolDiscoverer(*rpcURL, *limit)
 	pools, err := discoverer.DiscoverPools()
 	if err != nil {
-		log.Fatalf("Pool discovery failed: %v", err)
+		slog.Error("pool discovery failed", "err", err)
+		os.Exit(1)
 	}
 
 	if len(pools) == 0 {
-		log.Println("No pools discovered")
+		slog.Info("no pools discovered")
 		return
 	}
 
 	toml := FormatTOML(pools)
 
 	if err := os.WriteFile(*output, []byte(toml), 0644); err != nil {
-		log.Fatalf("Failed to write %s: %v", *output, err)
+		slog.Error("failed to write output file", "path", *output, "err", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Wrote %d pools to %s", len(pools), *output)
+	slog.Info("wrote pools", "count", len(pools), "path", *output)
 }

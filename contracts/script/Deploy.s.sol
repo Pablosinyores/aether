@@ -20,8 +20,8 @@ contract DeployAetherExecutor is Script {
         console.log("AetherExecutor deployed at:", address(executor));
         console.log("Owner:", executor.owner());
         console.log("Aave Pool:", executor.aavePool());
-        console.log("Balancer Vault:", executor.balancerVault());
-        console.log("Bancor Network:", executor.bancorNetwork());
+        console.log("Balancer Vault:", executor.protocolRouter(5)); // BALANCER_V2
+        console.log("Bancor Network:", executor.protocolRouter(6)); // BANCOR_V3
 
         return executor;
     }
