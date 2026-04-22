@@ -5,7 +5,7 @@ export default withMermaid(
   defineConfig({
     title: 'Aether',
     description: 'Production-grade cross-DEX arbitrage engine for Ethereum Mainnet',
-    base: '/aether/',
+    base: '/',
 
     head: [
       ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
