@@ -4,11 +4,56 @@ The Rust core handles all latency-critical work — from ingesting Ethereum even
 
 ## Crate Dependency Graph
 
-```
-common ← ingestion ← pools ← state ← detector ← simulator ← grpc-server
+```mermaid
+graph LR
+    COMMON["common<br/><i>shared types</i>"]
+    INGEST["ingestion<br/><i>WS + ABI decode</i>"]
+    POOLS["pools<br/><i>6 DEX adapters</i>"]
+    STATE["state<br/><i>price graph, MVCC</i>"]
+    DETECT["detector<br/><i>SPFA Bellman-Ford</i>"]
+    SIM["simulator<br/><i>revm fork</i>"]
+    GRPC["grpc-server<br/><i>binary entrypoint</i>"]
+
+    COMMON --> INGEST --> POOLS --> STATE --> DETECT --> SIM --> GRPC
+    COMMON --> POOLS
+    COMMON --> STATE
+    COMMON --> DETECT
+    COMMON --> SIM
+    COMMON --> GRPC
+
+    style COMMON fill:#15151c,stroke:#888,stroke-width:1px,color:#fff
+    style INGEST fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style POOLS fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style STATE fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style DETECT fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style SIM fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style GRPC fill:#1a1815,stroke:#f5a623,stroke-width:2px,color:#fff
 ```
 
-`grpc-server` is the binary entry point that wires everything together.
+`grpc-server` is the binary entry point that wires everything together. `common` is a leaf dependency used by every other crate.
+
+## Hot Path — Per-Event Flow
+
+```mermaid
+flowchart LR
+    NODE([Eth Node<br/>WS / IPC])
+    ING["Ingestion<br/><i>ABI decode &lt;200ns</i>"]
+    POOL["Pool Registry<br/><i>update reserves</i>"]
+    STATE["Price Graph<br/><i>mark dirty edges</i>"]
+    DET["Detector<br/><i>SPFA &lt;3ms</i>"]
+    SIM["Simulator<br/><i>revm fork &lt;5ms</i>"]
+    GRPC([gRPC / UDS])
+
+    NODE --> ING --> POOL --> STATE --> DET --> SIM --> GRPC
+
+    style NODE fill:#15151c,stroke:#888,color:#fff
+    style ING fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style POOL fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style STATE fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style DET fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style SIM fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style GRPC fill:#1a1815,stroke:#f5a623,stroke-width:2px,color:#fff
+```
 
 ## `crates/common/` — Shared Types
 
@@ -154,6 +199,42 @@ The detection engine uses a modified Bellman-Ford algorithm — specifically the
 - Detects negative cycles by checking if a node is relaxed N times (where N = number of nodes)
 - **Early exit** on first negative cycle found
 - Only scans the subgraph affected by recent state updates (dirty nodes)
+
+```mermaid
+flowchart TB
+    START([state update arrives])
+    DIRTY{"dirty subgraph<br/>non-empty?"}
+    INIT["initialize dist[v] = 0 for each dirty node<br/>enqueue dirty nodes"]
+    POP["pop node u from deque<br/>(front if SLF short-label)"]
+    RELAX["for each edge u→v:<br/>new = dist[u] + weight(u,v)"]
+    IMPROVED{"new &lt; dist[v]?"}
+    COUNT{"relaxed ≥ N times?<br/>(N = node count)"}
+    CYCLE["negative cycle found<br/>→ extract hop sequence"]
+    PUSH["dist[v] = new<br/>enqueue v"]
+    EMPTY{"deque empty?"}
+    DONE([return top-K arbs])
+    OPT["ternary search optimal input<br/>estimate gas cost<br/>compute net profit"]
+
+    START --> DIRTY
+    DIRTY -->|no| DONE
+    DIRTY -->|yes| INIT
+    INIT --> POP
+    POP --> RELAX
+    RELAX --> IMPROVED
+    IMPROVED -->|no| EMPTY
+    IMPROVED -->|yes| COUNT
+    COUNT -->|yes| CYCLE
+    COUNT -->|no| PUSH
+    PUSH --> EMPTY
+    EMPTY -->|no| POP
+    EMPTY -->|yes| DONE
+    CYCLE --> OPT
+    OPT --> DONE
+
+    style CYCLE fill:#1a3520,stroke:#5ce6c7,stroke-width:2px,color:#fff
+    style DONE fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style START fill:#15151c,stroke:#888,color:#fff
+```
 
 ### Input Optimizer
 

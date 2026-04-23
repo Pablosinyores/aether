@@ -29,6 +29,58 @@ service ArbService {
 
 **`StreamArbs`** — Server-side streaming. Go subscribes to a stream of opportunities from Rust, optionally filtered by minimum profit threshold.
 
+#### SubmitArb — call sequence
+
+```mermaid
+sequenceDiagram
+    participant Rust as Rust (grpc-server)
+    participant Go as Go (executor)
+    participant Risk as Risk Manager
+    participant Builder as Block Builders
+
+    Rust->>Go: SubmitArb(ValidatedArb)
+    activate Go
+    Go->>Risk: PreflightCheck
+    alt breaker tripped
+        Risk-->>Go: REJECTED
+        Go-->>Rust: SubmitArbResponse{accepted=false, reason}
+    else allowed
+        Risk-->>Go: OK
+        Go->>Go: build bundle (arb_tx + tip_tx)
+        Go->>Go: sign with searcher key
+        par fan-out
+            Go->>Builder: eth_sendBundle (Flashbots)
+        and
+            Go->>Builder: eth_sendBundle (Titan)
+        and
+            Go->>Builder: eth_sendBundle (Beaver)
+        end
+        Go-->>Rust: SubmitArbResponse{accepted=true, bundle_hash}
+    end
+    deactivate Go
+```
+
+#### StreamArbs — server-side stream
+
+```mermaid
+sequenceDiagram
+    participant Go as Go (executor)
+    participant Rust as Rust (grpc-server)
+    participant Det as Detector
+
+    Go->>Rust: StreamArbs(min_profit_eth)
+    activate Rust
+    loop per detection cycle
+        Det->>Rust: new ArbOpportunity
+        alt profit ≥ min_profit
+            Rust-->>Go: ValidatedArb chunk
+        else below threshold
+            Note over Rust: filtered out
+        end
+    end
+    deactivate Rust
+```
+
 ### HealthService
 
 Health checks from Go to Rust.
@@ -84,6 +136,27 @@ enum SystemState {
     PAUSED = 3;
     HALTED = 4;
 }
+```
+
+#### State transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> DEGRADED: node latency >500ms
+    RUNNING --> PAUSED: 3 consecutive reverts / 10m
+    RUNNING --> HALTED: gas >300gwei<br/>daily loss >0.5 ETH<br/>balance <0.1 ETH
+    DEGRADED --> RUNNING: latency recovers
+    DEGRADED --> HALTED: breaker trips
+    PAUSED --> RUNNING: manual resume
+    PAUSED --> HALTED: further failures
+    HALTED --> RUNNING: manual reset only
+    HALTED --> [*]: operator shutdown
+
+    note right of HALTED
+        terminal until manual reset
+        no automatic recovery
+    end note
 ```
 
 ## Messages

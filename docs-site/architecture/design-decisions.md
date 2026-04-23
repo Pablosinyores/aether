@@ -52,6 +52,36 @@ SLF further optimizes by inserting nodes with shorter labels at the front of the
 
 **Tradeoff:** Higher memory usage (multiple graph versions in flight). In practice, only 2-3 versions exist simultaneously, and the graph is small enough (~5K nodes, ~20K edges) that this is negligible.
 
+```mermaid
+sequenceDiagram
+    participant W as Writer (Ingestion)
+    participant A as ArcSwap
+    participant R1 as Reader A (Detector)
+    participant R2 as Reader B (Simulator)
+
+    Note over A: v1 active
+
+    R1->>A: load()
+    A-->>R1: Arc<v1>
+    activate R1
+
+    W->>W: clone v1 → mutate → v2
+    W->>A: store(v2)
+    Note over A: v2 active
+    Note over R1: still holds v1<br/>no block
+
+    R2->>A: load()
+    A-->>R2: Arc<v2>
+    activate R2
+
+    R1-->>R1: release Arc<v1>
+    deactivate R1
+    Note over A: v1 dropped<br/>(refcount 0)
+
+    R2-->>R2: release Arc<v2>
+    deactivate R2
+```
+
 ## Flash Loan Execution (Zero Capital at Risk)
 
 **Decision:** All arbitrage trades use Aave V3 flash loans. The bot holds no trading capital.
@@ -62,6 +92,29 @@ SLF further optimizes by inserting nodes with shorter labels at the front of the
 3. **Larger trade sizes** — Can execute trades up to the flash loan pool depth (millions of dollars), far more than any capital the bot could hold.
 
 **Tradeoff:** Flash loan premium (0.05% on Aave V3) reduces profit margins. For most arbitrage opportunities, this is negligible compared to the profit.
+
+```mermaid
+sequenceDiagram
+    participant EOA as Searcher EOA
+    participant Exec as AetherExecutor
+    participant Aave as Aave V3
+    participant DEX as DEX Pools
+
+    EOA->>Exec: executeArb(steps, token, amount)
+    Exec->>Aave: flashLoanSimple(amount)
+    Aave->>Exec: transfer + executeOperation()
+    loop each swap step
+        Exec->>DEX: swap
+        DEX-->>Exec: amountOut
+    end
+    Note over Exec: check profit ≥ minProfitOut
+    alt profitable
+        Exec->>Aave: approve + repay (amount + premium)
+        Exec->>EOA: transfer profit
+    else slippage / unprofitable
+        Exec-->>Aave: revert — full rollback, zero capital lost
+    end
+```
 
 ## Multi-Builder Bundle Submission
 
