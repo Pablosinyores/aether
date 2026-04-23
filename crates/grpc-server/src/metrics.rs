@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -15,7 +17,7 @@ pub struct EngineMetrics {
     simulations_run: IntCounter,
     arbs_published: IntCounter,
     blocks_processed: IntCounter,
-    decode_errors: IntCounter,
+    decode_errors: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -58,11 +60,14 @@ impl EngineMetrics {
             "Total blocks processed",
         )
         .expect("aether_blocks_processed_total counter");
-        let decode_errors = IntCounter::new(
-            "aether_decode_errors_total",
-            "Total logs the event decoder could not parse",
+        let decode_errors = IntCounterVec::new(
+            Opts::new(
+                "aether_decode_errors_total",
+                "Total logs the event decoder could not parse, labelled by reason",
+            ),
+            &["reason"],
         )
-        .expect("aether_decode_errors_total counter");
+        .expect("aether_decode_errors_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -130,8 +135,11 @@ impl EngineMetrics {
         self.blocks_processed.inc();
     }
 
-    pub fn inc_decode_errors(&self) {
-        self.decode_errors.inc();
+    /// Bump `aether_decode_errors_total{reason="..."}` for the given reason.
+    /// Labels come from `DecodeReason::as_str()` so the label set stays
+    /// stable and enumerable for dashboards / alerts.
+    pub fn inc_decode_errors(&self, reason: &str) {
+        self.decode_errors.with_label_values(&[reason]).inc();
     }
 
     /// Render the registered metrics in Prometheus text exposition format.
@@ -247,7 +255,9 @@ mod tests {
         metrics.inc_simulations_run(3);
         metrics.inc_arbs_published(4);
         metrics.inc_blocks_processed();
-        metrics.inc_decode_errors();
+        metrics.inc_decode_errors("unknown_topic");
+        metrics.inc_decode_errors("malformed_payload");
+        metrics.inc_decode_errors("insufficient_topics");
 
         let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
 
@@ -272,6 +282,8 @@ mod tests {
         assert!(output.contains("aether_simulations_run_total 3"));
         assert!(output.contains("aether_arbs_published_total 4"));
         assert!(output.contains("aether_blocks_processed_total 1"));
-        assert!(output.contains("aether_decode_errors_total 1"));
+        assert!(output.contains(r#"aether_decode_errors_total{reason="unknown_topic"} 1"#));
+        assert!(output.contains(r#"aether_decode_errors_total{reason="malformed_payload"} 1"#));
+        assert!(output.contains(r#"aether_decode_errors_total{reason="insufficient_topics"} 1"#));
     }
 }

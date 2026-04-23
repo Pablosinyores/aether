@@ -110,16 +110,45 @@ impl EventSignatures {
     }
 }
 
-/// Decode a raw log into a PoolEvent
-/// Returns None if the log doesn't match any known event
+/// Reason a log failed to decode. Surfaced as the `reason` label on
+/// `aether_decode_errors_total` so ops can alert on malformed payloads
+/// (real bug) without drowning in benign unknown-topic noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeReason {
+    /// topic0 didn't match any known event signature (or topics was empty).
+    /// Expected to be high-volume in discovery mode.
+    UnknownTopic,
+    /// Payload length check failed in a known-event decoder — data-integrity
+    /// signal worth paging on.
+    MalformedPayload,
+    /// Fewer topics than the known-event decoder requires (e.g. PairCreated
+    /// short-path). Indicates an upstream / node-side producer bug.
+    InsufficientTopics,
+}
+
+impl DecodeReason {
+    /// Stable label value for Prometheus.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecodeReason::UnknownTopic => "unknown_topic",
+            DecodeReason::MalformedPayload => "malformed_payload",
+            DecodeReason::InsufficientTopics => "insufficient_topics",
+        }
+    }
+}
+
+/// Decode a raw log into a PoolEvent.
+///
+/// On failure the `DecodeReason` is propagated so callers can bump the
+/// appropriate Prometheus label — see `aether_decode_errors_total`.
 pub fn decode_log(
     topics: &[B256],
     data: &[u8],
     source_address: Address,
     protocol_hint: Option<ProtocolType>,
-) -> Option<PoolEvent> {
+) -> Result<PoolEvent, DecodeReason> {
     if topics.is_empty() {
-        return None;
+        return Err(DecodeReason::UnknownTopic);
     }
 
     let topic0 = topics[0];
@@ -135,18 +164,21 @@ pub fn decode_log(
     } else if topic0 == EventSignatures::pair_created_topic() {
         decode_pair_created(topics, data)
     } else {
-        None
+        Err(DecodeReason::UnknownTopic)
     }
 }
 
-fn decode_swap_v2(topics: &[B256], data: &[u8], pool: Address) -> Option<PoolEvent> {
+fn decode_swap_v2(topics: &[B256], data: &[u8], pool: Address) -> Result<PoolEvent, DecodeReason> {
     // V2 Swap(address indexed sender, uint256 amount0In, uint256 amount1In,
     //        uint256 amount0Out, uint256 amount1Out, address indexed to)
     //
     // topics: [topic0, sender (indexed), to (indexed)]
     // data:   4 × 32-byte words — amount0In | amount1In | amount0Out | amount1Out
-    if topics.len() < 3 || data.len() < 128 {
-        return None;
+    if topics.len() < 3 {
+        return Err(DecodeReason::InsufficientTopics);
+    }
+    if data.len() < 128 {
+        return Err(DecodeReason::MalformedPayload);
     }
 
     let sender = Address::from_slice(&topics[1].as_slice()[12..]);
@@ -163,7 +195,7 @@ fn decode_swap_v2(topics: &[B256], data: &[u8], pool: Address) -> Option<PoolEve
         "V2 Swap decoded"
     );
 
-    Some(PoolEvent::V2Swap {
+    Ok(PoolEvent::V2Swap {
         pool,
         sender,
         to,
@@ -178,9 +210,9 @@ fn decode_sync(
     data: &[u8],
     pool: Address,
     protocol_hint: Option<ProtocolType>,
-) -> Option<PoolEvent> {
+) -> Result<PoolEvent, DecodeReason> {
     if data.len() < 64 {
-        return None;
+        return Err(DecodeReason::MalformedPayload);
     }
     let reserve0 = U256::from_be_slice(&data[0..32]);
     let reserve1 = U256::from_be_slice(&data[32..64]);
@@ -188,7 +220,7 @@ fn decode_sync(
 
     trace!(pool = %pool, r0 = %reserve0, r1 = %reserve1, "Sync event decoded");
 
-    Some(PoolEvent::ReserveUpdate {
+    Ok(PoolEvent::ReserveUpdate {
         pool,
         protocol,
         reserve0,
@@ -196,9 +228,9 @@ fn decode_sync(
     })
 }
 
-fn decode_swap_v3(topics: &[B256], data: &[u8], pool: Address) -> Option<PoolEvent> {
+fn decode_swap_v3(topics: &[B256], data: &[u8], pool: Address) -> Result<PoolEvent, DecodeReason> {
     if data.len() < 160 {
-        return None;
+        return Err(DecodeReason::MalformedPayload);
     }
     // amount0: int256 (bytes 0-32)
     // amount1: int256 (bytes 32-64)
@@ -230,7 +262,7 @@ fn decode_swap_v3(topics: &[B256], data: &[u8], pool: Address) -> Option<PoolEve
         "V3 Swap decoded"
     );
 
-    Some(PoolEvent::V3Update {
+    Ok(PoolEvent::V3Update {
         pool,
         sqrt_price_x96,
         liquidity,
@@ -242,11 +274,11 @@ fn decode_token_exchange(
     topics: &[B256],
     _data: &[u8],
     pool: Address,
-) -> Option<PoolEvent> {
+) -> Result<PoolEvent, DecodeReason> {
     // Curve events update reserves; we'd need to query on-chain for new balances
     // For now, emit a generic reserve update that triggers a state refresh
     let _ = topics;
-    Some(PoolEvent::ReserveUpdate {
+    Ok(PoolEvent::ReserveUpdate {
         pool,
         protocol: ProtocolType::Curve,
         reserve0: U256::ZERO, // Will be refreshed from on-chain
@@ -254,15 +286,18 @@ fn decode_token_exchange(
     })
 }
 
-fn decode_pair_created(topics: &[B256], data: &[u8]) -> Option<PoolEvent> {
-    if topics.len() < 3 || data.len() < 64 {
-        return None;
+fn decode_pair_created(topics: &[B256], data: &[u8]) -> Result<PoolEvent, DecodeReason> {
+    if topics.len() < 3 {
+        return Err(DecodeReason::InsufficientTopics);
+    }
+    if data.len() < 64 {
+        return Err(DecodeReason::MalformedPayload);
     }
     let token0 = Address::from_slice(&topics[1].as_slice()[12..]);
     let token1 = Address::from_slice(&topics[2].as_slice()[12..]);
     let pool = Address::from_slice(&data[12..32]);
 
-    Some(PoolEvent::PoolCreated {
+    Ok(PoolEvent::PoolCreated {
         token0,
         token1,
         pool,
@@ -316,7 +351,7 @@ mod tests {
         let topics = vec![EventSignatures::sync_topic()];
 
         let event = decode_log(&topics, &data, pool_addr, None);
-        assert!(event.is_some());
+        assert!(event.is_ok());
 
         let got = event.unwrap();
         let PoolEvent::ReserveUpdate {
@@ -360,7 +395,7 @@ mod tests {
         // Only 32 bytes instead of 64
         let data = vec![0u8; 32];
         let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert!(event.is_err());
     }
 
     // ── V2 Swap event decode tests ──
@@ -397,7 +432,7 @@ mod tests {
         data.extend_from_slice(&u256_to_be_bytes(amount1_out));
 
         let event = decode_log(&topics, &data, pool_addr, None);
-        assert!(event.is_some(), "V2 Swap must decode, not fall through");
+        assert!(event.is_ok(), "V2 Swap must decode, not fall through");
 
         match event.unwrap() {
             PoolEvent::V2Swap {
@@ -429,7 +464,10 @@ mod tests {
             // missing `to` topic
         ];
         let data = vec![0u8; 128];
-        assert!(decode_log(&topics, &data, Address::ZERO, None).is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::InsufficientTopics
+        );
     }
 
     #[test]
@@ -441,7 +479,10 @@ mod tests {
         ];
         // 96 bytes instead of 128
         let data = vec![0u8; 96];
-        assert!(decode_log(&topics, &data, Address::ZERO, None).is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::MalformedPayload
+        );
     }
 
     // ── V3 Swap event decode tests ──
@@ -482,7 +523,7 @@ mod tests {
         ];
 
         let event = decode_log(&topics, &data, pool_addr, None);
-        assert!(event.is_some());
+        assert!(event.is_ok());
 
         let got = event.unwrap();
         let PoolEvent::V3Update {
@@ -540,7 +581,7 @@ mod tests {
         // Only 128 bytes instead of 160
         let data = vec![0u8; 128];
         let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert!(event.is_err());
     }
 
     // ── TokenExchange (Curve) decode tests ──
@@ -555,7 +596,7 @@ mod tests {
         let data = vec![0u8; 128]; // sold_id, tokens_sold, bought_id, tokens_bought
 
         let event = decode_log(&topics, &data, pool_addr, None);
-        assert!(event.is_some());
+        assert!(event.is_ok());
 
         let got = event.unwrap();
         let PoolEvent::ReserveUpdate {
@@ -604,7 +645,7 @@ mod tests {
         ];
 
         let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_some());
+        assert!(event.is_ok());
 
         let got = event.unwrap();
         let PoolEvent::PoolCreated {
@@ -628,8 +669,10 @@ mod tests {
             // Missing third topic
         ];
         let data = vec![0u8; 64];
-        let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::InsufficientTopics
+        );
     }
 
     #[test]
@@ -641,28 +684,66 @@ mod tests {
         ];
         // Only 32 bytes instead of 64
         let data = vec![0u8; 32];
-        let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::MalformedPayload
+        );
     }
 
     // ── Unknown event tests ──
 
     #[test]
-    fn test_decode_unknown_event_returns_none() {
+    fn test_decode_unknown_event_returns_unknown_topic() {
         let unknown_topic = B256::from([0xABu8; 32]);
         let topics = vec![unknown_topic];
         let data = vec![0u8; 64];
 
-        let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::UnknownTopic
+        );
     }
 
     #[test]
-    fn test_decode_empty_topics_returns_none() {
+    fn test_decode_empty_topics_returns_unknown_topic() {
         let topics: Vec<B256> = vec![];
         let data = vec![0u8; 64];
 
-        let event = decode_log(&topics, &data, Address::ZERO, None);
-        assert!(event.is_none());
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::UnknownTopic
+        );
+    }
+
+    #[test]
+    fn test_decode_sync_malformed_payload() {
+        // Sync requires 64-byte payload (2 × U256). Give 32 bytes.
+        let topics = vec![EventSignatures::sync_topic()];
+        let data = vec![0u8; 32];
+
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::MalformedPayload
+        );
+    }
+
+    #[test]
+    fn test_decode_v3_swap_malformed_payload() {
+        let topics = vec![EventSignatures::swap_v3_topic()];
+        let data = vec![0u8; 96]; // V3 needs 160 bytes
+
+        assert_eq!(
+            decode_log(&topics, &data, Address::ZERO, None).unwrap_err(),
+            DecodeReason::MalformedPayload
+        );
+    }
+
+    #[test]
+    fn test_decode_reason_label_strings() {
+        // Guard the Prometheus label contract — these strings are baked into
+        // dashboards and alerts.
+        assert_eq!(DecodeReason::UnknownTopic.as_str(), "unknown_topic");
+        assert_eq!(DecodeReason::MalformedPayload.as_str(), "malformed_payload");
+        assert_eq!(DecodeReason::InsufficientTopics.as_str(), "insufficient_topics");
     }
 }
