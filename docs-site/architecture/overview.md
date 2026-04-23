@@ -169,6 +169,25 @@ EIP-1559 transactions constructed and signed (arb_tx + tip_tx)
   </TimelineItem>
 </Timeline>
 
+### End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    participant Node as Eth Node
+    participant Rust as Rust Core
+    participant Go as Go Executor
+    participant B as Builders
+
+    Node->>Rust: Swap / Sync log
+    Note over Rust: decode + state update (<1ms)
+    Note over Rust: Bellman-Ford SPFA (<3ms)
+    Note over Rust: revm fork + execute (<5ms)
+    Rust->>Go: ValidatedArb via gRPC/UDS
+    Note over Go: risk preflight + build + sign (<3ms)
+    Go->>B: eth_sendBundle fan-out
+    Note over B: Flashbots · Titan · Beaver · rsync
+```
+
 ## Inter-Service Communication
 
 Rust and Go communicate via **gRPC over Unix Domain Sockets** — sub-microsecond transport.

@@ -14,28 +14,18 @@ The `AetherExecutor.sol` contract is the on-chain component that receives flash 
 sequenceDiagram
     participant EOA as Searcher EOA
     participant EX as AetherExecutor
-    participant AAVE as Aave V3 Pool
-    participant DEX1 as DEX Pool 1
-    participant DEX2 as DEX Pool 2
-    participant DEXN as DEX Pool N
+    participant AAVE as Aave V3
+    participant DEX as DEX Pools
 
-    EOA->>EX: executeArb(steps, token, amount, deadline, minProfitOut, tipBps)
+    EOA->>EX: executeArb(steps, token, amount, ...)
     EX->>AAVE: flashLoanSimple(token, amount)
-    AAVE->>EX: Transfer loan amount
-    AAVE->>EX: executeOperation() callback
-
-    rect rgba(149, 128, 255, 0.08)
-        Note over EX,DEXN: Swap Loop
-        EX->>DEX1: _executeSwap(step[0])
-        DEX1-->>EX: tokens received
-        EX->>DEX2: _executeSwap(step[1])
-        DEX2-->>EX: tokens received
-        EX->>DEXN: _executeSwap(step[N])
-        DEXN-->>EX: tokens received
+    AAVE->>EX: transfer + executeOperation()
+    loop each swap step
+        EX->>DEX: _executeSwap(step[i])
+        DEX-->>EX: tokens received
     end
-
-    EX->>AAVE: Repay amount + 0.05% premium
-    EX->>EOA: Transfer profit
+    EX->>AAVE: repay (amount + 0.05% premium)
+    EX->>EOA: transfer profit
 ```
 
 ## Entry Point: `executeArb()`

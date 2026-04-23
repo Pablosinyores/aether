@@ -27,39 +27,64 @@ Sub-millisecond opportunity detection across Uniswap V2/V3, SushiSwap, Curve, Ba
 
 The system is organized into **7 distinct layers** with clear ownership boundaries:
 
-```
-Eth Nodes (WS/IPC)
-    │
-    ▼
-┌─────────────────── RUST CORE (Latency-Critical) ──────────────────┐
-│  Data Ingestion → DEX Pool Registry → State Management            │
-│       → Arbitrage Detection (Bellman-Ford) → EVM Simulator (revm) │
-└──────────────────────────┬────────────────────────────────────────-┘
-                           │ gRPC over UDS (<1μs)
-┌──────────────────────────▼────────────────────────────────────────-┐
-│               GO EXECUTION LAYER (Coordination)                    │
-│  Bundle Constructor → Multi-Builder Submitter                      │
-│  Risk Manager & Circuit Breakers → Monitoring & Observability      │
-└──────────────────────────┬─────────────────────────────────────────┘
-                           │ eth_sendBundle
-                           ▼
-              Flashbots Relay / Block Builders
-                           │
-                           ▼
-┌──────────────────── ON-CHAIN (Solidity) ──────────────────────────┐
-│  AetherExecutor.sol → Aave V3 Flash Loans → DEX Swaps            │
-└───────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    ETH["Eth Nodes (WS/IPC)"]
+
+    subgraph RUST["Rust Core — Latency-Critical"]
+        direction LR
+        IG["Ingestion"] --> PR["Pool Registry"] --> SM["State + Price Graph"]
+        SM --> DT["Detector<br/>Bellman-Ford"] --> SIM["Simulator<br/>revm"]
+    end
+
+    subgraph GO["Go Execution Layer — Coordination"]
+        direction LR
+        EX["Bundle Builder"] --> SUB["Multi-Builder Submitter"]
+        RM["Risk Manager"] -.->|preflight| EX
+        MN["Monitor"] -.->|metrics| RM
+    end
+
+    BUILDERS["Flashbots · Titan · Beaver · rsync"]
+
+    subgraph CHAIN["On-Chain"]
+        AE["AetherExecutor.sol"] --> AAVE["Aave V3 Flash Loan"]
+        AAVE --> AE
+        AE --> DEXES["DEX Pools"]
+    end
+
+    ETH --> IG
+    SIM -->|gRPC / UDS <1μs| EX
+    SUB -->|eth_sendBundle| BUILDERS
+    BUILDERS --> AE
+
+    style RUST fill:#1a1520,stroke:#9580ff,stroke-width:2px,color:#fff
+    style GO fill:#151a20,stroke:#5ce6c7,stroke-width:2px,color:#fff
+    style CHAIN fill:#1a1815,stroke:#f5a623,stroke-width:2px,color:#fff
 ```
 
 ### Hot Path (target <15ms end-to-end)
 
-1. **Event Ingestion** (<1ms) — WebSocket `newHeads`/`logs`/`pendingTx` → ABI decode via `alloy`
-2. **State Update** — Update pool reserves → recompute affected edges in price graph
-3. **Detection** (<3ms) — Bellman-Ford negative cycle scan on affected subgraph
-4. **Simulation** (<5ms) — Fork latest block state in `revm`, execute calldata, verify profit
-5. **gRPC Handoff** (<1ms) — `ValidatedArb` sent to Go executor over UDS
-6. **Bundle Build + Sign** (<2ms) — EIP-1559 tx + tip tx, sign with searcher key
-7. **Submission** — Fan-out `eth_sendBundle` to Flashbots, Titan, Beaver, rsync builders
+```mermaid
+sequenceDiagram
+    participant Node as Eth Node
+    participant Rust as Rust Core
+    participant Go as Go Executor
+    participant B as Block Builders
+
+    Node->>Rust: WS log (Swap/Sync)
+    Note over Rust: decode + state update<br/><1ms
+    Note over Rust: Bellman-Ford SPFA<br/><3ms
+    Note over Rust: revm fork + execute<br/><5ms
+    Rust->>Go: ValidatedArb (gRPC/UDS <1μs)
+    Note over Go: build + sign bundle<br/><2ms
+    par fan-out
+        Go->>B: eth_sendBundle (Flashbots)
+    and
+        Go->>B: eth_sendBundle (Titan)
+    and
+        Go->>B: eth_sendBundle (Beaver)
+    end
+```
 
 ---
 
@@ -266,7 +291,19 @@ The system enforces automatic circuit breakers:
 | Node latency >500ms | **DEGRADE** |
 | Bundle miss rate >80% in 1h | **ALERT** |
 
-System states: `Running → Degraded → Paused → Halted` (manual reset required from Halted).
+System state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running
+    Running --> Degraded: node latency >500ms
+    Running --> Paused: 3 reverts in 10min
+    Running --> Halted: gas >300gwei<br/>daily loss >0.5 ETH<br/>balance <0.1 ETH
+    Degraded --> Running: latency recovers
+    Degraded --> Halted: breaker trips
+    Paused --> Running: manual resume
+    Halted --> Running: manual reset only
+```
 
 ---
 
