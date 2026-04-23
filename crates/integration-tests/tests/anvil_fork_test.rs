@@ -201,7 +201,7 @@ async fn test_anvil_fork_log_fetch_and_decode() {
         for log in &logs {
             let topics = log.topics().to_vec();
             let data = log.data().data.to_vec();
-            if event_decoder::decode_log(&topics, &data, log.address(), None).is_some() {
+            if event_decoder::decode_log(&topics, &data, log.address(), None).is_ok() {
                 decoded_count += 1;
             }
         }
@@ -279,7 +279,7 @@ async fn test_anvil_fork_full_pipeline() {
             .collect();
 
         for (address, topics, data) in &raw_logs {
-            if let Some(event) = event_decoder::decode_log(topics, data, *address, None) {
+            if let Ok(event) = event_decoder::decode_log(topics, data, *address, None) {
                 channels.dispatch_pool_update(event);
             }
         }
@@ -299,7 +299,7 @@ async fn test_anvil_fork_full_pipeline() {
         let mut pools_seen = std::collections::HashSet::new();
 
         for (address, topics, data) in &raw_logs {
-            if let Some(event_decoder::PoolEvent::ReserveUpdate {
+            if let Ok(event_decoder::PoolEvent::ReserveUpdate {
                 pool,
                 reserve0,
                 reserve1,
