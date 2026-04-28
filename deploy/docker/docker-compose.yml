@@ -171,6 +171,29 @@ services:
     networks:
       - aether-net
 
+  # Trade-ledger Postgres. Binaries are no-op backward-compatible when
+  # DATABASE_URL is unset, so this service is safe to start unconditionally —
+  # the ledger writers stay quiet until they are wired up.
+  postgres:
+    image: postgres:17
+    container_name: aether-postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-aether}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aether}
+      - POSTGRES_DB=${POSTGRES_DB:-aether}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aether} -d ${POSTGRES_DB:-aether}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - aether-net
+
   # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
   # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
   reth:
@@ -198,6 +221,7 @@ volumes:
   tempo-data:
   reth-data:
   reth-ipc:
+  postgres-data:
 
 networks:
   aether-net:
