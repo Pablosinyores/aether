@@ -61,10 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("ETH_RPC_URL not set — engine will use empty-state simulation");
     }
-    let engine = Arc::new(AetherEngine::new_with_metrics(
+    let ledger = aether_common::db::ledger_from_env().await;
+    let engine = Arc::new(AetherEngine::new_with_metrics_and_ledger(
         engine_config,
         arb_tx,
         Arc::clone(&metrics),
+        ledger,
     ));
 
     // ControlService needs a handle to the engine for hot-reload support.
