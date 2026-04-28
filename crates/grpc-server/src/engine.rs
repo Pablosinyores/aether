@@ -11,7 +11,10 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol_types::SolCall;
 
+use aether_common::db::{Ledger, NewArb, NewPool, NoopLedger};
 use aether_common::types::{ArbHop, ArbOpportunity, PoolId, ProtocolType, SwapStep};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::gas::{estimate_total_gas, gas_cost_wei};
 use aether_detector::optimizer::ternary_search_optimal_input;
@@ -126,6 +129,9 @@ pub struct AetherEngine {
     rpc_provider: Option<DynProvider<Ethereum>>,
     /// Prometheus metrics for engine operations.
     metrics: Arc<EngineMetrics>,
+    /// Persistent trade ledger. NoopLedger by default; PgLedger when
+    /// `DATABASE_URL` is set at startup.
+    ledger: Arc<dyn Ledger>,
 }
 
 /// Lightweight snapshot of the current block's key fields.
@@ -165,6 +171,59 @@ fn token_label(addr: &Address) -> String {
                 hex
             }
         }
+    }
+}
+
+/// Build a [`NewArb`] row from a published opportunity.
+///
+/// `arb_id` is generated server-side because `ArbOpportunity::id` is a free-form
+/// String not guaranteed to be UUID-shaped. `path_hash` is sha256 of the pool
+/// address sequence so equivalent paths collapse to the same key for grouping.
+fn build_new_arb(
+    opp: &ArbOpportunity,
+    flashloan_token: Address,
+    flashloan_amount: U256,
+    net_profit_u128: u128,
+    tip_bps: u64,
+    sim_us: u128,
+    path_label: &str,
+) -> NewArb {
+    let pool_addrs: Vec<String> = opp
+        .hops
+        .iter()
+        .map(|h| format!("{:#x}", h.pool_address))
+        .collect();
+    let protocols: Vec<String> = opp
+        .hops
+        .iter()
+        .map(|h| format!("{:?}", h.protocol))
+        .collect();
+
+    let mut hasher = Sha256::new();
+    for h in &opp.hops {
+        hasher.update(h.pool_address.as_slice());
+    }
+    let digest = hasher.finalize();
+    let mut path_hash = [0u8; 32];
+    path_hash.copy_from_slice(&digest);
+
+    NewArb {
+        arb_id: Uuid::new_v4(),
+        target_block: opp.block_number,
+        path_hash: path_hash.into(),
+        hops: u8::try_from(opp.hops.len()).unwrap_or(u8::MAX),
+        path: serde_json::Value::String(path_label.to_string()),
+        protocols: serde_json::json!(protocols),
+        pool_addresses: serde_json::json!(pool_addrs),
+        flashloan_token,
+        flashloan_amount,
+        gross_profit_wei: opp.total_profit_wei,
+        net_profit_wei: U256::from(net_profit_u128),
+        gas_estimate: opp.total_gas,
+        tip_bps: u32::try_from(tip_bps).unwrap_or(u32::MAX),
+        detection_us: None,
+        sim_us: Some(u64::try_from(sim_us).unwrap_or(u64::MAX)),
+        git_sha: option_env!("GIT_SHA").map(|s| s.to_string()),
     }
 }
 
@@ -220,6 +279,18 @@ impl AetherEngine {
         arb_tx: broadcast::Sender<ProtoValidatedArb>,
         metrics: Arc<EngineMetrics>,
     ) -> Self {
+        Self::new_with_metrics_and_ledger(config, arb_tx, metrics, Arc::new(NoopLedger::new()))
+    }
+
+    /// Build an engine with an explicit ledger backend. Production callers
+    /// pass a `PgLedger` constructed from `DATABASE_URL`; tests and dev mode
+    /// use `NoopLedger`.
+    pub fn new_with_metrics_and_ledger(
+        config: EngineConfig,
+        arb_tx: broadcast::Sender<ProtoValidatedArb>,
+        metrics: Arc<EngineMetrics>,
+        ledger: Arc<dyn Ledger>,
+    ) -> Self {
         let event_channels = Arc::new(EventChannels::new());
         let detector = BellmanFord::new(config.max_hops, config.detection_time_budget_us);
         let simulator = EvmSimulator::with_defaults();
@@ -256,6 +327,7 @@ impl AetherEngine {
             pool_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             rpc_provider,
             metrics,
+            ledger,
         }
     }
 
@@ -347,6 +419,16 @@ impl AetherEngine {
             %pool_addr, %token0, %token1, ?protocol, fee_bps,
             "Pool registered (t0={}, t1={})", t0_idx, t1_idx
         );
+
+        self.ledger.insert_pool(&NewPool {
+            address: pool_addr,
+            protocol,
+            token0,
+            token1,
+            fee_bps: Some(fee_bps),
+            tier: None,
+            source: "register_pool".to_string(),
+        });
     }
 
     /// Bootstrap pools from a TOML config file (e.g. `config/pools.toml`).
@@ -1374,6 +1456,16 @@ impl AetherEngine {
                         sim_us,
                         "ARB PUBLISHED"
                     );
+
+                    self.ledger.insert_arb(&build_new_arb(
+                        &input.opp,
+                        input.flashloan_token,
+                        input.input_amount,
+                        input.net_profit,
+                        self.config.tip_bps,
+                        sim_us,
+                        &path,
+                    ));
                 }
             });
         }

@@ -11,6 +11,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ruint = { workspace = true }
 prost = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bigdecimal = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
