@@ -53,7 +53,9 @@ services:
       - aether-net
 
   prometheus:
-    image: prom/prometheus:latest
+    # Pin to a known-good major to avoid silent breaking upgrades on
+    # `docker compose pull`. Bump in a dedicated PR after smoke-testing.
+    image: prom/prometheus:v2.54.1
     container_name: aether-prometheus
     ports:
       - "9091:9090"
@@ -66,7 +68,7 @@ services:
       - aether-net
 
   alertmanager:
-    image: prom/alertmanager:latest
+    image: prom/alertmanager:v0.27.0
     container_name: aether-alertmanager
     ports:
       - "9093:9093"
@@ -77,11 +79,22 @@ services:
       - alertmanager-data:/alertmanager
     # Substitute the webhook URL from the environment at startup so the
     # secret never lands in the committed config file.
+    #
+    # Note: $$VAR escapes Compose-time interpolation so the literal
+    # `$SLACK_WEBHOOK_URL` is what reaches the container shell. Without the
+    # escape, Compose expands the value at parse time and the resolved URL
+    # ends up baked into the container ARGV, visible via `docker inspect`.
+    # The sed delimiter is `#` so URLs containing `|`, `&`, or `\` survive.
     entrypoint:
       - /bin/sh
       - -c
       - |
-        sed "s|__SLACK_WEBHOOK_URL__|${SLACK_WEBHOOK_URL}|g" \
+        if [ -z "$$SLACK_WEBHOOK_URL" ]; then
+          echo "FATAL: SLACK_WEBHOOK_URL is unset; refusing to start alertmanager." >&2
+          echo "       Set SLACK_WEBHOOK_URL in .env or unset the alertmanager service." >&2
+          exit 1
+        fi
+        sed "s#__SLACK_WEBHOOK_URL__#$$SLACK_WEBHOOK_URL#g" \
           /etc/alertmanager/alertmanager.yml.tpl > /tmp/alertmanager.yml
         exec /bin/alertmanager \
           --config.file=/tmp/alertmanager.yml \
@@ -91,7 +104,7 @@ services:
       - aether-net
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.4.7
     container_name: aether-grafana
     ports:
       - "3000:3000"

@@ -23,6 +23,14 @@ receivers:
           {{ end }}
 
 inhibit_rules:
-  - source_matchers: [severity="critical"]
+  # Suppress all non-critical alerts while AetherHalted is firing. Once the
+  # bot is halted, every other warning/info is downstream noise — operators
+  # only need the halt page until manual reset clears it.
+  #
+  # The `equal: []` clause means "no label-equality required" — any firing
+  # AetherHalted suppresses every warning/info system-wide regardless of
+  # alertname. The previous `equal: [alertname]` form was a no-op because
+  # each alert has a unique alertname.
+  - source_matchers: [alertname="AetherHalted", severity="critical"]
     target_matchers: [severity=~"warning|info"]
-    equal: [alertname]
+    equal: []

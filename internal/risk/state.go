@@ -7,6 +7,15 @@ import (
 )
 
 // SystemState represents the current system operating state.
+//
+// SYNC SOURCE — the integer encoding of these states is shared across:
+//   - cmd/executor/main.go            stateToInt()
+//   - cmd/executor/metrics.go         systemStateGauge Help text
+//   - deploy/docker/prometheus/alerts.yml  AetherHalted (`== 3`)
+//   - deploy/docker/grafana/dashboards/risk.json
+//
+// Adding a variant here without updating those sites makes the gauge report
+// -1 (anomaly value) and breaks the AetherHalted alert.
 type SystemState string
 
 const (
