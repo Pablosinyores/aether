@@ -528,6 +528,12 @@ func (executorMetricsObserver) OnCircuitBreakerTrip(reason string) {
 
 // stateToInt maps system states to a numeric gauge value. -1 surfaces an
 // anomaly on dashboards if a new state is added without updating this mapping.
+//
+// SYNC SOURCE — keep in lock-step with:
+//   - cmd/executor/metrics.go:systemStateGauge (Help text)
+//   - internal/risk/state.go State* constants
+//   - deploy/docker/prometheus/alerts.yml AetherHalted rule
+//   - deploy/docker/grafana/dashboards/risk.json
 func stateToInt(s risk.SystemState) int {
 	switch s {
 	case risk.StateRunning:

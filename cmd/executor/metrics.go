@@ -71,9 +71,15 @@ var (
 		Help:    "Per-builder submission round-trip latency in ms",
 		Buckets: []float64{10, 25, 50, 100, 250, 500, 1000, 2000, 5000},
 	}, []string{"builder"})
+	// SYNC SOURCE for the system_state integer encoding. Any change here
+	// must also update:
+	//   - cmd/executor/main.go            stateToInt()
+	//   - internal/risk/state.go          State* string constants
+	//   - deploy/docker/prometheus/alerts.yml  AetherHalted (`== 3`)
+	//   - deploy/docker/grafana/dashboards/risk.json
 	systemStateGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "aether_system_state",
-		Help: "Current system state (0=Running, 1=Degraded, 2=Paused, 3=Halted)",
+		Help: "Current system state (0=Running, 1=Degraded, 2=Paused, 3=Halted). See cmd/executor/main.go:stateToInt for the canonical mapping.",
 	})
 	circuitBreakerTripsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "aether_circuit_breaker_trips_total",
@@ -82,6 +88,15 @@ var (
 	shadowBundles = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "aether_executor_shadow_bundles_total",
 		Help: "Bundles built+logged but not submitted (AETHER_SHADOW=1)",
+	})
+	// Counts every big.Int → float64 down-cast inside addBigIntCounter that
+	// loses precision. Cumulative profit / gas spent counters cross 2^53 wei
+	// after a few ETH of lifetime activity, so loss is expected and the log
+	// line was being emitted on every bundle. Operators can dashboard this
+	// counter instead.
+	metricsPrecisionLoss = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aether_metrics_precision_loss_total",
+		Help: "Number of big.Int → float64 down-casts in addBigIntCounter that lost precision (expected once cumulative wei counters cross 2^53).",
 	})
 )
 
@@ -101,6 +116,7 @@ func init() {
 		systemStateGauge,
 		circuitBreakerTripsTotal,
 		shadowBundles,
+		metricsPrecisionLoss,
 	)
 }
 
@@ -187,7 +203,12 @@ func addBigIntCounter(counter prometheus.Counter, value *big.Int) {
 	}
 	f, accuracy := new(big.Float).SetInt(value).Float64()
 	if accuracy != big.Exact {
-		log.Printf("Metrics precision loss: %s truncated to %.0f", value.String(), f)
+		// Cumulative wei counters cross 2^53 after a few ETH of lifetime
+		// activity, so this branch is expected on a healthy long-running
+		// bot. Surface it as a counter (dashboardable, alertable, sampleable)
+		// instead of a per-bundle log line that drowns the rest of the
+		// executor output.
+		metricsPrecisionLoss.Inc()
 	}
 	if f == 0 {
 		return

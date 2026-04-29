@@ -3,6 +3,10 @@ groups:
     interval: 30s
     rules:
 
+      # NOTE: `== 3` is the integer encoding for the Halted state defined in
+      # cmd/executor/main.go:stateToInt. Keep in sync with that mapping and
+      # internal/risk/state.go's State* constants — see the SYNC SOURCE
+      # comments at both sites.
       - alert: AetherHalted
         expr: aether_system_state == 3
         for: 1m
@@ -34,7 +38,14 @@ groups:
           description: "p99 end-to-end latency = {{ printf \"%.1f\" $value }}ms over last 5m (target <100ms)."
 
       - alert: AetherNoOpportunities
-        expr: rate(aether_arbs_published_total[10m]) * 60 < 5
+        # Suppress during the first 30m after process start so a fresh boot or
+        # restart does not page operators while the warm-up window is still
+        # building up the publish-rate window.
+        expr: |
+          (rate(aether_arbs_published_total[10m]) * 60 < 5)
+          unless on() (
+            (time() - min(process_start_time_seconds{job="aether-rust"})) < 1800
+          )
         for: 10m
         labels:
           severity: warning
@@ -61,6 +72,10 @@ groups:
           description: "Base fee = {{ printf \"%.1f\" $value }} gwei. Executor preflight will reject arbs until this drops."
 
       - alert: AetherBuilderDown
+        # Disabled builders register zero-total on both {success} and {failure}
+        # series, so the second leg below filters them out by requiring
+        # observed traffic. Operators staring at an "idle" disabled builder
+        # see no alert by design — that's expected, not a regression.
         expr: |
           sum by (builder) (rate(aether_executor_builder_submissions_total{result="success"}[2m])) == 0
           and on (builder)
@@ -70,4 +85,17 @@ groups:
           severity: critical
         annotations:
           summary: "Builder {{ $labels.builder }} has no successful submissions"
-          description: "Builder {{ $labels.builder }} received submissions but zero succeeded over the last 2m. Check builder endpoint health and auth."
+          description: "Builder {{ $labels.builder }} received submissions but zero succeeded over the last 2m. Check builder endpoint health and auth. Note: builders configured with Enabled=false are intentionally silent here."
+
+      # Self-monitor of the alerting path. If Alertmanager crashloops (bad
+      # config, SLACK_WEBHOOK_URL missing, etc.) the rest of the alerts above
+      # silently never reach Slack; this rule fires through Prometheus's own
+      # built-in alert delivery so the gap surfaces.
+      - alert: AlertmanagerDown
+        expr: up{job="alertmanager"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Alertmanager scrape target is down"
+          description: "Prometheus has been unable to scrape alertmanager:9093 for 2m. Slack delivery is offline. Check the alertmanager container logs and SLACK_WEBHOOK_URL config."

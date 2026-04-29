@@ -222,8 +222,16 @@ func TestEndToEndLatency(t *testing.T) {
 }
 
 func TestRecordBuilderResult_ScrapeLabels(t *testing.T) {
-	recordBuilderResult("flashbots", true, 42*time.Millisecond)
-	recordBuilderResult("titan", false, 123*time.Millisecond)
+	// Use a unique prefix so the global Prometheus registry does not see this
+	// test's series leak into any aggregate query (e.g. `sum(rate(...))`)
+	// that another test might assert on. Real builder names ("flashbots",
+	// "titan") are reserved for production and should not appear in tests.
+	const (
+		nameAlpha = "scrape_alpha"
+		nameBeta  = "scrape_beta"
+	)
+	recordBuilderResult(nameAlpha, true, 42*time.Millisecond)
+	recordBuilderResult(nameBeta, false, 123*time.Millisecond)
 
 	server := httptest.NewServer(promhttp.Handler())
 	defer server.Close()
@@ -241,10 +249,10 @@ func TestRecordBuilderResult_ScrapeLabels(t *testing.T) {
 	payload := string(body)
 
 	required := []string{
-		`aether_executor_builder_submissions_total{builder="flashbots",result="success"}`,
-		`aether_executor_builder_submissions_total{builder="titan",result="failure"}`,
-		`aether_executor_builder_latency_ms_count{builder="flashbots"}`,
-		`aether_executor_builder_latency_ms_count{builder="titan"}`,
+		`aether_executor_builder_submissions_total{builder="` + nameAlpha + `",result="success"}`,
+		`aether_executor_builder_submissions_total{builder="` + nameBeta + `",result="failure"}`,
+		`aether_executor_builder_latency_ms_count{builder="` + nameAlpha + `"}`,
+		`aether_executor_builder_latency_ms_count{builder="` + nameBeta + `"}`,
 	}
 	for _, want := range required {
 		if !strings.Contains(payload, want) {
