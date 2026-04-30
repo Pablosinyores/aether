@@ -53,6 +53,15 @@ pub struct EngineMetrics {
     ///     the detector's local graph is wrong or the simulation reverted
     ///     in a way that masked the failure
     cycle_gate_dropped_total: IntCounterVec,
+    /// Pending DEX-router txs forwarded by the mempool subscription, labelled
+    /// by router (raw address) and the decoded protocol family. The
+    /// `decoded` label distinguishes successful ABI parses from
+    /// `decode_failure` so dashboards can surface decoder gaps directly.
+    pending_dex_tx_total: IntCounterVec,
+    /// Reason-tagged decoder failure counter. Reasons match
+    /// `aether_pools::router_decoder::DecodeError` variants so a dashboard
+    /// drill-down points at the exact path that needs work next.
+    pending_decode_errors_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -119,6 +128,22 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_cycle_gate_dropped_total counter vec");
+        let pending_dex_tx_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_dex_tx_total",
+                "Pending DEX-router txs forwarded by the mempool subscription, by router and decoded protocol",
+            ),
+            &["router", "protocol", "decoded"],
+        )
+        .expect("aether_pending_dex_tx_total counter vec");
+        let pending_decode_errors_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_decode_errors_total",
+                "Pending-tx calldata decoder failures, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pending_decode_errors_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -147,6 +172,12 @@ impl EngineMetrics {
         registry
             .register(Box::new(cycle_gate_dropped_total.clone()))
             .expect("register aether_cycle_gate_dropped_total");
+        registry
+            .register(Box::new(pending_dex_tx_total.clone()))
+            .expect("register aether_pending_dex_tx_total");
+        registry
+            .register(Box::new(pending_decode_errors_total.clone()))
+            .expect("register aether_pending_decode_errors_total");
 
         Self {
             registry,
@@ -159,6 +190,8 @@ impl EngineMetrics {
             decode_errors,
             sim_evm_fallback_total,
             cycle_gate_dropped_total,
+            pending_dex_tx_total,
+            pending_decode_errors_total,
         }
     }
 
@@ -246,6 +279,24 @@ impl EngineMetrics {
     /// scrape endpoint without standing up a second `/metrics` server.
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Bump `aether_pending_dex_tx_total{router, protocol, decoded}` for a
+    /// pending DEX-router tx the mempool source forwarded. `protocol` is
+    /// `unknown` when decoding failed; `decoded` is `"true"` or `"false"`.
+    pub fn inc_pending_dex_tx(&self, router: &str, protocol: &str, decoded: bool) {
+        self.pending_dex_tx_total
+            .with_label_values(&[router, protocol, if decoded { "true" } else { "false" }])
+            .inc();
+    }
+
+    /// Bump `aether_pending_decode_errors_total{reason="..."}`. Reasons
+    /// should be a small fixed set (`too_short`, `unknown_selector`,
+    /// `abi_decode`, `empty_path`) so dashboards can rely on stable labels.
+    pub fn inc_pending_decode_errors(&self, reason: &str) {
+        self.pending_decode_errors_total
+            .with_label_values(&[reason])
+            .inc();
     }
 
     /// Render the registered metrics in Prometheus text exposition format.
