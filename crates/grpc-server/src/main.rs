@@ -12,6 +12,7 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 
 mod engine;
+mod mempool_pipeline;
 mod pipeline;
 mod service;
 mod tracing_init;
@@ -114,6 +115,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_clone.run(provider_shutdown_rx).await;
     });
 
+    // Mempool tracking is opt-in via MEMPOOL_TRACKING=1. When unset the
+    // engine behaves identically to today; when set we spawn the Alchemy
+    // pending-tx subscription and the decode pipeline that consumes it.
+    let mempool_handles = if aether_ingestion::mempool::is_enabled() {
+        info!("MEMPOOL_TRACKING enabled — spawning pending-tx subscription + decode pipeline");
+        let ws_url = std::env::var("MEMPOOL_WS_URL")
+            .or_else(|_| std::env::var("ETH_RPC_URL"))
+            .unwrap_or_default();
+        if ws_url.is_empty() {
+            tracing::warn!(
+                "MEMPOOL_TRACKING set but neither MEMPOOL_WS_URL nor ETH_RPC_URL provided; skipping"
+            );
+            None
+        } else {
+            let cfg = aether_ingestion::mempool::AlchemyMempoolConfig {
+                ws_url,
+                router_filter: aether_ingestion::mempool::default_router_addresses(),
+            };
+            let source = Arc::new(aether_ingestion::mempool::AlchemyMempool::new(cfg));
+            let channels = Arc::clone(engine.event_channels());
+            let source_shutdown = shutdown_rx.clone();
+            let source_handle = tokio::spawn(async move {
+                use aether_ingestion::mempool::MempoolSource;
+                source.run(channels, source_shutdown).await;
+            });
+            let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
+                Arc::clone(engine.event_channels()),
+                Arc::clone(&metrics),
+                shutdown_rx.clone(),
+            );
+            Some((source_handle, pipeline_handle))
+        }
+    } else {
+        None
+    };
+
     // Read the listen address from the environment so the systemd unit and
     // the binary always agree.  Default to localhost TCP for development.
     //
@@ -193,6 +230,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Err(e) = provider_handle.await {
         error!(error = %e, "Provider task panicked");
+    }
+
+    if let Some((source_handle, pipeline_handle)) = mempool_handles {
+        if let Err(e) = source_handle.await {
+            error!(error = %e, "Mempool source task panicked");
+        }
+        if let Err(e) = pipeline_handle.await {
+            error!(error = %e, "Mempool pipeline task panicked");
+        }
     }
 
     server_result?;

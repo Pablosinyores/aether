@@ -11,3 +11,4 @@ toml = { workspace = true }
 tracing = { workspace = true }
 ruint = { workspace = true }
 dashmap = { workspace = true }
+thiserror = { workspace = true }
