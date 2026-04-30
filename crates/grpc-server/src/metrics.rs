@@ -27,6 +27,15 @@ pub struct EngineMetrics {
     /// `aether_pools::router_decoder::DecodeError` variants so a dashboard
     /// drill-down points at the exact path that needs work next.
     pending_decode_errors_total: IntCounterVec,
+    /// Profitable cycles found by the post-state mempool simulator, labelled
+    /// by router and a coarse profit bucket. Counts candidates only — these
+    /// are not validated arbs and never get submitted; they prove the
+    /// post-state pipeline produces non-empty output on real traffic.
+    pending_arb_candidates_total: IntCounterVec,
+    /// Reasons the post-state simulator skipped a decoded swap (no pool in
+    /// registry, missing token index, no graph edge, zero reserves, etc.).
+    /// Mirrors `pending_decode_errors_total` for the layer above the decoder.
+    pending_arb_sim_skipped_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -46,7 +55,9 @@ impl EngineMetrics {
                 "aether_simulation_latency_ms",
                 "EVM simulation latency in milliseconds",
             )
-            .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0]),
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0,
+            ]),
         )
         .expect("aether_simulation_latency_ms histogram");
         let cycles_detected = IntCounter::new(
@@ -54,21 +65,17 @@ impl EngineMetrics {
             "Total negative cycles detected",
         )
         .expect("aether_cycles_detected_total counter");
-        let simulations_run = IntCounter::new(
-            "aether_simulations_run_total",
-            "Total simulations executed",
-        )
-        .expect("aether_simulations_run_total counter");
+        let simulations_run =
+            IntCounter::new("aether_simulations_run_total", "Total simulations executed")
+                .expect("aether_simulations_run_total counter");
         let arbs_published = IntCounter::new(
             "aether_arbs_published_total",
             "Total validated arbs published",
         )
         .expect("aether_arbs_published_total counter");
-        let blocks_processed = IntCounter::new(
-            "aether_blocks_processed_total",
-            "Total blocks processed",
-        )
-        .expect("aether_blocks_processed_total counter");
+        let blocks_processed =
+            IntCounter::new("aether_blocks_processed_total", "Total blocks processed")
+                .expect("aether_blocks_processed_total counter");
         let decode_errors = IntCounterVec::new(
             Opts::new(
                 "aether_decode_errors_total",
@@ -93,6 +100,22 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_pending_decode_errors_total counter vec");
+        let pending_arb_candidates_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_arb_candidates_total",
+                "Profitable cycles found by the post-state mempool simulator, by router and profit bucket",
+            ),
+            &["router", "profit_bucket"],
+        )
+        .expect("aether_pending_arb_candidates_total counter vec");
+        let pending_arb_sim_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_arb_sim_skipped_total",
+                "Decoded swaps the post-state simulator skipped, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pending_arb_sim_skipped_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -121,6 +144,12 @@ impl EngineMetrics {
         registry
             .register(Box::new(pending_decode_errors_total.clone()))
             .expect("register aether_pending_decode_errors_total");
+        registry
+            .register(Box::new(pending_arb_candidates_total.clone()))
+            .expect("register aether_pending_arb_candidates_total");
+        registry
+            .register(Box::new(pending_arb_sim_skipped_total.clone()))
+            .expect("register aether_pending_arb_sim_skipped_total");
 
         Self {
             registry,
@@ -133,6 +162,8 @@ impl EngineMetrics {
             decode_errors,
             pending_dex_tx_total,
             pending_decode_errors_total,
+            pending_arb_candidates_total,
+            pending_arb_sim_skipped_total,
         }
     }
 
@@ -196,6 +227,22 @@ impl EngineMetrics {
     /// `abi_decode`, `empty_path`) so dashboards can rely on stable labels.
     pub fn inc_pending_decode_errors(&self, reason: &str) {
         self.pending_decode_errors_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Bump `aether_pending_arb_candidates_total{router, profit_bucket}`.
+    /// Buckets are coarse (`<10bps`, `10-50bps`, `50-200bps`, `>200bps`) so
+    /// the cardinality stays bounded.
+    pub fn inc_pending_arb_candidates(&self, router: &str, profit_bucket: &str) {
+        self.pending_arb_candidates_total
+            .with_label_values(&[router, profit_bucket])
+            .inc();
+    }
+
+    /// Bump `aether_pending_arb_sim_skipped_total{reason="..."}`.
+    pub fn inc_pending_arb_sim_skipped(&self, reason: &str) {
+        self.pending_arb_sim_skipped_total
             .with_label_values(&[reason])
             .inc();
     }

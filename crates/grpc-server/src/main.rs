@@ -77,8 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap pools from config file at startup.
     // Supports AETHER_POOLS_CONFIG env var to override the default path,
     // so the binary works regardless of the working directory.
-    let pools_config = std::env::var("AETHER_POOLS_CONFIG")
-        .unwrap_or_else(|_| "config/pools.toml".to_string());
+    let pools_config =
+        std::env::var("AETHER_POOLS_CONFIG").unwrap_or_else(|_| "config/pools.toml".to_string());
     let pool_count = engine.bootstrap_pools(&pools_config).await;
     info!(pool_count, path = %pools_config, "Pools loaded at startup");
 
@@ -140,9 +140,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 use aether_ingestion::mempool::MempoolSource;
                 source.run(channels, source_shutdown).await;
             });
+            // Build the post-state simulation context from the engine's
+            // live registry / token index / snapshot. The detector mirrors
+            // the engine's BellmanFord config so the analytical scan
+            // honours the same hop / latency budget as the main path.
+            let sim_ctx = Arc::new(mempool_pipeline::SimContext {
+                pool_registry: Arc::clone(engine.pool_registry()),
+                token_index: Arc::clone(engine.token_index()),
+                snapshot_manager: Arc::clone(engine.snapshot_manager()),
+                detector: aether_detector::bellman_ford::BellmanFord::new(
+                    EngineConfig::default().max_hops,
+                    EngineConfig::default().detection_time_budget_us,
+                ),
+            });
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
                 Arc::clone(&metrics),
+                Some(sim_ctx),
                 shutdown_rx.clone(),
             );
             Some((source_handle, pipeline_handle))
@@ -156,8 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Production (UDS): GRPC_ADDRESS=unix:///var/run/aether/engine.sock
     // Development (TCP): GRPC_ADDRESS=[::1]:50051  (default)
-    let addr_str =
-        std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
+    let addr_str = std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
 
     let server = Server::builder()
         .add_service(ArbServiceServer::new(arb_service))
@@ -172,7 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match std::fs::remove_file(uds_path) {
                 Ok(()) => info!(path = %uds_path, "Removed stale UDS socket"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %uds_path, error = %e, "Failed to remove stale UDS socket"),
+                Err(e) => {
+                    tracing::warn!(path = %uds_path, error = %e, "Failed to remove stale UDS socket")
+                }
             }
 
             // Ensure parent directory exists.
@@ -184,10 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Restrict socket access to the process owner — UDS bypasses
             // network-layer controls (iptables, mTLS), so file permissions
             // are the only access control for ControlService endpoints.
-            std::fs::set_permissions(
-                uds_path,
-                PermissionsExt::from_mode(0o600),
-            )?;
+            std::fs::set_permissions(uds_path, PermissionsExt::from_mode(0o600))?;
             info!(path = %uds_path, "gRPC server listening on UDS");
             let stream = UnixListenerStream::new(uds);
             server.serve_with_incoming(stream).await.map_err(|e| {
