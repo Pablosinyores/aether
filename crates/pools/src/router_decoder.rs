@@ -92,6 +92,9 @@ pub enum DecodeError {
 
 sol! {
     /// UniswapV2 / SushiSwap Router02 surface — they share the ABI.
+    /// Includes the fee-on-transfer variants because meme-token routing
+    /// dominates the live mempool and the non-FOT shapes alone produce a
+    /// near-zero decode hit rate against real Alchemy traffic.
     #[allow(missing_docs)]
     interface IUniswapV2Router02 {
         function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
@@ -100,6 +103,9 @@ sol! {
         function swapTokensForExactETH(uint256 amountOut, uint256 amountInMax, address[] path, address to, uint256 deadline) external;
         function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
         function swapETHForExactTokens(uint256 amountOut, address[] path, address to, uint256 deadline) external payable;
+        function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
+        function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) external payable;
+        function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
     }
 
     /// UniswapV3 SwapRouter (deadline) and SwapRouter02 (no deadline) flavours.
@@ -263,6 +269,39 @@ fn try_uni_v2_family(
             c.path,
             U256::ZERO,
             c.amountOut,
+            c.to,
+        )?));
+    }
+    if selector == swapExactTokensForTokensSupportingFeeOnTransferTokensCall::SELECTOR {
+        let c = swapExactTokensForTokensSupportingFeeOnTransferTokensCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(decode_v2_call(
+            router,
+            c.path,
+            c.amountIn,
+            c.amountOutMin,
+            c.to,
+        )?));
+    }
+    if selector == swapExactETHForTokensSupportingFeeOnTransferTokensCall::SELECTOR {
+        let c = swapExactETHForTokensSupportingFeeOnTransferTokensCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(decode_v2_call(
+            router,
+            c.path,
+            U256::ZERO,
+            c.amountOutMin,
+            c.to,
+        )?));
+    }
+    if selector == swapExactTokensForETHSupportingFeeOnTransferTokensCall::SELECTOR {
+        let c = swapExactTokensForETHSupportingFeeOnTransferTokensCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(decode_v2_call(
+            router,
+            c.path,
+            c.amountIn,
+            c.amountOutMin,
             c.to,
         )?));
     }
