@@ -114,6 +114,53 @@
       "gridPos": { "x": 12, "y": 6, "w": 12, "h": 9 }
     },
     {
+      "id": 8,
+      "type": "stat",
+      "title": "Arb candidates (1m rate)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aether_pending_arb_candidates_total[1m]))",
+          "legendFormat": "candidates/s"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": { "x": 0, "y": 24, "w": 6, "h": 6 }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Arb candidates by profit bucket",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (profit_bucket) (rate(aether_pending_arb_candidates_total[1m]))",
+          "legendFormat": "{{profit_bucket}}"
+        }
+      ],
+      "gridPos": { "x": 6, "y": 24, "w": 9, "h": 9 }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Sim skipped by reason",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(aether_pending_arb_sim_skipped_total[1m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "gridPos": { "x": 15, "y": 24, "w": 9, "h": 9 }
+    },
+    {
       "id": 7,
       "type": "timeseries",
       "title": "MEV-Share stream health",
