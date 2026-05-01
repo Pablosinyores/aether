@@ -37,7 +37,8 @@ pub struct ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            rpc_url: std::env::var("ETH_RPC_URL")
+            rpc_url: std::env::var("ETH_WS_URL")
+                .or_else(|_| std::env::var("ETH_RPC_URL"))
                 .unwrap_or_else(|_| "http://localhost:8545".to_string()),
             nodes_config_path: std::env::var("AETHER_NODES_CONFIG").ok(),
             monitored_pools: vec![],
