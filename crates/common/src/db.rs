@@ -121,6 +121,20 @@ impl Ledger for NoopLedger {
 /// Minimal UUID stand-in so this module does not pull a new workspace dep
 /// today. A follow-up swaps this for `uuid::Uuid` once the `sqlx` / `uuid`
 /// features land.
+///
+/// **Byte-order contract.** The 16-byte payload is stored in **RFC 4122
+/// network byte order** (big-endian for `time_low`, `time_mid`,
+/// `time_hi_and_version`). This matches:
+///
+/// * Postgres `uuid` binary wire format,
+/// * `uuid::Uuid::as_bytes` and `uuid::Uuid::from_bytes`,
+/// * the canonical `8-4-4-4-12` hex string read left-to-right.
+///
+/// Future swap to `uuid::Uuid` is therefore a straight `from_bytes` /
+/// `as_bytes` round-trip with no byte reversal — call sites that build a
+/// `uuid_compat::Uuid` from raw bytes today must already be feeding network
+/// order. Anything mixed-endian (`uuid::Uuid::from_bytes_le`,
+/// little-endian Windows GUIDs) must be converted before construction.
 pub mod uuid_compat {
     use serde::{Deserialize, Serialize};
 
@@ -132,10 +146,14 @@ pub mod uuid_compat {
             Self([0u8; 16])
         }
 
+        /// Build a UUID from 16 bytes in **RFC 4122 network byte order**.
+        /// See module docs for the byte-order contract.
         pub const fn from_bytes(b: [u8; 16]) -> Self {
             Self(b)
         }
 
+        /// Returns the 16-byte payload in **RFC 4122 network byte order**.
+        /// See module docs for the byte-order contract.
         pub const fn as_bytes(&self) -> &[u8; 16] {
             &self.0
         }
