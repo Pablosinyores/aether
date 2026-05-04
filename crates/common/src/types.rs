@@ -1,26 +1,22 @@
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
-/// Protocol type enum matching on-chain constants in AetherExecutor.sol
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Protocol type enum matching on-chain constants in AetherExecutor.sol.
+///
+/// `Default` resolves to [`ProtocolType::UniswapV2`] so structs that contain a
+/// `ProtocolType` (e.g. ledger payloads) can keep deriving `Default`. UniswapV2
+/// = 1 mirrors the on-chain enum's first variant and is the safest sentinel —
+/// never silently maps to an undefined protocol code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ProtocolType {
+    #[default]
     UniswapV2 = 1,
     UniswapV3 = 2,
     SushiSwap = 3,
     Curve = 4,
     BalancerV2 = 5,
     BancorV3 = 6,
-}
-
-// `Default` is provided so structs that contain a ProtocolType (e.g. ledger
-// payloads) can keep deriving Default. UniswapV2 = 1 mirrors the on-chain
-// enum's first variant and is the safest sentinel — never silently maps to
-// an undefined protocol code.
-impl Default for ProtocolType {
-    fn default() -> Self {
-        ProtocolType::UniswapV2
-    }
 }
 
 impl ProtocolType {
