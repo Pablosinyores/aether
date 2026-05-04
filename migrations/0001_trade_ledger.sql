@@ -8,6 +8,19 @@
 -- Variable-shape per-arb data    → JSONB (path, protocols, pool addresses).
 -- All timestamps                 → TIMESTAMPTZ.
 --
+-- Clock-authority policy:
+--   * Event-time columns (arbs.ts, bundles.submitted_at,
+--     inclusion_results.resolved_at) are CLIENT-SET. Writers MUST populate
+--     the value at the moment the event occurs in code — DEFAULT now()
+--     exists only as a safety net for ad-hoc inserts via psql / migrations
+--     and must not be relied on by application paths. Reasoning: the gap
+--     between "event happened" and "row hit Postgres" can be tens of
+--     milliseconds under load; trusting DB-time skews latency analysis and
+--     back-tests.
+--   * Persistence-boundary columns (pool_registry.first_seen / last_seen,
+--     pnl_daily.updated_at) are DB-SET. They record when the row landed,
+--     not when the event happened, so DB time is the right authority.
+--
 -- See docs/architecture.md and CLAUDE.md "Trade ledger" for context.
 
 CREATE TABLE IF NOT EXISTS arbs (
