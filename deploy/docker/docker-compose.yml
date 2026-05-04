@@ -172,11 +172,14 @@ services:
       - aether-net
 
   # Trade-ledger Postgres. Binaries are no-op backward-compatible when
-  # DATABASE_URL is unset, so this service is safe to start unconditionally —
-  # the ledger writers stay quiet until they are wired up.
+  # DATABASE_URL is unset, so devs not using the ledger should not pay the
+  # disk / RAM cost of a running Postgres. Gated behind the `ledger`
+  # compose profile — start with: docker compose --profile ledger up -d
   postgres:
     image: postgres:17
     container_name: aether-postgres
+    profiles:
+      - ledger
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-aether}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aether}
