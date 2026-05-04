@@ -13,6 +13,16 @@ pub enum ProtocolType {
     BancorV3 = 6,
 }
 
+// `Default` is provided so structs that contain a ProtocolType (e.g. ledger
+// payloads) can keep deriving Default. UniswapV2 = 1 mirrors the on-chain
+// enum's first variant and is the safest sentinel — never silently maps to
+// an undefined protocol code.
+impl Default for ProtocolType {
+    fn default() -> Self {
+        ProtocolType::UniswapV2
+    }
+}
+
 impl ProtocolType {
     /// Base gas cost for each protocol's swap
     pub fn base_gas(&self) -> u64 {
