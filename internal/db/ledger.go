@@ -31,13 +31,22 @@ type NewBundle struct {
 
 // NewInclusion is the upsert payload for one (bundle, builder) row of the
 // inclusion_results table — written when a GetBundleStats poll resolves.
+//
+// LandedTxHash is *[32]byte (not []byte) so the type system enforces the
+// 32-byte tx-hash invariant the schema and Rust counterpart (Option<B256>)
+// expect; nil = NULL in the database.
+//
+// Error is *string (not string) so the SQL-NULL case round-trips faithfully:
+// a non-nil *string produces a TEXT row, nil produces NULL. The previous
+// string field silently wrote "" instead of NULL, breaking
+// `WHERE error IS NULL` queries.
 type NewInclusion struct {
 	BundleID      uuid.UUID
 	Builder       string
 	Included      bool
 	IncludedBlock *uint64
-	LandedTxHash  []byte
-	Error         string
+	LandedTxHash  *[32]byte
+	Error         *string
 	ResolvedAt    time.Time
 }
 
