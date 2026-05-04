@@ -20,6 +20,8 @@ use std::sync::OnceLock;
 use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Serialize};
 
+use crate::types::ProtocolType;
+
 /// Insert payload for the `arbs` table.
 ///
 /// Field shapes mirror the SQL schema 1:1 so a Postgres-backed `Ledger` impl
@@ -46,10 +48,15 @@ pub struct NewArb {
 }
 
 /// Insert payload for the `pool_registry` table.
+///
+/// `protocol` is bound to [`ProtocolType`] (not `String`) so callers cannot
+/// invent values the rest of the system does not understand. The Postgres
+/// column stays `TEXT`; the impl serialises via `ProtocolType`'s serde
+/// representation, giving a stable on-disk name without losing type safety.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NewPool {
     pub address: Address,
-    pub protocol: String,
+    pub protocol: ProtocolType,
     pub token0: Address,
     pub token1: Address,
     pub fee_bps: Option<u32>,
