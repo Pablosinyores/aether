@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use alloy::primitives::{Address, B256, U256};
 use bigdecimal::BigDecimal;
+use chrono::{DateTime, Utc};
 use prometheus::{
     HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
 };
@@ -51,6 +52,10 @@ const LEDGER_CHANNEL_CAPACITY: usize = 1024;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NewArb {
     pub arb_id: Uuid,
+    /// Event time — when the engine published the arb. Per the migration's
+    /// clock-authority policy this column is CLIENT-SET; producers MUST
+    /// populate it and never rely on the schema's `DEFAULT now()` fallback.
+    pub ts: DateTime<Utc>,
     pub target_block: u64,
     pub path_hash: B256,
     pub hops: u8,
@@ -97,6 +102,11 @@ pub struct InclusionUpdate {
     pub included_block: Option<u64>,
     pub landed_tx_hash: Option<B256>,
     pub error: Option<String>,
+    /// Event time — when the GetBundleStats poll resolved. Per the
+    /// migration's clock-authority policy this column is CLIENT-SET and
+    /// must be populated by the writer; the schema `DEFAULT now()` is a
+    /// safety net for ad-hoc psql inserts only.
+    pub resolved_at: DateTime<Utc>,
 }
 
 /// Persistence boundary for arb / pool / inclusion records.
@@ -381,24 +391,25 @@ async fn insert_arb_inner(pool: &PgPool, arb: &NewArb) -> Result<(), sqlx::Error
     sqlx::query(
         r#"
         INSERT INTO arbs (
-            arb_id, target_block, path_hash, hops,
+            arb_id, ts, target_block, path_hash, hops,
             path, protocols, pool_addresses,
             flashloan_token, flashloan_amount,
             gross_profit_wei, net_profit_wei,
             gas_estimate, tip_bps,
             detection_us, sim_us, git_sha
         ) VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7,
-            $8, $9,
-            $10, $11,
-            $12, $13,
-            $14, $15, $16
+            $1, $2, $3, $4, $5,
+            $6, $7, $8,
+            $9, $10,
+            $11, $12,
+            $13, $14,
+            $15, $16, $17
         )
         ON CONFLICT (arb_id) DO NOTHING
         "#,
     )
     .bind(arb_id)
+    .bind(arb.ts)
     .bind(target_block)
     .bind(path_hash)
     .bind(hops)
@@ -458,19 +469,23 @@ async fn update_inclusion_inner(
         .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
     let landed = u.landed_tx_hash.as_ref().map(|h| h.as_slice());
 
+    // resolved_at is bound from the caller (CLIENT-SET, per the
+    // clock-authority policy in 0001_trade_ledger.sql). Both insert and
+    // update branches use the bound value so the column reflects when the
+    // GetBundleStats poll resolved in code, not when the row hit Postgres.
     sqlx::query(
         r#"
         INSERT INTO inclusion_results (
-            bundle_id, builder, included, included_block, landed_tx_hash, error
+            bundle_id, builder, included, included_block, landed_tx_hash, error, resolved_at
         ) VALUES (
-            $1, $2, $3, $4, $5, $6
+            $1, $2, $3, $4, $5, $6, $7
         )
         ON CONFLICT (bundle_id, builder) DO UPDATE SET
             included       = EXCLUDED.included,
             included_block = EXCLUDED.included_block,
             landed_tx_hash = EXCLUDED.landed_tx_hash,
             error          = EXCLUDED.error,
-            resolved_at    = now()
+            resolved_at    = EXCLUDED.resolved_at
         "#,
     )
     .bind(u.bundle_id)
@@ -479,6 +494,7 @@ async fn update_inclusion_inner(
     .bind(included_block)
     .bind(landed)
     .bind(u.error.as_deref())
+    .bind(u.resolved_at)
     .execute(pool)
     .await?;
     Ok(())
@@ -512,8 +528,10 @@ fn u256_to_decimal(v: U256) -> BigDecimal {
 
 /// Stable on-disk name for a [`ProtocolType`]. Matches the serde enum tag so
 /// rows written today and rows written by a future serde-driven impl stay
-/// comparable.
-fn protocol_label(p: ProtocolType) -> &'static str {
+/// comparable. Public so the engine can use the same mapping when building
+/// the JSONB `protocols` column on `NewArb` — keeping a single source of
+/// truth for on-disk protocol names.
+pub fn protocol_label(p: ProtocolType) -> &'static str {
     match p {
         ProtocolType::UniswapV2 => "UniswapV2",
         ProtocolType::UniswapV3 => "UniswapV3",
