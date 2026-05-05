@@ -61,7 +61,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("ETH_RPC_URL not set — engine will use empty-state simulation");
     }
-    let ledger = aether_common::db::ledger_from_env().await;
+    let ledger_metrics = aether_common::db::LedgerMetrics::register(metrics.registry());
+    let ledger = aether_common::db::ledger_from_env(ledger_metrics).await;
     let engine = Arc::new(AetherEngine::new_with_metrics_and_ledger(
         engine_config,
         arb_tx,

@@ -5,21 +5,43 @@
 //! - [`NoopLedger`] — default, used when `DATABASE_URL` is unset. Discards
 //!   every write so engine behaviour is identical to runs without Postgres.
 //! - [`PgLedger`] — `sqlx::PgPool`-backed. Public methods are sync; each call
-//!   spawns a detached tokio task so the engine hot path never blocks on I/O.
-//!   A connection blip logs and drops; the engine never crashes on ledger I/O.
+//!   enqueues onto a **bounded** mpsc and a single dedicated writer task drains
+//!   it. The hot path never awaits I/O. Channel saturation drops the row and
+//!   bumps `aether_ledger_drops_total{op}`; a slow Postgres can never exert
+//!   unbounded backpressure on the engine.
+//!
+//! Observability surface (registered against a shared `prometheus::Registry`):
+//!
+//! | Metric | Type | Labels |
+//! |---|---|---|
+//! | `aether_ledger_writes_total` | Counter | `op`, `result` (`ok`/`err`) |
+//! | `aether_ledger_drops_total` | Counter | `op` |
+//! | `aether_ledger_queue_depth` | Gauge | — |
+//! | `aether_ledger_write_latency_ms` | Histogram | `op` |
 //!
 //! See `migrations/0001_trade_ledger.sql` for the schema.
 
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use alloy::primitives::{Address, B256, U256};
 use bigdecimal::BigDecimal;
+use prometheus::{
+    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::types::ProtocolType;
+
+/// Channel depth between the engine hot path and the PgLedger writer task.
+/// Sized for ~3 s of bursty inserts (engine tops out around 200 arbs/s under
+/// peak load) before saturating and dropping. Breached only when Postgres
+/// stalls; the drops counter is the alert signal.
+const LEDGER_CHANNEL_CAPACITY: usize = 1024;
 
 /// Insert payload for the `arbs` table.
 ///
@@ -91,6 +113,75 @@ pub trait Ledger: Send + Sync {
     fn update_inclusion(&self, update: &InclusionUpdate);
 }
 
+/// Prometheus handles shared with [`PgLedger`]. Constructed once at startup
+/// against the engine's existing `Registry` so a single `/metrics` endpoint
+/// emits both engine and ledger families.
+pub struct LedgerMetrics {
+    writes_total: IntCounterVec,
+    drops_total: IntCounterVec,
+    queue_depth: IntGauge,
+    write_latency_ms: HistogramVec,
+}
+
+impl LedgerMetrics {
+    /// Register all four ledger metrics on the provided `Registry`.
+    ///
+    /// Panics on register failure; this is startup code and a duplicate
+    /// registration indicates a programmer error, not a runtime condition.
+    pub fn register(registry: &Registry) -> Arc<Self> {
+        let writes_total = IntCounterVec::new(
+            Opts::new(
+                "aether_ledger_writes_total",
+                "Trade-ledger writes attempted by the writer task, by op and outcome",
+            ),
+            &["op", "result"],
+        )
+        .expect("aether_ledger_writes_total counter vec");
+        let drops_total = IntCounterVec::new(
+            Opts::new(
+                "aether_ledger_drops_total",
+                "Trade-ledger writes dropped because the bounded channel was full",
+            ),
+            &["op"],
+        )
+        .expect("aether_ledger_drops_total counter vec");
+        let queue_depth = IntGauge::new(
+            "aether_ledger_queue_depth",
+            "Pending trade-ledger writes sitting in the writer-task channel",
+        )
+        .expect("aether_ledger_queue_depth gauge");
+        let write_latency_ms = HistogramVec::new(
+            HistogramOpts::new(
+                "aether_ledger_write_latency_ms",
+                "Per-op latency of trade-ledger writes from dequeue to query completion",
+            )
+            .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0]),
+            &["op"],
+        )
+        .expect("aether_ledger_write_latency_ms histogram vec");
+
+        registry
+            .register(Box::new(writes_total.clone()))
+            .expect("register aether_ledger_writes_total");
+        registry
+            .register(Box::new(drops_total.clone()))
+            .expect("register aether_ledger_drops_total");
+        registry
+            .register(Box::new(queue_depth.clone()))
+            .expect("register aether_ledger_queue_depth");
+        registry
+            .register(Box::new(write_latency_ms.clone()))
+            .expect("register aether_ledger_write_latency_ms");
+
+        Arc::new(Self {
+            writes_total,
+            drops_total,
+            queue_depth,
+            write_latency_ms,
+        })
+    }
+}
+
 /// Default ledger: discards every write.
 ///
 /// Logs once on construction so operators can grep for "ledger disabled" in
@@ -118,219 +209,287 @@ impl Ledger for NoopLedger {
     fn update_inclusion(&self, _update: &InclusionUpdate) {}
 }
 
+/// One unit of ledger work shipped over the writer-task channel. Owns its
+/// payload so the hot path can drop the original immediately.
+enum LedgerOp {
+    InsertArb(Box<NewArb>),
+    InsertPool(Box<NewPool>),
+    UpdateInclusion(Box<InclusionUpdate>),
+}
+
+impl LedgerOp {
+    fn label(&self) -> &'static str {
+        match self {
+            LedgerOp::InsertArb(_) => "insert_arb",
+            LedgerOp::InsertPool(_) => "insert_pool",
+            LedgerOp::UpdateInclusion(_) => "update_inclusion",
+        }
+    }
+}
+
 /// Postgres-backed [`Ledger`] using `sqlx`.
 ///
-/// Each public call spawns a detached tokio task so the caller (typically the
-/// engine on the hot path after `ARB PUBLISHED`) never awaits I/O. The pool
-/// is bounded so a slow Postgres cannot fan out unbounded backpressure.
+/// The hot path enqueues onto a bounded channel; a single dedicated writer
+/// task drains and executes. Channel saturation drops the row (with metric)
+/// rather than blocking the engine. The connection pool is bounded so a slow
+/// Postgres still cannot fan out unbounded backpressure even if it acquires
+/// every slot.
 #[derive(Clone)]
 pub struct PgLedger {
-    pool: PgPool,
+    tx: mpsc::Sender<LedgerOp>,
+    metrics: Arc<LedgerMetrics>,
 }
 
 impl PgLedger {
-    /// Connect to Postgres at `database_url` and return a ready ledger.
+    /// Connect to Postgres and spawn the dedicated writer task.
     ///
-    /// Pool sizing matches the engine: a few simultaneous inserts are common
-    /// but most blocks publish 0–5 arbs, so a small pool with idle timeout is
-    /// enough. Callers should construct this once at startup and clone the
-    /// `Arc` everywhere.
-    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+    /// Returns once the pool is ready and the writer is live. The writer task
+    /// runs until the channel closes (i.e. every clone of the `Sender` is
+    /// dropped — typically at process shutdown).
+    pub async fn connect(
+        database_url: &str,
+        metrics: Arc<LedgerMetrics>,
+    ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(database_url)
             .await?;
+
+        let (tx, rx) = mpsc::channel::<LedgerOp>(LEDGER_CHANNEL_CAPACITY);
+        spawn_writer(pool, rx, Arc::clone(&metrics));
+
         tracing::info!(
             target: "aether::ledger",
+            channel_capacity = LEDGER_CHANNEL_CAPACITY,
             "PgLedger connected — trade ledger writes enabled"
         );
-        Ok(Self { pool })
+        Ok(Self { tx, metrics })
     }
 
-    /// Fallible variant of [`Ledger::insert_arb`] used by the spawned task.
-    async fn insert_arb_inner(pool: &PgPool, arb: &NewArb) -> Result<(), sqlx::Error> {
-        let arb_id = arb.arb_id;
-        let target_block = i64::try_from(arb.target_block).unwrap_or(i64::MAX);
-        let path_hash = arb.path_hash.as_slice();
-        let hops = i16::from(arb.hops);
-        let flashloan_token = arb.flashloan_token.as_slice();
-        let flashloan_amount = u256_to_decimal(arb.flashloan_amount);
-        let gross_profit = u256_to_decimal(arb.gross_profit_wei);
-        let net_profit = u256_to_decimal(arb.net_profit_wei);
-        let gas_estimate = i64::try_from(arb.gas_estimate).unwrap_or(i64::MAX);
-        let tip_bps = i32::try_from(arb.tip_bps).unwrap_or(i32::MAX);
-        let detection_us = arb
-            .detection_us
-            .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
-        let sim_us = arb.sim_us.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
-
-        sqlx::query(
-            r#"
-            INSERT INTO arbs (
-                arb_id, target_block, path_hash, hops,
-                path, protocols, pool_addresses,
-                flashloan_token, flashloan_amount,
-                gross_profit_wei, net_profit_wei,
-                gas_estimate, tip_bps,
-                detection_us, sim_us, git_sha
-            ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7,
-                $8, $9,
-                $10, $11,
-                $12, $13,
-                $14, $15, $16
-            )
-            ON CONFLICT (arb_id) DO NOTHING
-            "#,
-        )
-        .bind(arb_id)
-        .bind(target_block)
-        .bind(path_hash)
-        .bind(hops)
-        .bind(&arb.path)
-        .bind(&arb.protocols)
-        .bind(&arb.pool_addresses)
-        .bind(flashloan_token)
-        .bind(&flashloan_amount)
-        .bind(&gross_profit)
-        .bind(&net_profit)
-        .bind(gas_estimate)
-        .bind(tip_bps)
-        .bind(detection_us)
-        .bind(sim_us)
-        .bind(arb.git_sha.as_deref())
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn insert_pool_inner(pool: &PgPool, np: &NewPool) -> Result<(), sqlx::Error> {
-        let address = np.address.as_slice();
-        let protocol = protocol_label(np.protocol);
-        let token0 = np.token0.as_slice();
-        let token1 = np.token1.as_slice();
-        let fee_bps = np.fee_bps.map(|v| i32::try_from(v).unwrap_or(i32::MAX));
-
-        sqlx::query(
-            r#"
-            INSERT INTO pool_registry (
-                address, protocol, token0, token1, fee_bps, tier, source
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7
-            )
-            ON CONFLICT (address) DO UPDATE
-                SET last_seen = now()
-            "#,
-        )
-        .bind(address)
-        .bind(protocol)
-        .bind(token0)
-        .bind(token1)
-        .bind(fee_bps)
-        .bind(np.tier.as_deref())
-        .bind(&np.source)
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn update_inclusion_inner(
-        pool: &PgPool,
-        u: &InclusionUpdate,
-    ) -> Result<(), sqlx::Error> {
-        let included_block = u
-            .included_block
-            .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
-        let landed = u.landed_tx_hash.as_ref().map(|h| h.as_slice());
-
-        sqlx::query(
-            r#"
-            INSERT INTO inclusion_results (
-                bundle_id, builder, included, included_block, landed_tx_hash, error
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6
-            )
-            ON CONFLICT (bundle_id, builder) DO UPDATE SET
-                included       = EXCLUDED.included,
-                included_block = EXCLUDED.included_block,
-                landed_tx_hash = EXCLUDED.landed_tx_hash,
-                error          = EXCLUDED.error,
-                resolved_at    = now()
-            "#,
-        )
-        .bind(u.bundle_id)
-        .bind(&u.builder)
-        .bind(u.included)
-        .bind(included_block)
-        .bind(landed)
-        .bind(u.error.as_deref())
-        .execute(pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Borrow the underlying pool. Useful for read-only queries (reporters,
-    /// integration tests) that want to share the connection budget.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    /// Common enqueue path: try_send, bump the right metric on the result.
+    /// Never awaits — the hot path stays non-blocking.
+    fn enqueue(&self, op: LedgerOp) {
+        let label = op.label();
+        match self.tx.try_send(op) {
+            Ok(()) => {
+                self.metrics.queue_depth.inc();
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics
+                    .drops_total
+                    .with_label_values(&[label])
+                    .inc();
+                tracing::warn!(
+                    target: "aether::ledger",
+                    op = label,
+                    capacity = LEDGER_CHANNEL_CAPACITY,
+                    "ledger channel full — dropping row"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Writer task has exited; this happens only at shutdown.
+                tracing::debug!(
+                    target: "aether::ledger",
+                    op = label,
+                    "ledger channel closed; dropping row"
+                );
+            }
+        }
     }
 }
 
 impl Ledger for PgLedger {
     fn insert_arb(&self, arb: &NewArb) {
-        let pool = self.pool.clone();
-        let arb = arb.clone();
-        spawn_detached(async move {
-            if let Err(e) = PgLedger::insert_arb_inner(&pool, &arb).await {
-                tracing::warn!(
-                    target: "aether::ledger",
-                    error = %e,
-                    arb_id = %arb.arb_id,
-                    "insert_arb failed; dropping row"
-                );
-            }
-        });
+        self.enqueue(LedgerOp::InsertArb(Box::new(arb.clone())));
     }
 
     fn insert_pool(&self, pool_row: &NewPool) {
-        let pool = self.pool.clone();
-        let row = pool_row.clone();
-        spawn_detached(async move {
-            if let Err(e) = PgLedger::insert_pool_inner(&pool, &row).await {
-                tracing::warn!(
-                    target: "aether::ledger",
-                    error = %e,
-                    pool = %row.address,
-                    "insert_pool failed; dropping row"
-                );
-            }
-        });
+        self.enqueue(LedgerOp::InsertPool(Box::new(pool_row.clone())));
     }
 
     fn update_inclusion(&self, update: &InclusionUpdate) {
-        let pool = self.pool.clone();
-        let upd = update.clone();
-        spawn_detached(async move {
-            if let Err(e) = PgLedger::update_inclusion_inner(&pool, &upd).await {
-                tracing::warn!(
-                    target: "aether::ledger",
-                    error = %e,
-                    bundle_id = %upd.bundle_id,
-                    "update_inclusion failed; dropping row"
-                );
-            }
-        });
+        self.enqueue(LedgerOp::UpdateInclusion(Box::new(update.clone())));
     }
+}
+
+/// Spawn the dedicated writer task. The task owns the `PgPool` so callers
+/// hand off ownership at construction; queries run sequentially within the
+/// task and concurrently across the pool's connections.
+fn spawn_writer(
+    pool: PgPool,
+    mut rx: mpsc::Receiver<LedgerOp>,
+    metrics: Arc<LedgerMetrics>,
+) {
+    tokio::spawn(async move {
+        while let Some(op) = rx.recv().await {
+            metrics.queue_depth.dec();
+            let label = op.label();
+            let timer = Instant::now();
+            let result = match op {
+                LedgerOp::InsertArb(arb) => insert_arb_inner(&pool, &arb).await,
+                LedgerOp::InsertPool(p) => insert_pool_inner(&pool, &p).await,
+                LedgerOp::UpdateInclusion(u) => update_inclusion_inner(&pool, &u).await,
+            };
+            let elapsed_ms = timer.elapsed().as_secs_f64() * 1_000.0;
+            metrics
+                .write_latency_ms
+                .with_label_values(&[label])
+                .observe(elapsed_ms);
+            match result {
+                Ok(()) => {
+                    metrics
+                        .writes_total
+                        .with_label_values(&[label, "ok"])
+                        .inc();
+                }
+                Err(e) => {
+                    metrics
+                        .writes_total
+                        .with_label_values(&[label, "err"])
+                        .inc();
+                    tracing::warn!(
+                        target: "aether::ledger",
+                        op = label,
+                        error = %e,
+                        elapsed_ms,
+                        "ledger write failed; row dropped"
+                    );
+                }
+            }
+        }
+        tracing::info!(target: "aether::ledger", "PgLedger writer task exiting");
+    });
+}
+
+async fn insert_arb_inner(pool: &PgPool, arb: &NewArb) -> Result<(), sqlx::Error> {
+    let arb_id = arb.arb_id;
+    let target_block = i64::try_from(arb.target_block).unwrap_or(i64::MAX);
+    let path_hash = arb.path_hash.as_slice();
+    let hops = i16::from(arb.hops);
+    let flashloan_token = arb.flashloan_token.as_slice();
+    let flashloan_amount = u256_to_decimal(arb.flashloan_amount);
+    let gross_profit = u256_to_decimal(arb.gross_profit_wei);
+    let net_profit = u256_to_decimal(arb.net_profit_wei);
+    let gas_estimate = i64::try_from(arb.gas_estimate).unwrap_or(i64::MAX);
+    let tip_bps = i32::try_from(arb.tip_bps).unwrap_or(i32::MAX);
+    let detection_us = arb
+        .detection_us
+        .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+    let sim_us = arb.sim_us.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+
+    sqlx::query(
+        r#"
+        INSERT INTO arbs (
+            arb_id, target_block, path_hash, hops,
+            path, protocols, pool_addresses,
+            flashloan_token, flashloan_amount,
+            gross_profit_wei, net_profit_wei,
+            gas_estimate, tip_bps,
+            detection_us, sim_us, git_sha
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6, $7,
+            $8, $9,
+            $10, $11,
+            $12, $13,
+            $14, $15, $16
+        )
+        ON CONFLICT (arb_id) DO NOTHING
+        "#,
+    )
+    .bind(arb_id)
+    .bind(target_block)
+    .bind(path_hash)
+    .bind(hops)
+    .bind(&arb.path)
+    .bind(&arb.protocols)
+    .bind(&arb.pool_addresses)
+    .bind(flashloan_token)
+    .bind(&flashloan_amount)
+    .bind(&gross_profit)
+    .bind(&net_profit)
+    .bind(gas_estimate)
+    .bind(tip_bps)
+    .bind(detection_us)
+    .bind(sim_us)
+    .bind(arb.git_sha.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_pool_inner(pool: &PgPool, np: &NewPool) -> Result<(), sqlx::Error> {
+    let address = np.address.as_slice();
+    let protocol = protocol_label(np.protocol);
+    let token0 = np.token0.as_slice();
+    let token1 = np.token1.as_slice();
+    let fee_bps = np.fee_bps.map(|v| i32::try_from(v).unwrap_or(i32::MAX));
+
+    sqlx::query(
+        r#"
+        INSERT INTO pool_registry (
+            address, protocol, token0, token1, fee_bps, tier, source
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7
+        )
+        ON CONFLICT (address) DO UPDATE
+            SET last_seen = now()
+        "#,
+    )
+    .bind(address)
+    .bind(protocol)
+    .bind(token0)
+    .bind(token1)
+    .bind(fee_bps)
+    .bind(np.tier.as_deref())
+    .bind(&np.source)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn update_inclusion_inner(
+    pool: &PgPool,
+    u: &InclusionUpdate,
+) -> Result<(), sqlx::Error> {
+    let included_block = u
+        .included_block
+        .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+    let landed = u.landed_tx_hash.as_ref().map(|h| h.as_slice());
+
+    sqlx::query(
+        r#"
+        INSERT INTO inclusion_results (
+            bundle_id, builder, included, included_block, landed_tx_hash, error
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6
+        )
+        ON CONFLICT (bundle_id, builder) DO UPDATE SET
+            included       = EXCLUDED.included,
+            included_block = EXCLUDED.included_block,
+            landed_tx_hash = EXCLUDED.landed_tx_hash,
+            error          = EXCLUDED.error,
+            resolved_at    = now()
+        "#,
+    )
+    .bind(u.bundle_id)
+    .bind(&u.builder)
+    .bind(u.included)
+    .bind(included_block)
+    .bind(landed)
+    .bind(u.error.as_deref())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Build a [`Ledger`] from `DATABASE_URL`. Returns [`NoopLedger`] when the var
 /// is unset or empty so the engine stays runnable in dev / CI without
 /// Postgres.
-pub async fn ledger_from_env() -> Arc<dyn Ledger> {
+pub async fn ledger_from_env(metrics: Arc<LedgerMetrics>) -> Arc<dyn Ledger> {
     match std::env::var("DATABASE_URL") {
-        Ok(url) if !url.is_empty() => match PgLedger::connect(&url).await {
+        Ok(url) if !url.is_empty() => match PgLedger::connect(&url, metrics).await {
             Ok(p) => Arc::new(p) as Arc<dyn Ledger>,
             Err(e) => {
                 tracing::error!(
@@ -362,23 +521,6 @@ fn protocol_label(p: ProtocolType) -> &'static str {
         ProtocolType::Curve => "Curve",
         ProtocolType::BalancerV2 => "BalancerV2",
         ProtocolType::BancorV3 => "BancorV3",
-    }
-}
-
-/// Spawn a future on the current tokio runtime if one exists; otherwise log
-/// and drop. The engine always runs under tokio so the drop branch is dev /
-/// test only.
-fn spawn_detached<F>(fut: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(fut);
-    } else {
-        tracing::debug!(
-            target: "aether::ledger",
-            "no tokio runtime; dropping ledger write"
-        );
     }
 }
 
@@ -421,6 +563,34 @@ mod tests {
             // query path produces the same on-disk value.
             let serde_repr = serde_json::to_string(&p).expect("serde");
             assert_eq!(serde_repr, format!("\"{expected}\""));
+        }
+    }
+
+    #[test]
+    fn ledger_metrics_register_round_trips() {
+        let registry = Registry::new();
+        let m = LedgerMetrics::register(&registry);
+        // Exercise every path so a counter typo surfaces in CI.
+        m.writes_total.with_label_values(&["insert_arb", "ok"]).inc();
+        m.writes_total.with_label_values(&["insert_pool", "err"]).inc();
+        m.drops_total.with_label_values(&["update_inclusion"]).inc();
+        m.queue_depth.set(7);
+        m.write_latency_ms
+            .with_label_values(&["insert_arb"])
+            .observe(2.5);
+
+        let families = registry.gather();
+        let names: Vec<_> = families.iter().map(|f| f.get_name().to_string()).collect();
+        for required in [
+            "aether_ledger_writes_total",
+            "aether_ledger_drops_total",
+            "aether_ledger_queue_depth",
+            "aether_ledger_write_latency_ms",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "missing metric family {required}"
+            );
         }
     }
 }

@@ -16,6 +16,7 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 bigdecimal = { workspace = true }
+prometheus = "0.13.4"
 
 [dev-dependencies]
 serde_json = { workspace = true }
