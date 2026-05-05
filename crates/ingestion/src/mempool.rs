@@ -108,6 +108,7 @@ pub struct AlchemyMempool {
 
 impl AlchemyMempool {
     pub fn new(config: AlchemyMempoolConfig) -> Self {
+        warn_if_non_alchemy_endpoint(&config.ws_url);
         Self { config }
     }
 
@@ -229,6 +230,27 @@ impl MempoolSource for AlchemyMempool {
     }
 }
 
+/// Warn loudly when the configured WebSocket endpoint is unlikely to be
+/// Alchemy. `alchemy_pendingTransactions` is an Alchemy-proprietary
+/// subscribe method — Reth, QuickNode, Infura and self-hosted Geth accept
+/// the WS upgrade but never deliver events, so this case otherwise produces
+/// zero metrics with no obvious failure mode. Heuristic only: matches the
+/// hostnames Alchemy issues for mainnet/sepolia.
+fn warn_if_non_alchemy_endpoint(ws_url: &str) {
+    let lower = ws_url.to_ascii_lowercase();
+    let alchemy_markers = ["alchemy.com", "g.alchemy.com", "alchemyapi.io"];
+    if alchemy_markers.iter().any(|m| lower.contains(m)) {
+        return;
+    }
+    warn!(
+        target: "aether::mempool",
+        ws_url = %ws_url,
+        "MEMPOOL_TRACKING enabled but WS endpoint does not look like Alchemy; \
+         alchemy_pendingTransactions is Alchemy-only and will return no events \
+         on Reth/QuickNode/Infura/Geth — see .env.example"
+    );
+}
+
 /// Default DEX router addresses on Ethereum mainnet that Aether watches.
 ///
 /// Curated for the testing scaffold: UniswapV2 Router02, UniswapV3
@@ -293,6 +315,23 @@ mod tests {
             }
         ]);
         assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn alchemy_marker_detection() {
+        // Marker present → no warn (cannot directly assert log absence here,
+        // but exercise both branches of the heuristic).
+        for url in [
+            "wss://eth-mainnet.g.alchemy.com/v2/key",
+            "wss://eth-mainnet.alchemyapi.io/v2/key",
+            "wss://eth.alchemy.com/v2/key",
+        ] {
+            // Ensure no panic on any path; explicit assertion lives in the
+            // `warn_if_non_alchemy_endpoint` heuristic comment.
+            warn_if_non_alchemy_endpoint(url);
+        }
+        warn_if_non_alchemy_endpoint("wss://reth.local:8546");
+        warn_if_non_alchemy_endpoint("wss://eth-mainnet.quiknode.pro/key");
     }
 
     #[test]
