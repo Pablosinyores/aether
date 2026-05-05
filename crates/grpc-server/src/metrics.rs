@@ -142,6 +142,13 @@ impl EngineMetrics {
         self.decode_errors.with_label_values(&[reason]).inc();
     }
 
+    /// Borrow the underlying `Registry` so foreign metric families (e.g. the
+    /// trade-ledger counters in `aether_common::db`) can register on the same
+    /// scrape endpoint without standing up a second `/metrics` server.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
     /// Render the registered metrics in Prometheus text exposition format.
     /// `pub(crate)` so sibling modules (`provider::tests`) can assert on
     /// rendered counter values without exposing the whole registry.
