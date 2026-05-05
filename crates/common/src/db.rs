@@ -33,16 +33,26 @@ use prometheus::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 use crate::types::ProtocolType;
 
 /// Channel depth between the engine hot path and the PgLedger writer task.
-/// Sized for ~3 s of bursty inserts (engine tops out around 200 arbs/s under
-/// peak load) before saturating and dropping. Breached only when Postgres
-/// stalls; the drops counter is the alert signal.
+/// Sized for ~5 s of bursty inserts at the engine's 200 arbs/s peak before
+/// saturating (1024 / 200 ≈ 5.12 s). Breached only when Postgres stalls; the
+/// drops counter is the alert signal.
 const LEDGER_CHANNEL_CAPACITY: usize = 1024;
+
+/// Maximum simultaneous in-flight INSERTs. Matches the sqlx pool size so the
+/// writer can saturate the pool without queueing on the connection acquire
+/// path. Higher than the pool size = wasted spawns waiting for a connection;
+/// lower = pool sits idle while writes serialise.
+const LEDGER_MAX_INFLIGHT: usize = 8;
+
+/// sqlx connection pool size. Kept identical to LEDGER_MAX_INFLIGHT so the
+/// two are tuned in lockstep.
+const LEDGER_POOL_SIZE: u32 = 8;
 
 /// Insert payload for the `arbs` table.
 ///
@@ -261,8 +271,13 @@ impl PgLedger {
         metrics: Arc<LedgerMetrics>,
     ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(std::time::Duration::from_secs(5))
+            .max_connections(LEDGER_POOL_SIZE)
+            // Short acquire timeout: misconfigured DATABASE_URL should fail
+            // boot in seconds, not block the engine while we wait. The
+            // ledger_from_env wrapper falls back to NoopLedger on this
+            // error, so a slow Postgres degrades gracefully instead of
+            // stalling startup.
+            .acquire_timeout(std::time::Duration::from_secs(2))
             .connect(database_url)
             .await?;
 
@@ -272,6 +287,8 @@ impl PgLedger {
         tracing::info!(
             target: "aether::ledger",
             channel_capacity = LEDGER_CHANNEL_CAPACITY,
+            pool_size = LEDGER_POOL_SIZE,
+            max_inflight = LEDGER_MAX_INFLIGHT,
             "PgLedger connected — trade ledger writes enabled"
         );
         Ok(Self { tx, metrics })
@@ -318,57 +335,80 @@ impl Ledger for PgLedger {
         self.enqueue(LedgerOp::InsertPool(Box::new(pool_row.clone())));
     }
 
+    /// `update_inclusion` is currently **unused on the engine side** — the Go
+    /// executor owns inclusion writes (it's the side that polls
+    /// `GetBundleStats`). This Rust path is reserved for a future
+    /// reconciliation worker that backfills `inclusion_results` from
+    /// on-chain block data when a builder API loses the race. Tests
+    /// exercise the wire-up so the code stays compilable; no engine-side
+    /// caller wires it yet.
     fn update_inclusion(&self, update: &InclusionUpdate) {
         self.enqueue(LedgerOp::UpdateInclusion(Box::new(update.clone())));
     }
 }
 
-/// Spawn the dedicated writer task. The task owns the `PgPool` so callers
-/// hand off ownership at construction; queries run sequentially within the
-/// task and concurrently across the pool's connections.
+/// Spawn the dedicated writer dispatcher. The dispatcher dequeues from `rx`
+/// and fans each op out to a tokio task gated by a semaphore so up to
+/// [`LEDGER_MAX_INFLIGHT`] writes execute concurrently across the sqlx pool's
+/// connections. Sequential await on the writer side previously left every
+/// connection but one idle; the semaphore matches concurrency to the pool.
 fn spawn_writer(
     pool: PgPool,
     mut rx: mpsc::Receiver<LedgerOp>,
     metrics: Arc<LedgerMetrics>,
 ) {
+    let semaphore = Arc::new(Semaphore::new(LEDGER_MAX_INFLIGHT));
     tokio::spawn(async move {
         while let Some(op) = rx.recv().await {
             metrics.queue_depth.dec();
-            let label = op.label();
-            let timer = Instant::now();
-            let result = match op {
-                LedgerOp::InsertArb(arb) => insert_arb_inner(&pool, &arb).await,
-                LedgerOp::InsertPool(p) => insert_pool_inner(&pool, &p).await,
-                LedgerOp::UpdateInclusion(u) => update_inclusion_inner(&pool, &u).await,
+            // Permit drops at task end, releasing one in-flight slot.
+            let permit = match Arc::clone(&semaphore).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore was closed; the dispatcher is shutting down.
+                    break;
+                }
             };
-            let elapsed_ms = timer.elapsed().as_secs_f64() * 1_000.0;
-            metrics
-                .write_latency_ms
-                .with_label_values(&[label])
-                .observe(elapsed_ms);
-            match result {
-                Ok(()) => {
-                    metrics
-                        .writes_total
-                        .with_label_values(&[label, "ok"])
-                        .inc();
+            let pool = pool.clone();
+            let metrics = Arc::clone(&metrics);
+            tokio::spawn(async move {
+                let label = op.label();
+                let timer = Instant::now();
+                let result = match op {
+                    LedgerOp::InsertArb(arb) => insert_arb_inner(&pool, &arb).await,
+                    LedgerOp::InsertPool(p) => insert_pool_inner(&pool, &p).await,
+                    LedgerOp::UpdateInclusion(u) => update_inclusion_inner(&pool, &u).await,
+                };
+                let elapsed_ms = timer.elapsed().as_secs_f64() * 1_000.0;
+                metrics
+                    .write_latency_ms
+                    .with_label_values(&[label])
+                    .observe(elapsed_ms);
+                match result {
+                    Ok(()) => {
+                        metrics
+                            .writes_total
+                            .with_label_values(&[label, "ok"])
+                            .inc();
+                    }
+                    Err(e) => {
+                        metrics
+                            .writes_total
+                            .with_label_values(&[label, "err"])
+                            .inc();
+                        tracing::warn!(
+                            target: "aether::ledger",
+                            op = label,
+                            error = %e,
+                            elapsed_ms,
+                            "ledger write failed; row dropped"
+                        );
+                    }
                 }
-                Err(e) => {
-                    metrics
-                        .writes_total
-                        .with_label_values(&[label, "err"])
-                        .inc();
-                    tracing::warn!(
-                        target: "aether::ledger",
-                        op = label,
-                        error = %e,
-                        elapsed_ms,
-                        "ledger write failed; row dropped"
-                    );
-                }
-            }
+                drop(permit);
+            });
         }
-        tracing::info!(target: "aether::ledger", "PgLedger writer task exiting");
+        tracing::info!(target: "aether::ledger", "PgLedger writer dispatcher exiting");
     });
 }
 
@@ -522,8 +562,16 @@ pub async fn ledger_from_env(metrics: Arc<LedgerMetrics>) -> Arc<dyn Ledger> {
 
 /// Map a U256 to the `NUMERIC(78,0)` representation sqlx accepts via
 /// [`BigDecimal`]. U256::MAX has 78 decimal digits, which fits.
+///
+/// `expect`s the parse rather than masking with `unwrap_or(0)`: `U256::to_string`
+/// emits a base-10 digit sequence which `BigDecimal::from_str` accepts by
+/// definition. A failure here would mean the alloy / bigdecimal contract
+/// changed under us — a programmer bug we want to surface loudly, not a
+/// silent zero that quietly corrupts every arb's economics.
 fn u256_to_decimal(v: U256) -> BigDecimal {
-    BigDecimal::from_str(&v.to_string()).unwrap_or_else(|_| BigDecimal::from(0))
+    let s = v.to_string();
+    BigDecimal::from_str(&s)
+        .expect("U256::to_string is always a valid base-10 BigDecimal input")
 }
 
 /// Stable on-disk name for a [`ProtocolType`]. Matches the serde enum tag so
