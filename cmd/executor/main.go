@@ -535,17 +535,19 @@ func signedTxsHex(bundle *Bundle) string {
 	return b.String()
 }
 
-// gasSpentApprox estimates wei spent on gas as `gas * gas_price`. Gwei is
-// pre-multiplied by 1e9 to land in wei. Used in pnl_daily before the
-// GetBundleStats poll updates the row with on-chain `gas_used`.
+// gasSpentApprox estimates wei spent on gas as `gas * gas_price`. Computed
+// in *big.Int (not float64) so the wei value round-trips into the schema's
+// NUMERIC(78,0) column without losing precision in the cumulative pnl_daily
+// total. Gwei float is converted to integer wei via *1e9 + truncation; sub-
+// gwei drift is acceptable for this approximation since the GetBundleStats
+// poll loop replaces the row with the on-chain `gas_used` later anyway.
 func gasSpentApprox(gasUnits uint64, fees GasFees) *big.Int {
-	priceWei := new(big.Float).SetFloat64(fees.GasPriceGwei * 1e9)
-	gas := new(big.Float).SetUint64(gasUnits)
-	out, _ := new(big.Float).Mul(priceWei, gas).Int(nil)
-	if out == nil {
+	if gasUnits == 0 || fees.GasPriceGwei <= 0 {
 		return new(big.Int)
 	}
-	return out
+	gasPriceWei := new(big.Int).SetUint64(uint64(fees.GasPriceGwei * 1e9))
+	gas := new(big.Int).SetUint64(gasUnits)
+	return new(big.Int).Mul(gasPriceWei, gas)
 }
 
 // hexEncode is a thin wrapper around encoding/hex.EncodeToString reused by

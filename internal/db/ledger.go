@@ -105,6 +105,12 @@ var ArbIDNamespace = uuid.UUID{
 // BundleIDNamespace is a separate UUID namespace for deriving deterministic
 // bundle_id values from `(arb_id, target_block)`. Distinct from
 // ArbIDNamespace so the two id spaces cannot accidentally collide.
+//
+// Unlike ArbIDNamespace there is no Rust counterpart to pin against — only
+// the Go executor writes to the `bundles` table. If a future Rust-side
+// writer needs to produce bundle ids (e.g. a chain-backfill reconciliation
+// worker), it MUST embed these exact 16 bytes verbatim and a parallel
+// `TestBundleIDNamespaceMatchesRust` should be added.
 var BundleIDNamespace = uuid.UUID{
 	0x91, 0x32, 0x7d, 0xa1, 0x3f, 0xa4, 0x47, 0x9c,
 	0x82, 0xb1, 0x1f, 0x6e, 0x9d, 0x47, 0x12, 0x07,
