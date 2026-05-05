@@ -21,7 +21,7 @@
 //! `main`-branch behaviour is unchanged.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aether_common::types::ProtocolType;
 use aether_detector::bellman_ford::BellmanFord;
@@ -37,6 +37,34 @@ use tracing::{debug, info, warn};
 use crate::engine::PoolMetadata;
 use crate::EngineMetrics;
 
+/// Pair-keyed pool index built from the live pool registry. Lookup is O(1)
+/// vs the previous registry.values().find(...) which was O(N) per pending
+/// swap and would dominate the per-event budget at 5000+ pools.
+///
+/// The key uses the canonical ordering (`min(token0, token1), max(...)`) so
+/// either swap direction returns the same bucket.
+type PairKey = (Address, Address, ProtocolType);
+type PairIndex = HashMap<PairKey, Vec<PoolMetadata>>;
+
+fn canonical_pair(a: Address, b: Address) -> (Address, Address) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn build_pair_index(registry: &HashMap<Address, PoolMetadata>) -> PairIndex {
+    let mut idx: PairIndex = HashMap::with_capacity(registry.len());
+    for meta in registry.values() {
+        let (a, b) = canonical_pair(meta.token0, meta.token1);
+        idx.entry((a, b, meta.protocol))
+            .or_default()
+            .push(meta.clone());
+    }
+    idx
+}
+
 /// State the post-state simulator needs to run after a successful decode.
 /// Cheap to clone (everything is `Arc`), so the pipeline holds one
 /// `Arc<SimContext>` and dispatches per-event work without re-locking.
@@ -45,6 +73,60 @@ pub struct SimContext {
     pub token_index: Arc<ArcSwap<TokenIndex>>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub detector: BellmanFord,
+    /// Cached `(registry_ptr, PairIndex)` so the second and following pending
+    /// swaps under the same registry generation lookup in O(1). The Mutex
+    /// guards rebuild only — the steady-state path is `lock + ptr_eq + read`.
+    pair_index_cache: Mutex<Option<(usize, Arc<PairIndex>)>>,
+}
+
+impl SimContext {
+    pub fn new(
+        pool_registry: Arc<ArcSwap<HashMap<Address, PoolMetadata>>>,
+        token_index: Arc<ArcSwap<TokenIndex>>,
+        snapshot_manager: Arc<SnapshotManager>,
+        detector: BellmanFord,
+    ) -> Self {
+        Self {
+            pool_registry,
+            token_index,
+            snapshot_manager,
+            detector,
+            pair_index_cache: Mutex::new(None),
+        }
+    }
+
+    /// Look up a pool by `(token_in, token_out, protocol)` in O(1).
+    ///
+    /// Rebuilds the pair index when the underlying `pool_registry` Arc has
+    /// been swapped (detected via pointer comparison). All lookups under a
+    /// single registry generation share one Arc<PairIndex>.
+    fn lookup_pool(
+        &self,
+        token_in: Address,
+        token_out: Address,
+        protocol: ProtocolType,
+    ) -> Option<PoolMetadata> {
+        let registry_guard = self.pool_registry.load();
+        let registry_ptr = Arc::as_ptr(&registry_guard) as usize;
+
+        let index = {
+            let mut cache = self
+                .pair_index_cache
+                .lock()
+                .expect("pair_index_cache poisoned");
+            let stale = cache.as_ref().map_or(true, |(p, _)| *p != registry_ptr);
+            if stale {
+                let fresh = Arc::new(build_pair_index(&registry_guard));
+                *cache = Some((registry_ptr, Arc::clone(&fresh)));
+                fresh
+            } else {
+                Arc::clone(&cache.as_ref().expect("populated above").1)
+            }
+        };
+
+        let (a, b) = canonical_pair(token_in, token_out);
+        index.get(&(a, b, protocol))?.first().cloned()
+    }
 }
 
 /// Spawn the mempool decode pipeline as a tokio task.
@@ -183,15 +265,11 @@ fn try_post_state_scan(
         return;
     };
 
-    // Find a registered pool with the (token_in, token_out) pair on the
-    // matching protocol. We accept either ordering; price graphs store
-    // edges in both directions for the same pool.
-    let registry = ctx.pool_registry.load();
-    let Some(meta) = registry.values().find(|m| {
-        m.protocol == target_protocol
-            && ((m.token0 == swap.token_in && m.token1 == swap.token_out)
-                || (m.token0 == swap.token_out && m.token1 == swap.token_in))
-    }) else {
+    // O(1) pair lookup via the cached PairIndex. The cache rebuilds only
+    // when the underlying pool_registry Arc has been swapped, so steady-state
+    // cost is one Mutex acquire + one HashMap probe — independent of the
+    // number of registered pools.
+    let Some(meta) = ctx.lookup_pool(swap.token_in, swap.token_out, target_protocol) else {
         metrics.inc_pending_arb_sim_skipped("pool_not_registered");
         return;
     };

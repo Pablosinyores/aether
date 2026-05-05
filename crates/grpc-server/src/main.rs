@@ -144,15 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // live registry / token index / snapshot. The detector mirrors
             // the engine's BellmanFord config so the analytical scan
             // honours the same hop / latency budget as the main path.
-            let sim_ctx = Arc::new(mempool_pipeline::SimContext {
-                pool_registry: Arc::clone(engine.pool_registry()),
-                token_index: Arc::clone(engine.token_index()),
-                snapshot_manager: Arc::clone(engine.snapshot_manager()),
-                detector: aether_detector::bellman_ford::BellmanFord::new(
-                    EngineConfig::default().max_hops,
-                    EngineConfig::default().detection_time_budget_us,
+            let engine_cfg = EngineConfig::default();
+            let sim_ctx = Arc::new(mempool_pipeline::SimContext::new(
+                Arc::clone(engine.pool_registry()),
+                Arc::clone(engine.token_index()),
+                Arc::clone(engine.snapshot_manager()),
+                aether_detector::bellman_ford::BellmanFord::new(
+                    engine_cfg.max_hops,
+                    engine_cfg.detection_time_budget_us,
                 ),
-            });
+            ));
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
                 Arc::clone(&metrics),
