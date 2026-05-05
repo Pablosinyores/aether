@@ -11,7 +11,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::sol_types::SolCall;
 
-use aether_common::db::{Ledger, NewArb, NewPool, NoopLedger};
+use aether_common::db::{protocol_label, Ledger, NewArb, NewPool, NoopLedger};
 use aether_common::types::{ArbHop, ArbOpportunity, PoolId, ProtocolType, SwapStep};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -174,11 +174,30 @@ fn token_label(addr: &Address) -> String {
     }
 }
 
+/// Stable UUID namespace for deriving DB `arb_id` values from the engine's
+/// log-side `ArbOpportunity::id` strings. Hard-coded so the same opportunity
+/// id always maps to the same UUID across runs and machines, making
+/// `grep <id> logs/* | xargs psql -c 'SELECT … WHERE arb_id = …'` work without
+/// a second lookup table.
+const ARB_ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6e, 0xc6, 0xfd, 0x05, 0xb1, 0xc8, 0x4c, 0x4d,
+    0x8d, 0x57, 0x4e, 0xc1, 0x77, 0xa2, 0x47, 0x6e,
+]);
+
+/// Derive a deterministic `arb_id` (UUIDv5) from the engine's free-form
+/// `ArbOpportunity::id`. Same input string always produces the same UUID, so
+/// log-side ids and DB ids correlate without a side table.
+pub(crate) fn arb_id_for_opp(opp_id: &str) -> Uuid {
+    Uuid::new_v5(&ARB_ID_NAMESPACE, opp_id.as_bytes())
+}
+
 /// Build a [`NewArb`] row from a published opportunity.
 ///
-/// `arb_id` is generated server-side because `ArbOpportunity::id` is a free-form
-/// String not guaranteed to be UUID-shaped. `path_hash` is sha256 of the pool
-/// address sequence so equivalent paths collapse to the same key for grouping.
+/// `arb_id` is derived from `ArbOpportunity::id` via UUIDv5 so the engine's
+/// log-side id and the DB row share a stable mapping; this is the only join
+/// key between Loki / structured logs and the trade ledger. `path_hash` is
+/// sha256 of the pool address sequence so equivalent paths collapse to the
+/// same key for grouping.
 fn build_new_arb(
     opp: &ArbOpportunity,
     flashloan_token: Address,
@@ -193,10 +212,15 @@ fn build_new_arb(
         .iter()
         .map(|h| format!("{:#x}", h.pool_address))
         .collect();
-    let protocols: Vec<String> = opp
+    // Use the same `protocol_label` adapter the PgLedger uses for
+    // pool_registry.protocol so the JSONB array on arbs.protocols stays
+    // join-compatible with the TEXT column. format!("{:?}", _) silently
+    // diverges if ProtocolType variants are renamed; the serde-tag-pinned
+    // label is the single source of truth.
+    let protocols: Vec<&'static str> = opp
         .hops
         .iter()
-        .map(|h| format!("{:?}", h.protocol))
+        .map(|h| protocol_label(h.protocol))
         .collect();
 
     let mut hasher = Sha256::new();
@@ -208,7 +232,8 @@ fn build_new_arb(
     path_hash.copy_from_slice(&digest);
 
     NewArb {
-        arb_id: Uuid::new_v4(),
+        arb_id: arb_id_for_opp(&opp.id),
+        ts: chrono::Utc::now(),
         target_block: opp.block_number,
         path_hash: path_hash.into(),
         hops: u8::try_from(opp.hops.len()).unwrap_or(u8::MAX),
@@ -1446,8 +1471,10 @@ impl AetherEngine {
                         sim_us,
                         "Published validated arb"
                     );
+                    let arb_id = arb_id_for_opp(&input.opp.id);
                     info!(
                         id = %input.opp.id,
+                        arb_id = %arb_id,
                         path = %path,
                         hops = hop_count,
                         flashloan = %flashloan_label,
