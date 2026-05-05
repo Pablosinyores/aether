@@ -152,6 +152,7 @@ pub fn spawn_mempool_pipeline(
                 next = rx.recv() => match next {
                     Ok(event) => handle_event(&metrics, sim_ctx.as_deref(), event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        metrics.add_pending_pipeline_lagged(n);
                         warn!(
                             target: "aether::mempool",
                             lagged = n,

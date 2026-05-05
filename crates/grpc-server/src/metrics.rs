@@ -36,6 +36,13 @@ pub struct EngineMetrics {
     /// registry, missing token index, no graph edge, zero reserves, etc.).
     /// Mirrors `pending_decode_errors_total` for the layer above the decoder.
     pending_arb_sim_skipped_total: IntCounterVec,
+    /// Pending-tx broadcast events the decode pipeline failed to receive
+    /// because it lagged behind the producer (tokio broadcast `Lagged(n)`).
+    /// Bumped by the `n` returned by the broadcast receiver so dashboards
+    /// can show *how many events* were dropped, not just how many lag
+    /// events fired. Sustained non-zero growth = pipeline is the bottleneck;
+    /// either widen the channel or shed mempool sources.
+    pending_pipeline_lagged_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -116,6 +123,11 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_pending_arb_sim_skipped_total counter vec");
+        let pending_pipeline_lagged_total = IntCounter::new(
+            "aether_pending_pipeline_lagged_total",
+            "Pending-tx events dropped because the decode pipeline lagged behind the broadcast",
+        )
+        .expect("aether_pending_pipeline_lagged_total counter");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -150,6 +162,9 @@ impl EngineMetrics {
         registry
             .register(Box::new(pending_arb_sim_skipped_total.clone()))
             .expect("register aether_pending_arb_sim_skipped_total");
+        registry
+            .register(Box::new(pending_pipeline_lagged_total.clone()))
+            .expect("register aether_pending_pipeline_lagged_total");
 
         Self {
             registry,
@@ -164,6 +179,7 @@ impl EngineMetrics {
             pending_decode_errors_total,
             pending_arb_candidates_total,
             pending_arb_sim_skipped_total,
+            pending_pipeline_lagged_total,
         }
     }
 
@@ -245,6 +261,15 @@ impl EngineMetrics {
         self.pending_arb_sim_skipped_total
             .with_label_values(&[reason])
             .inc();
+    }
+
+    /// Add `n` to `aether_pending_pipeline_lagged_total`. Pass the count
+    /// returned by `broadcast::error::RecvError::Lagged(n)` so the metric
+    /// reflects events dropped, not lag events fired.
+    pub fn add_pending_pipeline_lagged(&self, n: u64) {
+        if n > 0 {
+            self.pending_pipeline_lagged_total.inc_by(n);
+        }
     }
 
     /// Render the registered metrics in Prometheus text exposition format.
