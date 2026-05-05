@@ -150,7 +150,7 @@ pub fn spawn_mempool_pipeline(
         loop {
             tokio::select! {
                 next = rx.recv() => match next {
-                    Ok(event) => handle_event(&metrics, sim_ctx.as_deref(), event),
+                    Ok(event) => handle_event(&metrics, sim_ctx.as_ref(), event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         metrics.add_pending_pipeline_lagged(n);
                         warn!(
@@ -178,8 +178,15 @@ pub fn spawn_mempool_pipeline(
 /// Decode one pending tx and update metrics + logs.
 ///
 /// Pulled out as a free function so unit tests can drive it without spawning
-/// the full pipeline task.
-fn handle_event(metrics: &EngineMetrics, sim_ctx: Option<&SimContext>, event: PendingTxEvent) {
+/// the full pipeline task. The post-state scan (graph clone + Bellman-Ford)
+/// is dispatched onto tokio's blocking pool to keep its CPU cost off the
+/// main runtime workers — the engine's 3 ms p99 detection budget cannot
+/// share worker threads with a 3.8 MB-per-event clone under load.
+fn handle_event(
+    metrics: &Arc<EngineMetrics>,
+    sim_ctx: Option<&Arc<SimContext>>,
+    event: PendingTxEvent,
+) {
     let Some(to) = event.to else {
         // Contract creations and other anonymous calls don't have a router
         // to attribute to — bump a generic `no_to` failure and move on.
@@ -192,7 +199,13 @@ fn handle_event(metrics: &EngineMetrics, sim_ctx: Option<&SimContext>, event: Pe
         Ok(swap) => {
             emit_decoded(metrics, &router_label, &swap, &event);
             if let Some(ctx) = sim_ctx {
-                try_post_state_scan(metrics, ctx, &router_label, &swap);
+                let metrics = Arc::clone(metrics);
+                let ctx = Arc::clone(ctx);
+                let swap = swap.clone();
+                let router_label = router_label.clone();
+                tokio::task::spawn_blocking(move || {
+                    try_post_state_scan(&metrics, &ctx, &router_label, &swap);
+                });
             }
         }
         Err(err) => emit_failure(metrics, &router_label, &err),
@@ -464,7 +477,7 @@ mod tests {
 
     #[test]
     fn handle_event_decoded_swap_does_not_panic() {
-        let metrics = EngineMetrics::new();
+        let metrics = Arc::new(EngineMetrics::new());
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let calldata = swapExactTokensForTokensCall {
@@ -481,7 +494,7 @@ mod tests {
 
     #[test]
     fn handle_event_unknown_selector_does_not_panic() {
-        let metrics = EngineMetrics::new();
+        let metrics = Arc::new(EngineMetrics::new());
         let mut calldata = vec![0xde, 0xad, 0xbe, 0xef];
         calldata.extend(std::iter::repeat_n(0u8, 64));
         let to = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");
@@ -490,7 +503,7 @@ mod tests {
 
     #[test]
     fn handle_event_no_to_does_not_panic() {
-        let metrics = EngineMetrics::new();
+        let metrics = Arc::new(EngineMetrics::new());
         handle_event(
             &metrics,
             None,
