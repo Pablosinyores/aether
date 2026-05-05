@@ -16,7 +16,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(aether_pending_dex_tx_total[1m]))",
+          "expr": "sum(rate(aether_pending_dex_tx_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "tx/s"
         }
       ],
@@ -36,7 +36,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(rate(aether_pending_dex_tx_total{decoded=\"true\"}[5m])) / clamp_min(sum(rate(aether_pending_dex_tx_total[5m])), 1e-9)",
+          "expr": "100 * sum(rate(aether_pending_dex_tx_total{job=~\"aether-rust|aether-host-rust\",decoded=\"true\"}[5m])) / clamp_min(sum(rate(aether_pending_dex_tx_total{job=~\"aether-rust|aether-host-rust\"}[5m])), 1e-9)",
           "legendFormat": "%"
         }
       ],
@@ -57,7 +57,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(aether_mev_share_hints_total[1m])",
+          "expr": "rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
           "legendFormat": "hints/s"
         }
       ],
@@ -76,7 +76,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(rate(aether_mev_share_hints_with_logs_total[5m])) / clamp_min(sum(rate(aether_mev_share_hints_total[5m])), 1e-9)",
+          "expr": "100 * sum(rate(aether_mev_share_hints_with_logs_total{job=~\"aether-go|aether-host-monitor\"}[5m])) / clamp_min(sum(rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[5m])), 1e-9)",
           "legendFormat": "%"
         }
       ],
@@ -93,7 +93,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (protocol) (rate(aether_pending_dex_tx_total[1m]))",
+          "expr": "sum by (protocol) (rate(aether_pending_dex_tx_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "{{protocol}}"
         }
       ],
@@ -107,7 +107,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (reason) (rate(aether_pending_decode_errors_total[1m]))",
+          "expr": "sum by (reason) (rate(aether_pending_decode_errors_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "{{reason}}"
         }
       ],
@@ -121,7 +121,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(aether_pending_arb_candidates_total[1m]))",
+          "expr": "sum(rate(aether_pending_arb_candidates_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "candidates/s"
         }
       ],
@@ -140,7 +140,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (profit_bucket) (rate(aether_pending_arb_candidates_total[1m]))",
+          "expr": "sum by (profit_bucket) (rate(aether_pending_arb_candidates_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "{{profit_bucket}}"
         }
       ],
@@ -154,7 +154,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (reason) (rate(aether_pending_arb_sim_skipped_total[1m]))",
+          "expr": "sum by (reason) (rate(aether_pending_arb_sim_skipped_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
           "legendFormat": "{{reason}}"
         }
       ],
@@ -168,17 +168,17 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "rate(aether_mev_share_hints_total[1m])",
+          "expr": "rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
           "legendFormat": "hints/s"
         },
         {
           "refId": "B",
-          "expr": "rate(aether_mev_share_errors_total[1m])",
+          "expr": "rate(aether_mev_share_errors_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
           "legendFormat": "errors/s"
         },
         {
           "refId": "C",
-          "expr": "rate(aether_mev_share_hints_with_calldata_total[1m])",
+          "expr": "rate(aether_mev_share_hints_with_calldata_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
           "legendFormat": "with calldata/s"
         }
       ],
