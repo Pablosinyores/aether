@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -188,17 +189,25 @@ func (l *PgLedger) insertBundleInner(ctx context.Context, b *NewBundle) error {
 		v := int64(*b.GasUsed)
 		gasUsed = &v
 	}
-	_, err := l.pool.Exec(ctx, `
+	// bundles.builders is JSONB; pgx's default mapping for a Go []string is
+	// the Postgres text[] OID, not JSONB. Marshalling to a []byte JSON array
+	// here lands the right wire format ("[\"flashbots\", ...]") regardless of
+	// whether b.Builders is nil or empty.
+	buildersJSON, err := json.Marshal(b.Builders)
+	if err != nil {
+		return fmt.Errorf("marshal builders: %w", err)
+	}
+	_, err = l.pool.Exec(ctx, `
 		INSERT INTO bundles (
 			bundle_id, arb_id, submitted_at, target_block,
 			signed_tx_hex, gas_used, is_shadow, builders
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8
+			$1, $2, $3, $4, $5, $6, $7, $8::jsonb
 		)
 		ON CONFLICT (bundle_id) DO NOTHING
 	`,
 		b.BundleID, b.ArbID, b.SubmittedAt, int64(b.TargetBlock),
-		b.SignedTxHex, gasUsed, b.IsShadow, b.Builders,
+		b.SignedTxHex, gasUsed, b.IsShadow, buildersJSON,
 	)
 	return err
 }
