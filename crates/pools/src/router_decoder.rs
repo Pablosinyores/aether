@@ -29,9 +29,31 @@
 //! Every decoded swap is paired with a [`Protocol`] tag so downstream
 //! simulators can route to the right post-state computation.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{address, Address, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
+
+/// Routers that share the UniswapV2 ABI but should be tagged as SushiSwap.
+///
+/// SushiSwap forked Router02 verbatim, so its calldata is byte-for-byte
+/// indistinguishable from UniswapV2's at the selector layer; the only signal
+/// the decoder has is the `to` address. Without this dispatch every Sushi
+/// pending tx falls into the UniswapV2 metric label and the registry lookup
+/// hunts in the wrong protocol's pool set.
+///
+/// Update this list when adding a new Sushi-flavoured router (e.g. SushiX,
+/// Sushi RouteProcessor) — adding the address here is the only change
+/// required for correct protocol attribution downstream.
+const SUSHISWAP_ROUTERS: &[Address] =
+    &[address!("d9e1cE17f2641f24aE83637ab66a2cca9C378B9F")];
+
+fn router_to_v2_protocol(router: Address) -> Protocol {
+    if SUSHISWAP_ROUTERS.contains(&router) {
+        Protocol::SushiSwap
+    } else {
+        Protocol::UniswapV2
+    }
+}
 
 /// Protocol tag attached to every successful decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,7 +344,7 @@ fn decode_v2_call(
     let token_out = path[1];
     let path_extra = path.iter().skip(2).copied().collect();
     Ok(DecodedSwap {
-        protocol: Protocol::UniswapV2, // SushiSwap callers rely on metric label, not this
+        protocol: router_to_v2_protocol(router),
         router,
         token_in,
         token_out,
@@ -577,6 +599,48 @@ mod tests {
     fn parse_v3_path_rejects_too_short() {
         let res = parse_v3_path(&[0u8; 10]);
         assert!(matches!(res, Err(DecodeError::EmptyPath)));
+    }
+
+    #[test]
+    fn decode_sushiswap_router_tagged_as_sushi_not_uni_v2() {
+        use IUniswapV2Router02::swapExactTokensForTokensCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let calldata = swapExactTokensForTokensCall {
+            amountIn: U256::from(1_000u64),
+            amountOutMin: U256::from(900u64),
+            path: vec![weth, usdc],
+            to: Address::ZERO,
+            deadline: U256::ZERO,
+        }
+        .abi_encode();
+        let sushi_router = address!("d9e1cE17f2641f24aE83637ab66a2cca9C378B9F");
+        let decoded = decode_pending(sushi_router, &calldata).expect("decode");
+        assert_eq!(
+            decoded.protocol,
+            Protocol::SushiSwap,
+            "Sushi Router02 must dispatch to Protocol::SushiSwap so registry \
+             lookups hit the Sushi pool set, not UniV2's"
+        );
+        assert_eq!(decoded.router, sushi_router);
+    }
+
+    #[test]
+    fn decode_uni_v2_router_still_tagged_as_uni_v2() {
+        use IUniswapV2Router02::swapExactTokensForTokensCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let calldata = swapExactTokensForTokensCall {
+            amountIn: U256::from(1u64),
+            amountOutMin: U256::from(0u64),
+            path: vec![weth, usdc],
+            to: Address::ZERO,
+            deadline: U256::ZERO,
+        }
+        .abi_encode();
+        let uni_v2_router = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");
+        let decoded = decode_pending(uni_v2_router, &calldata).expect("decode");
+        assert_eq!(decoded.protocol, Protocol::UniswapV2);
     }
 
     #[test]
