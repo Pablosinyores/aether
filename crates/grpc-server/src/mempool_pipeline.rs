@@ -114,7 +114,7 @@ impl SimContext {
                 .pair_index_cache
                 .lock()
                 .expect("pair_index_cache poisoned");
-            let stale = cache.as_ref().map_or(true, |(p, _)| *p != registry_ptr);
+            let stale = cache.as_ref().is_none_or(|(p, _)| *p != registry_ptr);
             if stale {
                 let fresh = Arc::new(build_pair_index(&registry_guard));
                 *cache = Some((registry_ptr, Arc::clone(&fresh)));
@@ -396,6 +396,15 @@ fn profit_bucket(profit_factor: f64) -> &'static str {
 /// Saturating U256 → f64. The price graph already stores reserves as f64,
 /// and Bellman-Ford runs in f64 weight space, so feeding the simulator a
 /// f64 amount is consistent with the rest of the detection path.
+///
+/// **Precision contract.** f64 has a 53-bit mantissa (~9.0e15). Any U256
+/// up to 2^53 - 1 round-trips losslessly. Above that the conversion
+/// truncates lower bits — for an 18-decimal token this means amounts up to
+/// ~9 million whole tokens are exact, and arbitrarily large amounts cap at
+/// f64::MAX without panicking. Real on-chain swap sizes sit comfortably
+/// below the lossless bound; the saturating return value protects against
+/// adversarial calldata inflating dx beyond 2^256 → +inf in the math
+/// kernel below.
 fn u256_to_f64_saturating(v: U256) -> f64 {
     let limbs = v.as_limbs();
     let mut result = 0.0f64;

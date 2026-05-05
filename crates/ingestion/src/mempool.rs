@@ -221,8 +221,8 @@ impl MempoolSource for AlchemyMempool {
                             }
                         }
                     }
-                    // Linear bounded backoff; we do not want to give up but
-                    // also do not want to hammer the endpoint.
+                    // Exponential bounded backoff (cap 30 s) — we do not want
+                    // to give up but also do not want to hammer the endpoint.
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             }
