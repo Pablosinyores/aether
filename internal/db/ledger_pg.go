@@ -33,6 +33,13 @@ const (
 	// the executor degrades to NoopLedger via LedgerFromEnv instead of
 	// stalling startup.
 	ledgerConnectTimeout = 2 * time.Second
+
+	// ledgerCloseDrainTimeout caps how long Close() will wait for in-flight
+	// writes to complete before tearing down the pool. A wedged Postgres
+	// must not be able to hang executor shutdown forever; rows still in the
+	// channel at deadline are dropped (counted via existing drops metric
+	// when Inc was already done; otherwise simply unrecorded).
+	ledgerCloseDrainTimeout = 5 * time.Second
 )
 
 // PgLedger writes trade-ledger rows to Postgres via pgxpool. The hot path is
@@ -45,10 +52,11 @@ const (
 // instead of fanning out unbounded background goroutines while Postgres is
 // slow.
 type PgLedger struct {
-	pool    *pgxpool.Pool
-	ch      chan ledgerOp
-	metrics *LedgerMetrics
-	wg      sync.WaitGroup
+	pool             *pgxpool.Pool
+	ch               chan ledgerOp
+	metrics          *LedgerMetrics
+	wg               sync.WaitGroup
+	dispatcherCancel context.CancelFunc
 }
 
 type ledgerOp struct {
@@ -80,13 +88,20 @@ func NewPgLedger(ctx context.Context, databaseURL string, metrics *LedgerMetrics
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
+	// The writer dispatcher runs on a context **independent** of the caller's
+	// ctx so that Close() can shut it down with its own bounded deadline
+	// without racing against the caller's cancellation. Without this split a
+	// caller cancelling ctx would also kill in-flight queries, defeating the
+	// purpose of Close()'s drain.
+	dispatcherCtx, dispatcherCancel := context.WithCancel(context.Background())
 	l := &PgLedger{
-		pool:    pool,
-		ch:      make(chan ledgerOp, ledgerChannelCapacity),
-		metrics: metrics,
+		pool:             pool,
+		ch:               make(chan ledgerOp, ledgerChannelCapacity),
+		metrics:          metrics,
+		dispatcherCancel: dispatcherCancel,
 	}
 	l.wg.Add(1)
-	go l.dispatch(ctx)
+	go l.dispatch(dispatcherCtx)
 
 	slog.Info("PgLedger connected — trade ledger writes enabled",
 		"component", "ledger",
@@ -96,11 +111,33 @@ func NewPgLedger(ctx context.Context, databaseURL string, metrics *LedgerMetrics
 	return l, nil
 }
 
-// Close drains in-flight writes and shuts the pool down. Safe to call from
-// the executor's shutdown path.
+// Close drains in-flight writes and shuts the pool down. Bounded by
+// ledgerCloseDrainTimeout so a wedged Postgres can never hang executor
+// shutdown — rows still in flight at the deadline are abandoned and the
+// pool tears down regardless. Safe to call from the executor's shutdown
+// path.
 func (l *PgLedger) Close() {
 	close(l.ch)
-	l.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// Clean drain.
+	case <-time.After(ledgerCloseDrainTimeout):
+		slog.Warn("PgLedger Close() drain timed out; abandoning in-flight writes",
+			"component", "ledger",
+			"timeout", ledgerCloseDrainTimeout)
+		l.dispatcherCancel()
+		// Wait briefly for the cancelled dispatcher to return so Pool.Close
+		// is not racing with goroutines still touching the pool.
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	}
 	l.pool.Close()
 }
 
@@ -138,6 +175,13 @@ func (l *PgLedger) dispatch(ctx context.Context) {
 	defer l.wg.Done()
 	sem := make(chan struct{}, ledgerMaxInflight)
 	var inflight sync.WaitGroup
+	// `defer inflight.Wait()` guarantees every spawned writer drains before
+	// the dispatcher returns, on every exit path — channel close, ctx
+	// cancel, or a future error branch. Without this, a ctx-cancel return
+	// left dangling writer goroutines holding pool connections after the
+	// dispatcher had reported `wg.Done()`.
+	defer inflight.Wait()
+	defer slog.Info("PgLedger writer dispatcher exiting", "component", "ledger")
 	for op := range l.ch {
 		l.metrics.QueueDepth.Dec()
 		select {
@@ -152,8 +196,6 @@ func (l *PgLedger) dispatch(ctx context.Context) {
 			l.runOne(ctx, op)
 		}(op)
 	}
-	inflight.Wait()
-	slog.Info("PgLedger writer dispatcher exiting", "component", "ledger")
 }
 
 func (l *PgLedger) runOne(ctx context.Context, op ledgerOp) {
