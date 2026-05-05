@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aether-arb/aether/internal/db"
 	"github.com/aether-arb/aether/internal/risk"
 	"github.com/aether-arb/aether/internal/testutil"
 )
@@ -76,7 +77,7 @@ func BenchmarkProcessArb(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_, _ = processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+		_, _ = processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 			"0x0000000000000000000000000000000000000000", 0.5)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aether-arb/aether/internal/db"
 	pb "github.com/aether-arb/aether/internal/pb"
 	"github.com/aether-arb/aether/internal/risk"
 )
@@ -59,7 +60,7 @@ func TestProcessArb_Approved(t *testing.T) {
 
 	arb := newValidArb("arb-approved-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
@@ -77,7 +78,7 @@ func TestProcessArb_RejectedLowProfit(t *testing.T) {
 	// Profit of 0.0001 ETH is below the 0.001 ETH minimum threshold
 	arb := newValidArb("arb-lowprofit-001", 0.0001, 5.0)
 
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
@@ -97,7 +98,7 @@ func TestProcessArb_RejectedHighGas(t *testing.T) {
 
 	arb := newValidArb("arb-highgas-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
@@ -115,7 +116,7 @@ func TestProcessArb_RejectedLowBalance(t *testing.T) {
 	arb := newValidArb("arb-lowbal-001", 0.01, 5.0)
 
 	// Pass ethBalance of 0.05, below the 0.1 ETH minimum
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.05)
 
 	if err != nil {
@@ -133,7 +134,7 @@ func TestProcessArb_RejectedTradeTooLarge(t *testing.T) {
 	// Trade of 60 ETH exceeds the 50 ETH single trade limit
 	arb := newValidArb("arb-bigtrade-001", 0.5, 60.0)
 
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
@@ -161,7 +162,7 @@ func TestProcessArb_SystemPaused(t *testing.T) {
 
 	arb := newValidArb("arb-paused-001", 0.01, 5.0)
 
-	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(ctx, arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 
 	if err != nil {
@@ -200,7 +201,7 @@ func TestProcessArb_CompetitiveReverts_DoNotPause(t *testing.T) {
 	arb := newValidArb("arb-competitive-001", 0.01, 5.0)
 
 	for i := 0; i < 2; i++ {
-		submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter,
+		submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 			"0x0000000000000000000000000000000000000000", 0.5)
 		if err != nil {
 			t.Fatalf("processArb: %v", err)
@@ -244,7 +245,7 @@ func TestProcessArb_BugReverts_PauseSystem(t *testing.T) {
 	// With dedup, each arb attempt counts as 1 revert regardless of builder
 	// count, so we need 2 arb attempts to reach the threshold of 2.
 	for i := 0; i < 2; i++ {
-		submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter,
+		submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 			"0x0000000000000000000000000000000000000000", 0.5)
 		if err != nil {
 			t.Fatalf("processArb[%d]: %v", i, err)
@@ -282,7 +283,7 @@ func TestProcessArb_NonRevertErrors_NotCounted(t *testing.T) {
 
 	arb := newValidArb("arb-timeout-001", 0.01, 5.0)
 
-	submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter,
+	submitted, err := processArb(context.Background(), arb, time.Now(), rm, bundler, submitter, db.NewNoopLedger(),
 		"0x0000000000000000000000000000000000000000", 0.5)
 	if err != nil {
 		t.Fatalf("processArb: %v", err)

@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/aether-arb/aether/internal/config"
+	"github.com/aether-arb/aether/internal/db"
 	aethergrpc "github.com/aether-arb/aether/internal/grpc"
 	pb "github.com/aether-arb/aether/internal/pb"
 	"github.com/aether-arb/aether/internal/risk"
@@ -212,6 +213,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Trade ledger: graceful no-op when DATABASE_URL is unset, so dev /
+	// shadow runs against a fork keep working without Postgres. Connect
+	// failure also degrades to NoopLedger so a misconfigured URL does not
+	// stall executor boot.
+	ledgerMetrics := db.NewLedgerMetrics()
+	ledger := db.LedgerFromEnv(ctx, os.Getenv("DATABASE_URL"), ledgerMetrics)
+	defer func() {
+		if pg, ok := ledger.(*db.PgLedger); ok {
+			pg.Close()
+		}
+	}()
+
 	// Initialize components
 	nonceManager := NewNonceManager(0)
 	if txSigner != nil {
@@ -299,7 +312,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, execCfg.ExecutorAddress, liveBalance)
+			consumeArbStream(ctx, grpcClient, bundler, submitter, riskMgr, ledger, execCfg.ExecutorAddress, liveBalance)
 		}()
 	}
 
@@ -327,6 +340,7 @@ func processArb(
 	rm *risk.RiskManager,
 	bundler *BundleConstructor,
 	submitter *Submitter,
+	ledger db.Ledger,
 	executorAddr string,
 	ethBalance float64,
 ) (submitted bool, err error) {
@@ -372,6 +386,16 @@ func processArb(
 	}
 	buildSpan.End()
 
+	// Derive deterministic ledger ids before either branch so the same
+	// (arb, target_block) pair always maps to the same row, regardless of
+	// shadow vs live submission. Mirrors the Rust engine's
+	// `arb_id_for_opp` so log↔DB joins work end-to-end across the gRPC
+	// boundary.
+	arbDBID := db.ArbIDFromOppID(arb.Id)
+	targetBlock := arb.BlockNumber + 1
+	bundleID := db.BundleIDFor(arbDBID, targetBlock)
+	signedTxHex := signedTxsHex(bundle)
+
 	// Shadow mode: the bundle is fully built and signed, but we skip the
 	// network submission. Used by historical replay + pre-prod measurement
 	// to exercise the full pipeline without touching Flashbots.
@@ -381,7 +405,9 @@ func processArb(
 		profitEth := weiToEth(profitWei)
 		slog.InfoContext(ctx, "shadow bundle built, skipping submission",
 			"arb_id", arb.Id,
-			"target_block", arb.BlockNumber+1,
+			"arb_db_id", arbDBID,
+			"bundle_id", bundleID,
+			"target_block", targetBlock,
 			"tip_tx_count", len(bundle.RawTxs),
 			"profit_eth", profitEth,
 			"gas", arb.TotalGas,
@@ -390,6 +416,17 @@ func processArb(
 		if err := dumpShadowBundle(arb, bundle, profitEth, gasGwei, tipSharePct); err != nil {
 			slog.WarnContext(ctx, "shadow bundle json dump failed", "arb_id", arb.Id, "err", err)
 		}
+		// Persist a `bundles` row for the shadow build so query traffic
+		// can answer "what would we have submitted today" off SQL.
+		ledger.InsertBundle(db.NewBundle{
+			BundleID:    bundleID,
+			ArbID:       arbDBID,
+			SubmittedAt: time.Now().UTC(),
+			TargetBlock: targetBlock,
+			SignedTxHex: signedTxHex,
+			IsShadow:    true,
+			Builders:    nil,
+		})
 		span.SetAttributes(attribute.String("outcome", "shadow"))
 		return true, nil
 	}
@@ -401,7 +438,48 @@ func processArb(
 	recordSubmissionReverts(rm, results)
 	successes := SuccessCount(results)
 
-	slog.InfoContext(ctx, "arb submitted", "arb_id", arb.Id, "builders", len(results), "accepted", successes)
+	slog.InfoContext(ctx, "arb submitted",
+		"arb_id", arb.Id,
+		"arb_db_id", arbDBID,
+		"bundle_id", bundleID,
+		"builders", len(results),
+		"accepted", successes,
+	)
+
+	// Persist the live bundle and the per-builder submission outcome.
+	// IMPORTANT: `Included` here reflects builder *acceptance* of the
+	// bundle for inclusion in the next block, not on-chain inclusion.
+	// True inclusion is resolved later by a `GetBundleStats` poll loop
+	// (separate followup), which UPSERTs the same (bundle_id, builder)
+	// row with `included_block` and `landed_tx_hash` populated.
+	builderNames := make([]string, 0, len(results))
+	for _, r := range results {
+		builderNames = append(builderNames, r.Builder)
+	}
+	now := time.Now().UTC()
+	ledger.InsertBundle(db.NewBundle{
+		BundleID:    bundleID,
+		ArbID:       arbDBID,
+		SubmittedAt: now,
+		TargetBlock: targetBlock,
+		SignedTxHex: signedTxHex,
+		IsShadow:    false,
+		Builders:    builderNames,
+	})
+	for _, r := range results {
+		var errStr *string
+		if r.Error != nil {
+			s := r.Error.Error()
+			errStr = &s
+		}
+		ledger.InsertInclusion(db.NewInclusion{
+			BundleID:   bundleID,
+			Builder:    r.Builder,
+			Included:   r.Success,
+			Error:      errStr,
+			ResolvedAt: now,
+		})
+	}
 
 	// Record result for miss rate tracking
 	included := successes > 0
@@ -410,12 +488,73 @@ func processArb(
 	}
 	rm.RecordBundleResult(included)
 
+	// Inline daily roll-up so `pnl_daily` accumulates during fork / live
+	// runs without a separate cron. Bundle count bumps every submit;
+	// inclusion count + realized profit bump only on builder acceptance.
+	// gas_spent_wei is gas_used * effective_gas_price; we approximate with
+	// total_gas * gas_price_gwei since per-bundle gas_used is unknown
+	// pre-poll. Updated to actuals when the GetBundleStats poll lands.
+	delta := db.PnLDailyDelta{
+		Day:               now,
+		RealizedProfitWei: new(big.Int),
+		GasSpentWei:       gasSpentApprox(arb.TotalGas, gasFees),
+		BundleCount:       1,
+	}
+	if included {
+		delta.RealizedProfitWei = new(big.Int).Set(profitWei)
+		delta.InclusionCount = 1
+	}
+	ledger.UpsertPnLDaily(delta)
+
 	span.SetAttributes(
 		attribute.Int("builders", len(results)),
 		attribute.Int("accepted", successes),
 		attribute.Bool("included", included),
 	)
 	return included, nil
+}
+
+// signedTxsHex concatenates every raw tx in the bundle as a single hex
+// string for the `bundles.signed_tx_hex` TEXT column. Multi-tx bundles are
+// joined with newlines so a future split-and-decode is trivial.
+func signedTxsHex(bundle *Bundle) string {
+	if bundle == nil {
+		return ""
+	}
+	var b strings.Builder
+	for i, raw := range bundle.RawTxs {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("0x")
+		b.WriteString(hexEncode(raw))
+	}
+	return b.String()
+}
+
+// gasSpentApprox estimates wei spent on gas as `gas * gas_price`. Gwei is
+// pre-multiplied by 1e9 to land in wei. Used in pnl_daily before the
+// GetBundleStats poll updates the row with on-chain `gas_used`.
+func gasSpentApprox(gasUnits uint64, fees GasFees) *big.Int {
+	priceWei := new(big.Float).SetFloat64(fees.GasPriceGwei * 1e9)
+	gas := new(big.Float).SetUint64(gasUnits)
+	out, _ := new(big.Float).Mul(priceWei, gas).Int(nil)
+	if out == nil {
+		return new(big.Int)
+	}
+	return out
+}
+
+// hexEncode is a thin wrapper around encoding/hex.EncodeToString reused by
+// signedTxsHex so the import surface in this file stays minimal.
+func hexEncode(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, v := range b {
+		out[i*2] = hexdigits[v>>4]
+		out[i*2+1] = hexdigits[v&0x0f]
+	}
+	return string(out)
 }
 
 // recordSubmissionReverts classifies and records a single revert per arb
@@ -466,7 +605,7 @@ func looksLikeRevert(errMsg string) bool {
 // processes validated arbitrage opportunities as they arrive. On stream
 // errors it reconnects with a backoff delay. The function exits when ctx
 // is cancelled.
-func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, executorAddr string, liveBalance *LiveBalance) {
+func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *BundleConstructor, submitter *Submitter, rm *risk.RiskManager, ledger db.Ledger, executorAddr string, liveBalance *LiveBalance) {
 	const (
 		minProfitETH   = 0.001 // Minimum profit threshold in ETH
 		reconnectDelay = 5 * time.Second
@@ -502,7 +641,7 @@ func consumeArbStream(ctx context.Context, client *aethergrpc.Client, bundler *B
 
 			slog.InfoContext(ctx, "arb received", "arb_id", arb.Id, "hops", len(arb.Hops), "gas", arb.TotalGas, "block", arb.BlockNumber)
 
-			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, executorAddr, liveBalance.Get())
+			submitted, err := processArb(ctx, arb, receivedAt, rm, bundler, submitter, ledger, executorAddr, liveBalance.Get())
 			switch {
 			case err != nil:
 				slog.ErrorContext(ctx, "error processing arb", "arb_id", arb.Id, "err", err)
