@@ -33,6 +33,24 @@ use alloy::primitives::{address, Address, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
 
+/// Curve Router addresses we knowingly cannot decode yet.
+///
+/// Curve's `exchange` / `exchange_multiple` selectors vary per pool registry
+/// version and the calldata shape is too divergent to handle in the scaffold.
+/// We still want pending txs to these routers in the address filter (so the
+/// firehose stays representative of real router traffic), but unknown-selector
+/// errors against them otherwise drown out genuine decoder gaps in
+/// other protocols. Marking them up-front lets the caller bump a dedicated
+/// `curve_unsupported` reason instead of `unknown_selector`.
+const CURVE_ROUTERS: &[Address] =
+    &[address!("99a58482BD75cbab83b27EC03CA68fF489b5788f")];
+
+/// Returns `true` when `router` is a known Curve router that the decoder
+/// cannot parse. Caller should short-circuit with a dedicated metric.
+pub fn is_unsupported_curve_router(router: Address) -> bool {
+    CURVE_ROUTERS.contains(&router)
+}
+
 /// Routers that share the UniswapV2 ABI but should be tagged as SushiSwap.
 ///
 /// SushiSwap forked Router02 verbatim, so its calldata is byte-for-byte
@@ -104,6 +122,12 @@ pub enum DecodeError {
     AbiDecode(String),
     #[error("path is empty or malformed")]
     EmptyPath,
+    /// Recipient is a Curve router but the decoder does not yet support
+    /// Curve's `exchange` / `exchange_multiple` shapes. Distinct from
+    /// `UnknownSelector` so the `curve_unsupported` metric reason isolates
+    /// the known gap from genuine unmapped selectors elsewhere.
+    #[error("curve router {0} not yet supported by decoder")]
+    CurveUnsupported(Address),
 }
 
 // ── Router ABIs ──
@@ -203,6 +227,13 @@ sol! {
 pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, DecodeError> {
     if calldata.len() < 4 {
         return Err(DecodeError::TooShort);
+    }
+    // Short-circuit known Curve routers before selector dispatch so they map
+    // to a dedicated reason instead of inflating `unknown_selector`. They
+    // remain in the address filter because dropping them would skew the
+    // firehose's protocol mix away from real router traffic.
+    if is_unsupported_curve_router(to) {
+        return Err(DecodeError::CurveUnsupported(to));
     }
     let selector: [u8; 4] = calldata[0..4].try_into().expect("4 bytes by check above");
 

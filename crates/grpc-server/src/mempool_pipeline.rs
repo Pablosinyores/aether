@@ -414,6 +414,7 @@ fn decode_error_label(err: &DecodeError) -> &'static str {
         DecodeError::UnknownSelector { .. } => "unknown_selector",
         DecodeError::AbiDecode(_) => "abi_decode",
         DecodeError::EmptyPath => "empty_path",
+        DecodeError::CurveUnsupported(_) => "curve_unsupported",
     }
 }
 
@@ -455,6 +456,10 @@ mod tests {
             "abi_decode"
         );
         assert_eq!(decode_error_label(&DecodeError::EmptyPath), "empty_path");
+        assert_eq!(
+            decode_error_label(&DecodeError::CurveUnsupported(alloy::primitives::Address::ZERO)),
+            "curve_unsupported"
+        );
     }
 
     #[test]
