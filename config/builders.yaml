@@ -10,6 +10,23 @@ builders:
     timeout_ms: 2000
     auth_type: "none"
     # To use API key auth, set auth_type: "api_key" and auth_key: "${TITAN_API_KEY}"
+  - name: "eden"
+    url: "https://api.edennetwork.io/v1/bundle"
+    enabled: true
+    timeout_ms: 2000
+    auth_type: "none"
+    # Eden requires an API key for production. Set auth_type: "api_key" and
+    # auth_key: "${EDEN_API_KEY}" once the env var is provisioned in .env.
+    # Validation rejects api_key entries with empty keys, so this defaults to
+    # "none" to keep startup clean — submissions without auth will be rejected
+    # by the relay until the key is wired.
+  - name: "rsync"
+    url: "https://rsync-builder.xyz"
+    enabled: true
+    timeout_ms: 2000
+    auth_type: "none"
+    # Same opt-in pattern as Eden. Set auth_type: "api_key" and
+    # auth_key: "${RSYNC_API_KEY}" once the env var is provisioned in .env.
 
 submission:
   fan_out: true
