@@ -155,11 +155,18 @@ func (l *PgLedger) UpsertPnLDaily(d PnLDailyDelta) {
 
 // enqueue is the common non-blocking enqueue path. Saturation drops the row
 // and bumps `aether_ledger_drops_total{op}`.
+//
+// Bumps QueueDepth **before** the send so the dispatcher's matching Dec()
+// always pairs against an Inc() that has already landed. The previous order
+// (send, then Inc) allowed a brief negative-gauge window on dashboards
+// during heavy enqueue/dequeue interleaving. On a failed send we revert the
+// Inc so the gauge stays consistent with the actual channel depth.
 func (l *PgLedger) enqueue(op ledgerOp) {
+	l.metrics.QueueDepth.Inc()
 	select {
 	case l.ch <- op:
-		l.metrics.QueueDepth.Inc()
 	default:
+		l.metrics.QueueDepth.Dec()
 		l.metrics.DropsTotal.WithLabelValues(op.kind).Inc()
 		slog.Warn("ledger channel full — dropping row",
 			"component", "ledger",

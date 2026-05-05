@@ -41,9 +41,12 @@ func NewLedgerMetrics() *LedgerMetrics {
 			Help: "Pending trade-ledger writes sitting in the writer goroutine channel",
 		}),
 		WriteLatencyMs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "aether_ledger_write_latency_ms",
-			Help:    "Per-op latency of trade-ledger writes from dequeue to query completion",
-			Buckets: []float64{0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0},
+			Name: "aether_ledger_write_latency_ms",
+			Help: "Per-op latency of trade-ledger writes from dequeue to query completion",
+			// Sub-millisecond buckets land first because local-Postgres
+			// inserts run ~150-300 µs and we want p50 visible on dashboards
+			// without being flattened into the 0.5 ms bucket.
+			Buckets: []float64{0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0},
 		}, []string{"op"}),
 	}
 	prometheus.MustRegister(m.WritesTotal, m.DropsTotal, m.QueueDepth, m.WriteLatencyMs)
