@@ -107,8 +107,15 @@ func (c *MevShareConsumer) Run(ctx context.Context) {
 	}
 }
 
+// sseReadIdleTimeout is the maximum gap allowed between two reads from the
+// MEV-Share stream. Flashbots sends a `:ping` SSE comment every 15 s as
+// connection keepalive, so any gap noticeably longer than that signals a
+// silent half-open TCP connection (NAT timeout, network partition, broker
+// crash). 60 s gives 4 ping intervals of slack before forcing reconnect.
+const sseReadIdleTimeout = 60 * time.Second
+
 // streamOnce opens a single SSE connection, parses events line-by-line until
-// the server closes or an error occurs.
+// the server closes, the read-idle deadline expires, or ctx is cancelled.
 func (c *MevShareConsumer) streamOnce(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint, nil)
 	if err != nil {
@@ -127,8 +134,20 @@ func (c *MevShareConsumer) streamOnce(ctx context.Context) error {
 		return fmt.Errorf("upstream status %d", resp.StatusCode)
 	}
 
-	slog.Info("mev-share stream connected", "endpoint", c.endpoint)
-	scanner := bufio.NewScanner(resp.Body)
+	slog.Info("mev-share stream connected",
+		"endpoint", c.endpoint,
+		"read_idle_timeout", sseReadIdleTimeout)
+
+	// Wrap the body so any read that blocks past sseReadIdleTimeout cancels
+	// itself and surfaces as an error to the scanner. http.Client.Timeout
+	// alone cannot do this for streams: Timeout = 0 (required for SSE)
+	// disables the per-request deadline entirely. A goroutine-driven
+	// cancellation tied to the request context is the only portable path.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	body := newIdleTimeoutReader(resp.Body, sseReadIdleTimeout, cancelStream)
+
+	scanner := bufio.NewScanner(body)
 	// SSE events can carry up to a few KB of nested log data; raise the
 	// default 64KB scanner buffer to 1MB to be safe.
 	scanner.Buffer(make([]byte, 0, 4096), 1<<20)
@@ -157,9 +176,54 @@ func (c *MevShareConsumer) streamOnce(ctx context.Context) error {
 		// not currently differentiate event types.
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
+		// Distinguish idle-timeout from generic read errors so the outer
+		// reconnect loop can log the cause precisely.
+		if streamCtx.Err() != nil && ctx.Err() == nil {
+			return fmt.Errorf("read idle timeout after %s: %w", sseReadIdleTimeout, err)
+		}
 		return fmt.Errorf("read: %w", err)
 	}
 	return nil
+}
+
+// idleTimeoutReader wraps an io.ReadCloser and forces the next Read to fail
+// when no bytes have arrived for `idle`. cancel is invoked once on timeout,
+// which (when wired to the http.Request context) tears down the underlying
+// TCP connection and unblocks any in-flight Read in resp.Body.
+type idleTimeoutReader struct {
+	inner  io.ReadCloser
+	timer  *time.Timer
+	idle   time.Duration
+	cancel context.CancelFunc
+}
+
+func newIdleTimeoutReader(r io.ReadCloser, idle time.Duration, cancel context.CancelFunc) *idleTimeoutReader {
+	rd := &idleTimeoutReader{inner: r, idle: idle, cancel: cancel}
+	rd.timer = time.AfterFunc(idle, cancel)
+	return rd
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	n, err := r.inner.Read(p)
+	if n > 0 {
+		// Reset on any bytes — including SSE :ping comments, which count
+		// as proof of life from the broker.
+		if !r.timer.Stop() {
+			// Drain a fired timer so Reset is safe (best-effort: select
+			// is non-blocking via default to avoid hanging on a timer
+			// that already drained itself).
+			select {
+			default:
+			}
+		}
+		r.timer.Reset(r.idle)
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReader) Close() error {
+	r.timer.Stop()
+	return r.inner.Close()
 }
 
 // handleData parses one SSE event payload into a MevShareHint and updates
