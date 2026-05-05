@@ -466,16 +466,24 @@ func processArb(
 		IsShadow:    false,
 		Builders:    builderNames,
 	})
+	// Per-builder submission row. `included` stays false here even when the
+	// builder ACKs the bundle — `inclusion_results.included` is the on-chain
+	// outcome the schema's `WHERE included` partial index expects, not the
+	// JSON-RPC ACK. The future GetBundleStats poll loop UPSERTs the same
+	// (bundle_id, builder) row with the on-chain truth (included = true,
+	// included_block, landed_tx_hash). Submit-time Error is preserved on
+	// failure so dashboards can distinguish 'builder rejected' from 'never
+	// landed'.
 	for _, r := range results {
 		var errStr *string
-		if r.Error != nil {
+		if !r.Success && r.Error != nil {
 			s := r.Error.Error()
 			errStr = &s
 		}
 		ledger.InsertInclusion(db.NewInclusion{
 			BundleID:   bundleID,
 			Builder:    r.Builder,
-			Included:   r.Success,
+			Included:   false,
 			Error:      errStr,
 			ResolvedAt: now,
 		})
@@ -489,22 +497,17 @@ func processArb(
 	rm.RecordBundleResult(included)
 
 	// Inline daily roll-up so `pnl_daily` accumulates during fork / live
-	// runs without a separate cron. Bundle count bumps every submit;
-	// inclusion count + realized profit bump only on builder acceptance.
-	// gas_spent_wei is gas_used * effective_gas_price; we approximate with
-	// total_gas * gas_price_gwei since per-bundle gas_used is unknown
-	// pre-poll. Updated to actuals when the GetBundleStats poll lands.
-	delta := db.PnLDailyDelta{
+	// runs without a separate cron. bundle_count bumps every submit. The
+	// inclusion_count + realized_profit_wei increments are deferred to the
+	// future GetBundleStats poll loop so they reflect on-chain inclusion,
+	// not builder ACK. gas_spent_wei approximates with total_gas *
+	// gas_price for now; the poll loop replaces this with actual gas_used.
+	ledger.UpsertPnLDaily(db.PnLDailyDelta{
 		Day:               now,
 		RealizedProfitWei: new(big.Int),
 		GasSpentWei:       gasSpentApprox(arb.TotalGas, gasFees),
 		BundleCount:       1,
-	}
-	if included {
-		delta.RealizedProfitWei = new(big.Int).Set(profitWei)
-		delta.InclusionCount = 1
-	}
-	ledger.UpsertPnLDaily(delta)
+	})
 
 	span.SetAttributes(
 		attribute.Int("builders", len(results)),
