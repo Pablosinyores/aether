@@ -24,15 +24,6 @@ type Metrics struct {
 	RevertsBug            atomic.Int64
 	RevertsCompetitive    atomic.Int64
 
-	// MEV-Share SSE consumer counters. Bumped when the consumer parses a
-	// hint event from the Flashbots stream. Each is split by privacy field
-	// presence so dashboards can chart how many hints carry usable signal
-	// (calldata, logs) vs hash-only events that need round-trip work.
-	MevShareHintsTotal      atomic.Int64
-	MevShareHintsWithLogs   atomic.Int64
-	MevShareHintsWithCalldata atomic.Int64
-	MevShareErrors          atomic.Int64
-
 	// Gauges
 	GasPriceGwei atomic.Int64 // Stored as gwei * 100 for precision
 	DailyPnLWei  atomic.Int64 // Stored as signed int
@@ -98,22 +89,6 @@ func (m *Metrics) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP aether_eth_balance Current ETH balance\n")
 	fmt.Fprintf(w, "# TYPE aether_eth_balance gauge\n")
 	fmt.Fprintf(w, "aether_eth_balance %.6f\n\n", float64(m.ETHBalance.Load())/1e6)
-
-	fmt.Fprintf(w, "# HELP aether_mev_share_hints_total Total MEV-Share SSE hints received\n")
-	fmt.Fprintf(w, "# TYPE aether_mev_share_hints_total counter\n")
-	fmt.Fprintf(w, "aether_mev_share_hints_total %d\n\n", m.MevShareHintsTotal.Load())
-
-	fmt.Fprintf(w, "# HELP aether_mev_share_hints_with_logs_total MEV-Share hints carrying logs\n")
-	fmt.Fprintf(w, "# TYPE aether_mev_share_hints_with_logs_total counter\n")
-	fmt.Fprintf(w, "aether_mev_share_hints_with_logs_total %d\n\n", m.MevShareHintsWithLogs.Load())
-
-	fmt.Fprintf(w, "# HELP aether_mev_share_hints_with_calldata_total MEV-Share hints carrying calldata\n")
-	fmt.Fprintf(w, "# TYPE aether_mev_share_hints_with_calldata_total counter\n")
-	fmt.Fprintf(w, "aether_mev_share_hints_with_calldata_total %d\n\n", m.MevShareHintsWithCalldata.Load())
-
-	fmt.Fprintf(w, "# HELP aether_mev_share_errors_total MEV-Share SSE consumer errors\n")
-	fmt.Fprintf(w, "# TYPE aether_mev_share_errors_total counter\n")
-	fmt.Fprintf(w, "aether_mev_share_errors_total %d\n\n", m.MevShareErrors.Load())
 }
 
 func (m *Metrics) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -177,15 +152,6 @@ func main() {
 
 	// Send startup alert
 	alerter.Send(SeverityInfo, "System Started", "Aether monitor service started")
-
-	// Spawn the MEV-Share SSE consumer when MEMPOOL_TRACKING is on. Stays
-	// silent (no goroutine, no metrics movement) when the flag is unset.
-	if mempoolTrackingEnabled() {
-		endpoint := os.Getenv("MEV_SHARE_URL")
-		consumer := NewMevShareConsumer(endpoint, metrics)
-		slog.Info("mev-share consumer enabled", "endpoint", consumer.endpoint)
-		go consumer.Run(context.Background())
-	}
 
 	// Block forever (in production, would have signal handling)
 	select {}
