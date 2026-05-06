@@ -1,18 +1,27 @@
 {
   "uid": "aether-mempool",
-  "title": "Aether — Mempool (testing scaffold)",
-  "tags": ["aether", "mempool"],
+  "title": "Aether \u2014 Mempool (testing scaffold)",
+  "tags": [
+    "aether",
+    "mempool"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "10s",
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "Pending DEX txs (1m rate)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -21,18 +30,31 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
         "colorMode": "value",
         "graphMode": "area",
         "textMode": "value_and_name"
       },
-      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 6 }
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      }
     },
     {
       "id": 2,
       "type": "stat",
       "title": "Decode success rate",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -47,49 +69,21 @@
           "max": 100
         }
       },
-      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 6 }
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "MEV-Share hints (1m rate)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
-          "legendFormat": "hints/s"
-        }
-      ],
-      "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
-        "colorMode": "value",
-        "graphMode": "area"
-      },
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 6 }
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Hints carrying logs (5m share)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "100 * sum(rate(aether_mev_share_hints_with_logs_total{job=~\"aether-go|aether-host-monitor\"}[5m])) / clamp_min(sum(rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[5m])), 1e-9)",
-          "legendFormat": "%"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "percent", "min": 0, "max": 100 }
-      },
-      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 6 }
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      }
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Pending DEX tx rate by protocol",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -97,13 +91,21 @@
           "legendFormat": "{{protocol}}"
         }
       ],
-      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 9 }
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 9
+      }
     },
     {
       "id": 6,
       "type": "timeseries",
       "title": "Decoder failures by reason",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -111,13 +113,21 @@
           "legendFormat": "{{reason}}"
         }
       ],
-      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 9 }
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 9
+      }
     },
     {
       "id": 8,
       "type": "stat",
       "title": "Arb candidates (1m rate)",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -126,17 +136,30 @@
         }
       ],
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
         "colorMode": "value",
         "graphMode": "area"
       },
-      "gridPos": { "x": 0, "y": 24, "w": 6, "h": 6 }
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 6,
+        "h": 6
+      }
     },
     {
       "id": 9,
       "type": "timeseries",
       "title": "Arb candidates by profit bucket",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -144,13 +167,21 @@
           "legendFormat": "{{profit_bucket}}"
         }
       ],
-      "gridPos": { "x": 6, "y": 24, "w": 9, "h": 9 }
+      "gridPos": {
+        "x": 6,
+        "y": 24,
+        "w": 9,
+        "h": 9
+      }
     },
     {
       "id": 10,
       "type": "timeseries",
       "title": "Sim skipped by reason",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "refId": "A",
@@ -158,31 +189,12 @@
           "legendFormat": "{{reason}}"
         }
       ],
-      "gridPos": { "x": 15, "y": 24, "w": 9, "h": 9 }
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "MEV-Share stream health",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "rate(aether_mev_share_hints_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
-          "legendFormat": "hints/s"
-        },
-        {
-          "refId": "B",
-          "expr": "rate(aether_mev_share_errors_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
-          "legendFormat": "errors/s"
-        },
-        {
-          "refId": "C",
-          "expr": "rate(aether_mev_share_hints_with_calldata_total{job=~\"aether-go|aether-host-monitor\"}[1m])",
-          "legendFormat": "with calldata/s"
-        }
-      ],
-      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 9 }
+      "gridPos": {
+        "x": 15,
+        "y": 24,
+        "w": 9,
+        "h": 9
+      }
     }
   ]
 }
