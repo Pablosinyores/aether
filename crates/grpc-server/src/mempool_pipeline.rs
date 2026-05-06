@@ -199,6 +199,9 @@ fn handle_event(
         Ok(swap) => {
             emit_decoded(metrics, &router_label, &swap, &event);
             if let Some(ctx) = sim_ctx {
+                if !pre_sim_filter(metrics, ctx, &swap) {
+                    return;
+                }
                 let metrics = Arc::clone(metrics);
                 let ctx = Arc::clone(ctx);
                 let swap = swap.clone();
@@ -209,6 +212,56 @@ fn handle_event(
             }
         }
         Err(err) => emit_failure(metrics, &router_label, &err),
+    }
+}
+
+/// Drop a decoded swap before any sim work is scheduled when it would land
+/// nowhere useful: self-swap, zero amount, or a (token, token, protocol)
+/// triple absent from the live `pool_registry`. Bumps
+/// `aether_mempool_filtered_total{reason}` and returns `false` on drop;
+/// returns `true` to pass the swap through to the sim task.
+///
+/// The pool-registry check is the load-bearing one — without it every
+/// shitcoin V2 swap on mainnet would queue a `spawn_blocking` that clones
+/// the live graph (~3.8 MB) only to bump
+/// `pending_arb_sim_skipped{token_in_unknown}` and discard the work.
+fn pre_sim_filter(metrics: &EngineMetrics, ctx: &SimContext, swap: &DecodedSwap) -> bool {
+    if swap.token_in == swap.token_out {
+        metrics.inc_mempool_filtered("same_token");
+        return false;
+    }
+    if swap.amount_in.is_zero() {
+        metrics.inc_mempool_filtered("zero_amount");
+        return false;
+    }
+    let target_protocol = match decoder_protocol_to_type(swap.protocol) {
+        Some(p) => p,
+        // Protocols whose post-state predictor we don't ship yet still
+        // surface in `pending_arb_sim_skipped{protocol_unsupported}` so the
+        // existing dashboard panel keeps measuring the V3/Curve/Balancer
+        // gap. Don't double-count under `mempool_filtered_total`.
+        None => return true,
+    };
+    if ctx
+        .lookup_pool(swap.token_in, swap.token_out, target_protocol)
+        .is_none()
+    {
+        metrics.inc_mempool_filtered("not_in_registry");
+        return false;
+    }
+    true
+}
+
+/// Map the router decoder's `Protocol` (a parser-side enum) to the workspace
+/// `ProtocolType` used in the pool registry. Returns `None` for protocols
+/// the post-state simulator doesn't yet handle so callers can route those
+/// through the existing `protocol_unsupported` skip path instead of the
+/// mempool filter.
+fn decoder_protocol_to_type(p: Protocol) -> Option<ProtocolType> {
+    match p {
+        Protocol::UniswapV2 => Some(ProtocolType::UniswapV2),
+        Protocol::SushiSwap => Some(ProtocolType::SushiSwap),
+        Protocol::UniswapV3 | Protocol::BalancerV2 => None,
     }
 }
 
@@ -572,5 +625,104 @@ mod tests {
     #[test]
     fn u256_to_f64_small_value() {
         assert!((u256_to_f64_saturating(U256::from(1_000_000u64)) - 1_000_000.0).abs() < 1.0);
+    }
+
+    // ----- pre_sim_filter -----
+
+    /// Build an empty SimContext suitable for tests that exercise the filter
+    /// without needing real graph state — registry is empty, token index
+    /// empty, snapshot has a zero-vertex graph. Any `lookup_pool` returns
+    /// `None`, which is what the `not_in_registry` test wants anyway.
+    fn empty_sim_ctx() -> Arc<SimContext> {
+        use aether_state::price_graph::PriceGraph;
+        Arc::new(SimContext::new(
+            Arc::new(ArcSwap::from_pointee(HashMap::<Address, PoolMetadata>::new())),
+            Arc::new(ArcSwap::from_pointee(TokenIndex::default())),
+            Arc::new(SnapshotManager::new(PriceGraph::new(0))),
+            BellmanFord::new(3, 1_000),
+        ))
+    }
+
+    fn fake_swap(protocol: Protocol, token_in: Address, token_out: Address, amount_in: U256) -> DecodedSwap {
+        DecodedSwap {
+            protocol,
+            router: Address::ZERO,
+            token_in,
+            token_out,
+            amount_in,
+            amount_out_min: U256::ZERO,
+            recipient: Address::ZERO,
+            fee_bps: 0,
+            path_extra: vec![],
+        }
+    }
+
+    fn filtered_count(metrics: &EngineMetrics, reason: &str) -> u64 {
+        metrics.mempool_filtered_count(reason)
+    }
+
+    #[test]
+    fn pre_sim_filter_drops_same_token_swaps() {
+        let metrics = EngineMetrics::new();
+        let ctx = empty_sim_ctx();
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let swap = fake_swap(Protocol::UniswapV2, weth, weth, U256::from(1u64));
+        assert!(!pre_sim_filter(&metrics, &ctx, &swap));
+        assert_eq!(filtered_count(&metrics, "same_token"), 1);
+    }
+
+    #[test]
+    fn pre_sim_filter_drops_zero_amount() {
+        let metrics = EngineMetrics::new();
+        let ctx = empty_sim_ctx();
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let swap = fake_swap(Protocol::UniswapV2, weth, usdc, U256::ZERO);
+        assert!(!pre_sim_filter(&metrics, &ctx, &swap));
+        assert_eq!(filtered_count(&metrics, "zero_amount"), 1);
+    }
+
+    #[test]
+    fn pre_sim_filter_drops_pair_absent_from_registry() {
+        let metrics = EngineMetrics::new();
+        let ctx = empty_sim_ctx();
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let swap = fake_swap(Protocol::UniswapV2, weth, usdc, U256::from(1_000u64));
+        assert!(!pre_sim_filter(&metrics, &ctx, &swap));
+        assert_eq!(filtered_count(&metrics, "not_in_registry"), 1);
+    }
+
+    #[test]
+    fn pre_sim_filter_passes_unsupported_protocols_through() {
+        // V3 / Balancer have no analytical predictor yet — filter must NOT
+        // drop them under `not_in_registry`. They flow into the sim task and
+        // hit the existing `protocol_unsupported` skip path so the gap stays
+        // visible on its own counter.
+        let metrics = EngineMetrics::new();
+        let ctx = empty_sim_ctx();
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        for proto in [Protocol::UniswapV3, Protocol::BalancerV2] {
+            let swap = fake_swap(proto, weth, usdc, U256::from(1_000u64));
+            assert!(pre_sim_filter(&metrics, &ctx, &swap));
+        }
+        assert_eq!(filtered_count(&metrics, "not_in_registry"), 0);
+        assert_eq!(filtered_count(&metrics, "same_token"), 0);
+        assert_eq!(filtered_count(&metrics, "zero_amount"), 0);
+    }
+
+    #[test]
+    fn decoder_protocol_to_type_maps_supported_protocols() {
+        assert_eq!(
+            decoder_protocol_to_type(Protocol::UniswapV2),
+            Some(ProtocolType::UniswapV2)
+        );
+        assert_eq!(
+            decoder_protocol_to_type(Protocol::SushiSwap),
+            Some(ProtocolType::SushiSwap)
+        );
+        assert_eq!(decoder_protocol_to_type(Protocol::UniswapV3), None);
+        assert_eq!(decoder_protocol_to_type(Protocol::BalancerV2), None);
     }
 }

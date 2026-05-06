@@ -43,6 +43,20 @@ pub struct EngineMetrics {
     /// events fired. Sustained non-zero growth = pipeline is the bottleneck;
     /// either widen the channel or shed mempool sources.
     pending_pipeline_lagged_total: IntCounter,
+    /// Reason-tagged counter for pending swaps the pipeline drops *after*
+    /// the router decoder succeeds but *before* the post-state simulator
+    /// gets a chance to run. Distinct from `pending_arb_sim_skipped_total`
+    /// (which fires once the sim task has started and discovered a missing
+    /// graph edge / zero reserves / etc.). Bumping here short-circuits the
+    /// 3.8 MB graph clone the sim does, so it is cheap to be aggressive.
+    ///
+    /// Stable label set:
+    ///   - `not_in_registry` — neither (token_in, token_out, protocol)
+    ///                         tuple is present in `pool_registry`
+    ///   - `same_token`      — decoder returned a self-swap
+    ///                         (likely fee-on-transfer wrapper)
+    ///   - `zero_amount`     — `amount_in == 0` (no profit possible)
+    mempool_filtered_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -128,6 +142,14 @@ impl EngineMetrics {
             "Pending-tx events dropped because the decode pipeline lagged behind the broadcast",
         )
         .expect("aether_pending_pipeline_lagged_total counter");
+        let mempool_filtered_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_filtered_total",
+                "Decoded pending swaps dropped before the post-state simulator runs, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_mempool_filtered_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -165,6 +187,9 @@ impl EngineMetrics {
         registry
             .register(Box::new(pending_pipeline_lagged_total.clone()))
             .expect("register aether_pending_pipeline_lagged_total");
+        registry
+            .register(Box::new(mempool_filtered_total.clone()))
+            .expect("register aether_mempool_filtered_total");
 
         Self {
             registry,
@@ -180,6 +205,7 @@ impl EngineMetrics {
             pending_arb_candidates_total,
             pending_arb_sim_skipped_total,
             pending_pipeline_lagged_total,
+            mempool_filtered_total,
         }
     }
 
@@ -270,6 +296,26 @@ impl EngineMetrics {
         if n > 0 {
             self.pending_pipeline_lagged_total.inc_by(n);
         }
+    }
+
+    /// Bump `aether_mempool_filtered_total{reason="..."}` for a decoded
+    /// pending swap the pipeline rejects before any sim work is scheduled.
+    /// See the field doc on `mempool_filtered_total` for the stable label
+    /// set.
+    pub fn inc_mempool_filtered(&self, reason: &str) {
+        self.mempool_filtered_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Read the current value of `aether_mempool_filtered_total{reason}`.
+    /// Public so tests in the `aether-rust` bin (a separate crate from the
+    /// `aether-grpc-server` lib) can assert filter behaviour without
+    /// re-implementing Prometheus text parsing.
+    pub fn mempool_filtered_count(&self, reason: &str) -> u64 {
+        self.mempool_filtered_total
+            .with_label_values(&[reason])
+            .get()
     }
 
     /// Render the registered metrics in Prometheus text exposition format.
