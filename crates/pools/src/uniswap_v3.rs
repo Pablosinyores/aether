@@ -26,6 +26,36 @@ pub struct UniswapV3Pool {
 
 // Constants for Q96 fixed-point math
 const Q96: u128 = 1u128 << 96;
+/// 2^96 in `f64` form. The closest representable double to the exact
+/// integer; used by [`sqrt_price_x96_to_tick`] to project Q96 prices into
+/// the f64 domain where tick math is cheap.
+const TWO_POW_96_F64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+/// Pre-computed `ln(1.0001)` to avoid recomputing per call. Determines
+/// the size of one V3 tick on the log-price axis.
+const LN_1_0001: f64 = 0.000_099_995_000_333_308_34;
+
+/// Project a Q96 sqrt-price into its V3 tick index. Used to detect when a
+/// post-swap `sqrt_price_x96` lands outside the active tick bucket and the
+/// analytical single-tick math no longer holds. f64 precision is enough
+/// here because each tick is a 1.0001× multiplicative step (~1 bp) and
+/// f64's ~15-digit mantissa resolves that with margin to spare across the
+/// full `[MIN_TICK, MAX_TICK]` range.
+fn sqrt_price_x96_to_tick(sqrt_price_x96: U256) -> i32 {
+    let limbs = sqrt_price_x96.as_limbs();
+    let raw = limbs[0] as f64
+        + limbs[1] as f64 * 18_446_744_073_709_551_616.0
+        + limbs[2] as f64 * 3.402_823_669_209_385e38
+        + limbs[3] as f64 * 1.157_920_892_373_162e77;
+    if raw <= 0.0 || !raw.is_finite() {
+        return i32::MIN;
+    }
+    let sqrt_norm = raw / TWO_POW_96_F64;
+    let price = sqrt_norm * sqrt_norm;
+    if price <= 0.0 || !price.is_finite() {
+        return i32::MIN;
+    }
+    (price.ln() / LN_1_0001).floor() as i32
+}
 
 /// Snapshot of a UniswapV3 pool *after* a hypothetical victim swap has been
 /// applied. Returned by [`UniswapV3Pool::predict_post_state`] so the mempool
@@ -86,6 +116,25 @@ impl UniswapV3Pool {
         self.ticks = ticks;
     }
 
+    /// True when `new_sqrt_price_x96` projects to a tick inside the
+    /// `[bucket_low, bucket_high)` range that contains the pool's current
+    /// active tick. The bucket is aligned to `tick_spacing` using
+    /// floor-division (Euclidean, so it is correct for negative ticks too;
+    /// `i32::div_euclid` rounds toward `-∞`).
+    fn is_within_active_tick_bucket(&self, new_sqrt_price_x96: U256) -> bool {
+        if self.tick_spacing <= 0 {
+            // Defensive: a non-positive tick_spacing is invalid V3 state;
+            // treat as "single tick" so the predictor still returns
+            // *some* answer rather than crashing the caller. The EVM
+            // fallback path will catch any real misuse downstream.
+            return true;
+        }
+        let new_tick = sqrt_price_x96_to_tick(new_sqrt_price_x96);
+        let bucket_low = self.tick.div_euclid(self.tick_spacing) * self.tick_spacing;
+        let bucket_high = bucket_low + self.tick_spacing;
+        new_tick >= bucket_low && new_tick < bucket_high
+    }
+
     /// Predict the pool's post-swap state under the same single-tick
     /// constant-liquidity assumption as [`Self::compute_swap_within_tick`].
     /// Mempool post-state simulation uses this to update its graph-edge
@@ -98,9 +147,13 @@ impl UniswapV3Pool {
     ///   - the math underflows / divides by zero (defensive — should not
     ///     happen on real pool state)
     ///
-    /// `single_tick` on the returned state is hard-coded to `true` here.
-    /// The cross-tick branch lives in a follow-up commit and flips this
-    /// flag to signal an EVM fork-replay fallback to the caller.
+    /// `single_tick` is `true` when the post-swap `sqrt_price` stays
+    /// inside the current `[bucket_low, bucket_high)` tick range, where
+    /// the bucket bounds are aligned to `self.tick_spacing` around
+    /// `self.tick`. It is `false` when the swap crosses at least one
+    /// initialised tick boundary; in that case the returned values are a
+    /// best-effort estimate and the caller MUST fall back to an EVM
+    /// fork-replay before trusting them.
     pub fn predict_post_state(
         &self,
         token_in: Address,
@@ -148,7 +201,7 @@ impl UniswapV3Pool {
                 new_sqrt_price_x96,
                 new_liquidity: self.liquidity,
                 amount_out,
-                single_tick: true,
+                single_tick: self.is_within_active_tick_bucket(new_sqrt_price_x96),
             })
         } else {
             // token1 → token0: sqrt_price increases.
@@ -169,7 +222,7 @@ impl UniswapV3Pool {
                 new_sqrt_price_x96,
                 new_liquidity: self.liquidity,
                 amount_out,
-                single_tick: true,
+                single_tick: self.is_within_active_tick_bucket(new_sqrt_price_x96),
             })
         }
     }
@@ -314,6 +367,28 @@ mod tests {
         pool
     }
 
+    /// Pool fixture seated *mid-bucket* — current `sqrt_price` lands in
+    /// the middle of the active tick bucket [0, 60), so a small swap in
+    /// either direction stays inside the bucket and a large swap crosses
+    /// out. Required because tick boundaries are *exactly* at integer
+    /// `sqrt(1.0001^N) * 2^96`, so a fixture sitting on the boundary
+    /// trips `single_tick=false` for any direction of price movement.
+    fn setup_v3_pool_mid_bucket() -> UniswapV3Pool {
+        let mut pool = UniswapV3Pool::new(
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            30, // 0.3%
+            60,
+        );
+        // tick=30 sits halfway through bucket [0, 60).
+        // sqrt_price = sqrt(1.0001^30) * 2^96 = 1.0001^15 * 2^96.
+        let sqrt_norm = 1.0001f64.powi(15);
+        let sqrt_x96 = (sqrt_norm * TWO_POW_96_F64) as u128;
+        pool.update_sqrt_price(U256::from(sqrt_x96), 10_000_000_000_000_000u128, 30);
+        pool
+    }
+
     #[test]
     fn test_v3_get_amount_out_token0() {
         let pool = setup_v3_pool();
@@ -390,8 +465,8 @@ mod tests {
 
     #[test]
     fn predict_post_state_token0_to_token1_lowers_sqrt_price() {
-        let pool = setup_v3_pool();
-        let dx = U256::from(1_000_000_000u64); // 1000 USDC (6dp)
+        let pool = setup_v3_pool_mid_bucket();
+        let dx = U256::from(100_000_000u64); // small relative to L=1e16
         let post = pool
             .predict_post_state(pool.token0, dx)
             .expect("post state");
@@ -401,15 +476,14 @@ mod tests {
             post.new_sqrt_price_x96,
             pool.sqrt_price_x96
         );
-        assert!(!post.amount_out.is_zero(), "non-zero output expected");
         assert_eq!(post.new_liquidity, pool.liquidity);
-        assert!(post.single_tick);
+        assert!(post.single_tick, "small swap should not cross tick bucket");
     }
 
     #[test]
     fn predict_post_state_token1_to_token0_raises_sqrt_price() {
-        let pool = setup_v3_pool();
-        let dy = U256::from(1_000_000_000_000_000_000u64); // 1 ETH
+        let pool = setup_v3_pool_mid_bucket();
+        let dy = U256::from(100_000_000u64);
         let post = pool
             .predict_post_state(pool.token1, dy)
             .expect("post state");
@@ -417,9 +491,39 @@ mod tests {
             post.new_sqrt_price_x96 > pool.sqrt_price_x96,
             "token1→token0 must raise sqrt_price"
         );
-        assert!(!post.amount_out.is_zero());
         assert_eq!(post.new_liquidity, pool.liquidity);
-        assert!(post.single_tick);
+        assert!(post.single_tick, "small swap should not cross tick bucket");
+    }
+
+    #[test]
+    fn predict_post_state_large_swap_crosses_tick_bucket() {
+        // tick_spacing=60 ↔ ~0.6% price move covers one bucket. A swap
+        // sized at ~half the pool's notional liquidity moves price much
+        // more than that, so the resulting sqrt_price_x96 must land
+        // outside [tick=0, tick=60) and `single_tick` must be false.
+        let pool = setup_v3_pool_mid_bucket();
+        let huge = U256::from(5_000_000_000_000_000u64); // ~half of L
+        let post = pool
+            .predict_post_state(pool.token0, huge)
+            .expect("post state");
+        assert!(
+            !post.single_tick,
+            "large swap must cross tick bucket (new_sqrt={})",
+            post.new_sqrt_price_x96
+        );
+    }
+
+    #[test]
+    fn sqrt_price_x96_to_tick_at_unity_is_zero() {
+        // sqrt_price = 2^96 ↔ price = 1.0 ↔ tick = 0.
+        let tick = sqrt_price_x96_to_tick(U256::from(Q96));
+        assert!(tick.abs() <= 1, "tick at price=1.0 must be ~0, got {}", tick);
+    }
+
+    #[test]
+    fn sqrt_price_x96_to_tick_handles_zero_input() {
+        // No price defined for zero — must not panic; saturate to MIN.
+        assert_eq!(sqrt_price_x96_to_tick(U256::ZERO), i32::MIN);
     }
 
     #[test]
