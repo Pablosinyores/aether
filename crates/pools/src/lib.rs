@@ -1,10 +1,11 @@
-pub mod uniswap_v2;
-pub mod uniswap_v3;
-pub mod sushiswap;
-pub mod curve;
 pub mod balancer;
 pub mod bancor;
+pub mod curve;
 pub mod registry;
+pub mod router_decoder;
+pub mod sushiswap;
+pub mod uniswap_v2;
+pub mod uniswap_v3;
 
 use alloy::primitives::{Address, U256};
 use aether_common::types::ProtocolType;

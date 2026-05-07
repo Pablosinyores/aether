@@ -12,6 +12,7 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 
 mod engine;
+mod mempool_pipeline;
 mod pipeline;
 mod service;
 mod tracing_init;
@@ -76,8 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap pools from config file at startup.
     // Supports AETHER_POOLS_CONFIG env var to override the default path,
     // so the binary works regardless of the working directory.
-    let pools_config = std::env::var("AETHER_POOLS_CONFIG")
-        .unwrap_or_else(|_| "config/pools.toml".to_string());
+    let pools_config =
+        std::env::var("AETHER_POOLS_CONFIG").unwrap_or_else(|_| "config/pools.toml".to_string());
     let pool_count = engine.bootstrap_pools(&pools_config).await;
     info!(pool_count, path = %pools_config, "Pools loaded at startup");
 
@@ -114,13 +115,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_clone.run(provider_shutdown_rx).await;
     });
 
+    // Mempool tracking is opt-in via MEMPOOL_TRACKING=1. When unset the
+    // engine behaves identically to today; when set we spawn the Alchemy
+    // pending-tx subscription and the decode pipeline that consumes it.
+    let mempool_handles = if aether_ingestion::mempool::is_enabled() {
+        info!("MEMPOOL_TRACKING enabled — spawning pending-tx subscription + decode pipeline");
+        let ws_url = std::env::var("MEMPOOL_WS_URL")
+            .or_else(|_| std::env::var("ETH_RPC_URL"))
+            .unwrap_or_default();
+        if ws_url.is_empty() {
+            tracing::warn!(
+                "MEMPOOL_TRACKING set but neither MEMPOOL_WS_URL nor ETH_RPC_URL provided; skipping"
+            );
+            None
+        } else {
+            let cfg = aether_ingestion::mempool::AlchemyMempoolConfig {
+                ws_url,
+                router_filter: aether_ingestion::mempool::default_router_addresses(),
+            };
+            let source = Arc::new(aether_ingestion::mempool::AlchemyMempool::new(cfg));
+            let channels = Arc::clone(engine.event_channels());
+            let source_shutdown = shutdown_rx.clone();
+            let source_handle = tokio::spawn(async move {
+                use aether_ingestion::mempool::MempoolSource;
+                source.run(channels, source_shutdown).await;
+            });
+            // Build the post-state simulation context from the engine's
+            // live registry / token index / snapshot. The detector mirrors
+            // the engine's BellmanFord config so the analytical scan
+            // honours the same hop / latency budget as the main path.
+            let engine_cfg = EngineConfig::default();
+            let sim_ctx = Arc::new(mempool_pipeline::SimContext::new(
+                Arc::clone(engine.pool_registry()),
+                Arc::clone(engine.token_index()),
+                Arc::clone(engine.snapshot_manager()),
+                aether_detector::bellman_ford::BellmanFord::new(
+                    engine_cfg.max_hops,
+                    engine_cfg.detection_time_budget_us,
+                ),
+            ));
+            let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
+                Arc::clone(engine.event_channels()),
+                Arc::clone(&metrics),
+                Some(sim_ctx),
+                shutdown_rx.clone(),
+            );
+            Some((source_handle, pipeline_handle))
+        }
+    } else {
+        None
+    };
+
     // Read the listen address from the environment so the systemd unit and
     // the binary always agree.  Default to localhost TCP for development.
     //
     // Production (UDS): GRPC_ADDRESS=unix:///var/run/aether/engine.sock
     // Development (TCP): GRPC_ADDRESS=[::1]:50051  (default)
-    let addr_str =
-        std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
+    let addr_str = std::env::var("GRPC_ADDRESS").unwrap_or_else(|_| "[::1]:50051".to_string());
 
     let server = Server::builder()
         .add_service(ArbServiceServer::new(arb_service))
@@ -135,7 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match std::fs::remove_file(uds_path) {
                 Ok(()) => info!(path = %uds_path, "Removed stale UDS socket"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(path = %uds_path, error = %e, "Failed to remove stale UDS socket"),
+                Err(e) => {
+                    tracing::warn!(path = %uds_path, error = %e, "Failed to remove stale UDS socket")
+                }
             }
 
             // Ensure parent directory exists.
@@ -147,10 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Restrict socket access to the process owner — UDS bypasses
             // network-layer controls (iptables, mTLS), so file permissions
             // are the only access control for ControlService endpoints.
-            std::fs::set_permissions(
-                uds_path,
-                PermissionsExt::from_mode(0o600),
-            )?;
+            std::fs::set_permissions(uds_path, PermissionsExt::from_mode(0o600))?;
             info!(path = %uds_path, "gRPC server listening on UDS");
             let stream = UnixListenerStream::new(uds);
             server.serve_with_incoming(stream).await.map_err(|e| {
@@ -193,6 +243,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Err(e) = provider_handle.await {
         error!(error = %e, "Provider task panicked");
+    }
+
+    if let Some((source_handle, pipeline_handle)) = mempool_handles {
+        if let Err(e) = source_handle.await {
+            error!(error = %e, "Mempool source task panicked");
+        }
+        if let Err(e) = pipeline_handle.await {
+            error!(error = %e, "Mempool pipeline task panicked");
+        }
     }
 
     server_result?;

@@ -18,6 +18,45 @@ pub struct EngineMetrics {
     arbs_published: IntCounter,
     blocks_processed: IntCounter,
     decode_errors: IntCounterVec,
+    /// Pending DEX-router txs forwarded by the mempool subscription, labelled
+    /// by router (raw address) and the decoded protocol family. The
+    /// `decoded` label distinguishes successful ABI parses from
+    /// `decode_failure` so dashboards can surface decoder gaps directly.
+    pending_dex_tx_total: IntCounterVec,
+    /// Reason-tagged decoder failure counter. Reasons match
+    /// `aether_pools::router_decoder::DecodeError` variants so a dashboard
+    /// drill-down points at the exact path that needs work next.
+    pending_decode_errors_total: IntCounterVec,
+    /// Profitable cycles found by the post-state mempool simulator, labelled
+    /// by router and a coarse profit bucket. Counts candidates only — these
+    /// are not validated arbs and never get submitted; they prove the
+    /// post-state pipeline produces non-empty output on real traffic.
+    pending_arb_candidates_total: IntCounterVec,
+    /// Reasons the post-state simulator skipped a decoded swap (no pool in
+    /// registry, missing token index, no graph edge, zero reserves, etc.).
+    /// Mirrors `pending_decode_errors_total` for the layer above the decoder.
+    pending_arb_sim_skipped_total: IntCounterVec,
+    /// Pending-tx broadcast events the decode pipeline failed to receive
+    /// because it lagged behind the producer (tokio broadcast `Lagged(n)`).
+    /// Bumped by the `n` returned by the broadcast receiver so dashboards
+    /// can show *how many events* were dropped, not just how many lag
+    /// events fired. Sustained non-zero growth = pipeline is the bottleneck;
+    /// either widen the channel or shed mempool sources.
+    pending_pipeline_lagged_total: IntCounter,
+    /// Reason-tagged counter for pending swaps the pipeline drops *after*
+    /// the router decoder succeeds but *before* the post-state simulator
+    /// gets a chance to run. Distinct from `pending_arb_sim_skipped_total`
+    /// (which fires once the sim task has started and discovered a missing
+    /// graph edge / zero reserves / etc.). Bumping here short-circuits the
+    /// 3.8 MB graph clone the sim does, so it is cheap to be aggressive.
+    ///
+    /// Stable label set:
+    ///   - `not_in_registry` — neither (token_in, token_out, protocol)
+    ///                         tuple is present in `pool_registry`
+    ///   - `same_token`      — decoder returned a self-swap
+    ///                         (likely fee-on-transfer wrapper)
+    ///   - `zero_amount`     — `amount_in == 0` (no profit possible)
+    mempool_filtered_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -37,7 +76,9 @@ impl EngineMetrics {
                 "aether_simulation_latency_ms",
                 "EVM simulation latency in milliseconds",
             )
-            .buckets(vec![0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0]),
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0,
+            ]),
         )
         .expect("aether_simulation_latency_ms histogram");
         let cycles_detected = IntCounter::new(
@@ -45,21 +86,17 @@ impl EngineMetrics {
             "Total negative cycles detected",
         )
         .expect("aether_cycles_detected_total counter");
-        let simulations_run = IntCounter::new(
-            "aether_simulations_run_total",
-            "Total simulations executed",
-        )
-        .expect("aether_simulations_run_total counter");
+        let simulations_run =
+            IntCounter::new("aether_simulations_run_total", "Total simulations executed")
+                .expect("aether_simulations_run_total counter");
         let arbs_published = IntCounter::new(
             "aether_arbs_published_total",
             "Total validated arbs published",
         )
         .expect("aether_arbs_published_total counter");
-        let blocks_processed = IntCounter::new(
-            "aether_blocks_processed_total",
-            "Total blocks processed",
-        )
-        .expect("aether_blocks_processed_total counter");
+        let blocks_processed =
+            IntCounter::new("aether_blocks_processed_total", "Total blocks processed")
+                .expect("aether_blocks_processed_total counter");
         let decode_errors = IntCounterVec::new(
             Opts::new(
                 "aether_decode_errors_total",
@@ -68,6 +105,51 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_decode_errors_total counter vec");
+        let pending_dex_tx_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_dex_tx_total",
+                "Pending DEX-router txs forwarded by the mempool subscription, by router and decoded protocol",
+            ),
+            &["router", "protocol", "decoded"],
+        )
+        .expect("aether_pending_dex_tx_total counter vec");
+        let pending_decode_errors_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_decode_errors_total",
+                "Pending-tx calldata decoder failures, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pending_decode_errors_total counter vec");
+        let pending_arb_candidates_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_arb_candidates_total",
+                "Profitable cycles found by the post-state mempool simulator, by router and profit bucket",
+            ),
+            &["router", "profit_bucket"],
+        )
+        .expect("aether_pending_arb_candidates_total counter vec");
+        let pending_arb_sim_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pending_arb_sim_skipped_total",
+                "Decoded swaps the post-state simulator skipped, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pending_arb_sim_skipped_total counter vec");
+        let pending_pipeline_lagged_total = IntCounter::new(
+            "aether_pending_pipeline_lagged_total",
+            "Pending-tx events dropped because the decode pipeline lagged behind the broadcast",
+        )
+        .expect("aether_pending_pipeline_lagged_total counter");
+        let mempool_filtered_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_filtered_total",
+                "Decoded pending swaps dropped before the post-state simulator runs, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_mempool_filtered_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -90,6 +172,24 @@ impl EngineMetrics {
         registry
             .register(Box::new(decode_errors.clone()))
             .expect("register aether_decode_errors_total");
+        registry
+            .register(Box::new(pending_dex_tx_total.clone()))
+            .expect("register aether_pending_dex_tx_total");
+        registry
+            .register(Box::new(pending_decode_errors_total.clone()))
+            .expect("register aether_pending_decode_errors_total");
+        registry
+            .register(Box::new(pending_arb_candidates_total.clone()))
+            .expect("register aether_pending_arb_candidates_total");
+        registry
+            .register(Box::new(pending_arb_sim_skipped_total.clone()))
+            .expect("register aether_pending_arb_sim_skipped_total");
+        registry
+            .register(Box::new(pending_pipeline_lagged_total.clone()))
+            .expect("register aether_pending_pipeline_lagged_total");
+        registry
+            .register(Box::new(mempool_filtered_total.clone()))
+            .expect("register aether_mempool_filtered_total");
 
         Self {
             registry,
@@ -100,6 +200,12 @@ impl EngineMetrics {
             arbs_published,
             blocks_processed,
             decode_errors,
+            pending_dex_tx_total,
+            pending_decode_errors_total,
+            pending_arb_candidates_total,
+            pending_arb_sim_skipped_total,
+            pending_pipeline_lagged_total,
+            mempool_filtered_total,
         }
     }
 
@@ -147,6 +253,69 @@ impl EngineMetrics {
     /// scrape endpoint without standing up a second `/metrics` server.
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Bump `aether_pending_dex_tx_total{router, protocol, decoded}` for a
+    /// pending DEX-router tx the mempool source forwarded. `protocol` is
+    /// `unknown` when decoding failed; `decoded` is `"true"` or `"false"`.
+    pub fn inc_pending_dex_tx(&self, router: &str, protocol: &str, decoded: bool) {
+        self.pending_dex_tx_total
+            .with_label_values(&[router, protocol, if decoded { "true" } else { "false" }])
+            .inc();
+    }
+
+    /// Bump `aether_pending_decode_errors_total{reason="..."}`. Reasons
+    /// should be a small fixed set (`too_short`, `unknown_selector`,
+    /// `abi_decode`, `empty_path`) so dashboards can rely on stable labels.
+    pub fn inc_pending_decode_errors(&self, reason: &str) {
+        self.pending_decode_errors_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Bump `aether_pending_arb_candidates_total{router, profit_bucket}`.
+    /// Buckets are coarse (`<10bps`, `10-50bps`, `50-200bps`, `>200bps`) so
+    /// the cardinality stays bounded.
+    pub fn inc_pending_arb_candidates(&self, router: &str, profit_bucket: &str) {
+        self.pending_arb_candidates_total
+            .with_label_values(&[router, profit_bucket])
+            .inc();
+    }
+
+    /// Bump `aether_pending_arb_sim_skipped_total{reason="..."}`.
+    pub fn inc_pending_arb_sim_skipped(&self, reason: &str) {
+        self.pending_arb_sim_skipped_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Add `n` to `aether_pending_pipeline_lagged_total`. Pass the count
+    /// returned by `broadcast::error::RecvError::Lagged(n)` so the metric
+    /// reflects events dropped, not lag events fired.
+    pub fn add_pending_pipeline_lagged(&self, n: u64) {
+        if n > 0 {
+            self.pending_pipeline_lagged_total.inc_by(n);
+        }
+    }
+
+    /// Bump `aether_mempool_filtered_total{reason="..."}` for a decoded
+    /// pending swap the pipeline rejects before any sim work is scheduled.
+    /// See the field doc on `mempool_filtered_total` for the stable label
+    /// set.
+    pub fn inc_mempool_filtered(&self, reason: &str) {
+        self.mempool_filtered_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Read the current value of `aether_mempool_filtered_total{reason}`.
+    /// Public so tests in the `aether-rust` bin (a separate crate from the
+    /// `aether-grpc-server` lib) can assert filter behaviour without
+    /// re-implementing Prometheus text parsing.
+    pub fn mempool_filtered_count(&self, reason: &str) -> u64 {
+        self.mempool_filtered_total
+            .with_label_values(&[reason])
+            .get()
     }
 
     /// Render the registered metrics in Prometheus text exposition format.
