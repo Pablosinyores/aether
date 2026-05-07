@@ -18,6 +18,23 @@ pub struct EngineMetrics {
     arbs_published: IntCounter,
     blocks_processed: IntCounter,
     decode_errors: IntCounterVec,
+    /// Counter for EVM fork-replay fallbacks invoked from the analytical
+    /// post-state predictors. Bumped whenever an analytical predictor
+    /// returns a low-confidence result and the caller escalates to an
+    /// EVM fork. The label set is intentionally small so dashboards can
+    /// stay stable across releases.
+    ///
+    /// Stable label set:
+    ///   - `v3_tick_crossed`        — V3 swap moved sqrt_price out of
+    ///                                its single-tick bucket
+    ///   - `curve_unconverged`      — Curve Newton iteration produced
+    ///                                an invalid post-state
+    ///   - `balancer_unequal_weight`— Balancer first-order Taylor
+    ///                                approximation deemed too coarse
+    ///                                under heavy weight skew
+    ///   - `unknown_protocol`       — protocol family with no analytical
+    ///                                predictor on this build
+    sim_evm_fallback_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -68,6 +85,14 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_decode_errors_total counter vec");
+        let sim_evm_fallback_total = IntCounterVec::new(
+            Opts::new(
+                "aether_sim_evm_fallback_total",
+                "EVM fork-replay fallbacks invoked from the analytical post-state predictors, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_sim_evm_fallback_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -90,6 +115,9 @@ impl EngineMetrics {
         registry
             .register(Box::new(decode_errors.clone()))
             .expect("register aether_decode_errors_total");
+        registry
+            .register(Box::new(sim_evm_fallback_total.clone()))
+            .expect("register aether_sim_evm_fallback_total");
 
         Self {
             registry,
@@ -100,6 +128,7 @@ impl EngineMetrics {
             arbs_published,
             blocks_processed,
             decode_errors,
+            sim_evm_fallback_total,
         }
     }
 
@@ -140,6 +169,27 @@ impl EngineMetrics {
     /// stable and enumerable for dashboards / alerts.
     pub fn inc_decode_errors(&self, reason: &str) {
         self.decode_errors.with_label_values(&[reason]).inc();
+    }
+
+    /// Bump `aether_sim_evm_fallback_total{reason="..."}` for an EVM
+    /// fork-replay fallback escalated from one of the analytical
+    /// post-state predictors. See the field doc on
+    /// `sim_evm_fallback_total` for the stable label set; passing a
+    /// reason outside that set still records but breaks dashboards, so
+    /// callers MUST pick from the documented enum.
+    pub fn inc_sim_evm_fallback(&self, reason: &str) {
+        self.sim_evm_fallback_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Read the current value of `aether_sim_evm_fallback_total{reason}`.
+    /// `pub` so tests can assert fallback rates without re-implementing
+    /// Prometheus text parsing.
+    pub fn sim_evm_fallback_count(&self, reason: &str) -> u64 {
+        self.sim_evm_fallback_total
+            .with_label_values(&[reason])
+            .get()
     }
 
     /// Borrow the underlying `Registry` so foreign metric families (e.g. the
