@@ -20,7 +20,8 @@ use aether_detector::gas::{estimate_total_gas, gas_cost_wei};
 use aether_detector::optimizer::ternary_search_optimal_input;
 use aether_ingestion::event_decoder::PoolEvent;
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
-use aether_pools::{new_pool_state_cache, PoolStateCache};
+use aether_pools::uniswap_v2::UniswapV2Pool;
+use aether_pools::{new_pool_state_cache, Pool, PoolState, PoolStateCache};
 use aether_simulator::calldata::build_execute_arb_calldata;
 use aether_simulator::fork::{prewarm_state, ForkedState, PrewarmedState, RpcForkedState};
 use aether_simulator::EvmSimulator;
@@ -378,6 +379,28 @@ impl AetherEngine {
         &self.pool_states
     }
 
+    /// Build the V2-family `PoolState` variant that matches the pool's
+    /// configured protocol (UniswapV2 vs SushiSwap). Both share the
+    /// same `UniswapV2Pool` math; the variant lets the dispatcher route
+    /// to the correct protocol metadata downstream without an extra
+    /// address lookup.
+    fn build_v2_pool_state(
+        &self,
+        pool_addr: Address,
+        meta: &PoolMetadata,
+        reserve0: U256,
+        reserve1: U256,
+    ) -> PoolState {
+        let mut p = UniswapV2Pool::new(pool_addr, meta.token0, meta.token1, meta.fee_bps);
+        p.update_state(reserve0, reserve1);
+        match meta.protocol {
+            ProtocolType::SushiSwap => PoolState::SushiSwap(p),
+            // UniswapV2 is the natural default — anything else routed
+            // through this helper would be a bug at the call site.
+            _ => PoolState::UniswapV2(p),
+        }
+    }
+
     /// Get a reference to the event channels for external use (e.g., the
     /// provider pushing events into the engine).
     pub fn event_channels(&self) -> &Arc<EventChannels> {
@@ -729,6 +752,11 @@ impl AetherEngine {
                                 meta.token1_idx, meta.token0_idx,
                                 meta.pool_id, r1_f, r0_f, fee,
                             );
+                            // Mirror the reserves into the pool-state cache so
+                            // the mempool post-state simulator has live state
+                            // to call `predict_post_state` against.
+                            let state = self.build_v2_pool_state(pool_addr, &meta, r0, r1);
+                            self.pool_states.insert(pool_addr, Arc::new(state));
                             fetched += 1;
                             debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
                         }
@@ -850,6 +878,19 @@ impl AetherEngine {
                             fee,
                         );
                         // Snapshot is published once per detection cycle, not per event.
+                        // Refresh the V2-family pool-state cache entry alongside the
+                        // graph edge so the mempool post-state simulator stays in
+                        // lockstep with the detector. SushiSwap reuses the same
+                        // shape under a distinct variant; other protocols handled
+                        // by V3Update / future Curve / Balancer events.
+                        if matches!(
+                            meta.protocol,
+                            ProtocolType::UniswapV2 | ProtocolType::SushiSwap
+                        ) {
+                            let state =
+                                self.build_v2_pool_state(pool, &meta, reserve0, reserve1);
+                            self.pool_states.insert(pool, Arc::new(state));
+                        }
                     }
                 }
             }
@@ -1730,6 +1771,80 @@ mod tests {
 
         // Should not panic.
         engine.handle_pool_update(event).await;
+    }
+
+    #[tokio::test]
+    async fn test_v2_pool_state_cache_populated_on_reserve_update() {
+        use alloy::primitives::address;
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+        let token0 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let token1 = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        engine
+            .register_pool(pool, token0, token1, ProtocolType::UniswapV2, 30)
+            .await;
+
+        // Pre-update: registry knows the pool, but cache is empty (no
+        // reserves yet).
+        assert!(engine.pool_states().get(&pool).is_none());
+
+        engine
+            .handle_pool_update(PoolEvent::ReserveUpdate {
+                pool,
+                protocol: ProtocolType::UniswapV2,
+                reserve0: U256::from(1_000_000_000u64),
+                reserve1: U256::from(500_000_000_000_000_000u64),
+            })
+            .await;
+
+        let entry = engine
+            .pool_states()
+            .get(&pool)
+            .expect("cache entry written on reserve update")
+            .clone();
+        match entry.as_ref() {
+            PoolState::UniswapV2(p) => {
+                assert_eq!(p.address, pool);
+                assert_eq!(p.token0, token0);
+                assert_eq!(p.token1, token1);
+                assert_eq!(p.reserve0, U256::from(1_000_000_000u64));
+                assert_eq!(p.reserve1, U256::from(500_000_000_000_000_000u64));
+            }
+            other => panic!("expected UniswapV2 variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sushiswap_pool_state_cache_uses_sushiswap_variant() {
+        use alloy::primitives::address;
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0");
+        let token0 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let token1 = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        engine
+            .register_pool(pool, token0, token1, ProtocolType::SushiSwap, 30)
+            .await;
+        engine
+            .handle_pool_update(PoolEvent::ReserveUpdate {
+                pool,
+                protocol: ProtocolType::SushiSwap,
+                reserve0: U256::from(2u64),
+                reserve1: U256::from(3u64),
+            })
+            .await;
+        let entry = engine
+            .pool_states()
+            .get(&pool)
+            .expect("cache entry written")
+            .clone();
+        assert!(
+            matches!(entry.as_ref(), PoolState::SushiSwap(_)),
+            "SushiSwap protocol must route to PoolState::SushiSwap variant"
+        );
     }
 
     #[tokio::test]
