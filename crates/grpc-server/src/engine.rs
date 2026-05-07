@@ -678,16 +678,24 @@ impl AetherEngine {
 
         info!(count = pools.len(), "Fetching initial reserves via RPC (concurrent)");
 
-        // ABI for getReserves() and slot0()
+        // ABI for getReserves() / slot0() / Curve A + balances /
+        // Balancer pool/vault helpers.
         alloy::sol! {
             function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
             function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+            function A() external view returns (uint256);
+            function balances(uint256 i) external view returns (uint256);
+            function getPoolId() external view returns (bytes32);
+            function getNormalizedWeights() external view returns (uint256[]);
+            function getPoolTokens(bytes32 poolId) external view returns (address[], uint256[], uint256);
         }
 
         // Result type for each concurrent RPC fetch.
         enum ReserveResult {
             V2 { pool_addr: Address, meta: PoolMetadata, r0: U256, r1: U256 },
             V3 { pool_addr: Address, meta: PoolMetadata, sqrt_price_x96: U256, tick: i32 },
+            Curve { pool_addr: Address, meta: PoolMetadata, a: U256, b0: U256, b1: U256 },
+            Balancer { pool_addr: Address, meta: PoolMetadata, b0: U256, b1: U256, w0: U256, w1: U256 },
             Skipped,
         }
 
@@ -753,6 +761,122 @@ impl AetherEngine {
                                 ReserveResult::Skipped
                             }
                         }
+                    }
+                    ProtocolType::Curve => {
+                        // 2-coin Curve only: fetch A + balances(0) +
+                        // balances(1) sequentially. Three RPC round-trips
+                        // per pool — bounded by the join_set fan-out and
+                        // typically <100 pools at bootstrap so the cost is
+                        // a one-time second of warmup.
+                        let a_calldata = ACall {}.abi_encode();
+                        let a_tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(pool_addr)
+                            .input(a_calldata.into());
+                        let a = match provider.call(a_tx).await {
+                            Ok(out) if out.len() >= 32 => U256::from_be_slice(&out[0..32]),
+                            Ok(out) => {
+                                warn!(%pool_addr, len = out.len(), "Curve A() output too short");
+                                return ReserveResult::Skipped;
+                            }
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "Curve A() RPC call failed");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        let mut bal = [U256::ZERO; 2];
+                        for (idx, slot) in bal.iter_mut().enumerate() {
+                            let calldata = balancesCall { i: U256::from(idx as u64) }.abi_encode();
+                            let tx = alloy::rpc::types::TransactionRequest::default()
+                                .to(pool_addr)
+                                .input(calldata.into());
+                            match provider.call(tx).await {
+                                Ok(out) if out.len() >= 32 => {
+                                    *slot = U256::from_be_slice(&out[0..32]);
+                                }
+                                Ok(out) => {
+                                    warn!(%pool_addr, idx, len = out.len(), "Curve balances() output too short");
+                                    return ReserveResult::Skipped;
+                                }
+                                Err(e) => {
+                                    warn!(%pool_addr, idx, error = %e, "Curve balances() RPC call failed");
+                                    return ReserveResult::Skipped;
+                                }
+                            }
+                        }
+                        ReserveResult::Curve { pool_addr, meta, a, b0: bal[0], b1: bal[1] }
+                    }
+                    ProtocolType::BalancerV2 => {
+                        // Balancer V2 reads need three sequential calls:
+                        // pool.getPoolId() → vault.getPoolTokens(poolId)
+                        // → pool.getNormalizedWeights(). The Vault address
+                        // is canonical and identical across every Balancer
+                        // V2 pool.
+                        const BALANCER_V2_VAULT: Address = alloy::primitives::address!(
+                            "BA12222222228d8Ba445958a75a0704d566BF2C8"
+                        );
+                        let pool_id_tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(pool_addr)
+                            .input(getPoolIdCall {}.abi_encode().into());
+                        let pool_id_bytes = match provider.call(pool_id_tx).await {
+                            Ok(out) if out.len() >= 32 => {
+                                let mut buf = [0u8; 32];
+                                buf.copy_from_slice(&out[0..32]);
+                                buf
+                            }
+                            Ok(out) => {
+                                warn!(%pool_addr, len = out.len(), "Balancer getPoolId output too short");
+                                return ReserveResult::Skipped;
+                            }
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "Balancer getPoolId RPC call failed");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        let tokens_tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(BALANCER_V2_VAULT)
+                            .input(
+                                getPoolTokensCall { poolId: pool_id_bytes.into() }
+                                    .abi_encode()
+                                    .into(),
+                            );
+                        let tokens_out = match provider.call(tokens_tx).await {
+                            Ok(out) => out,
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "Balancer getPoolTokens RPC call failed");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        let (b0, b1) = match getPoolTokensCall::abi_decode_returns(&tokens_out) {
+                            // 3-return tuple from getPoolTokens — fields are
+                            // (address[] tokens, uint256[] balances, uint256 lastChangeBlock)
+                            // → alloy synthesises `_0`, `_1`, `_2` for the
+                            // anonymous return slots. We need `_1` (balances).
+                            Ok(ret) if ret._1.len() >= 2 => (ret._1[0], ret._1[1]),
+                            _ => {
+                                warn!(%pool_addr, "Balancer getPoolTokens did not return 2-coin balances");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        let weights_tx = alloy::rpc::types::TransactionRequest::default()
+                            .to(pool_addr)
+                            .input(getNormalizedWeightsCall {}.abi_encode().into());
+                        let weights_out = match provider.call(weights_tx).await {
+                            Ok(out) => out,
+                            Err(e) => {
+                                warn!(%pool_addr, error = %e, "Balancer getNormalizedWeights RPC call failed");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        let (w0, w1) = match getNormalizedWeightsCall::abi_decode_returns(&weights_out) {
+                            // Single-return function — alloy unwraps the
+                            // tuple, so `ret` is the `Vec<U256>` directly.
+                            Ok(ret) if ret.len() >= 2 => (ret[0], ret[1]),
+                            _ => {
+                                warn!(%pool_addr, "Balancer getNormalizedWeights did not return 2 weights");
+                                return ReserveResult::Skipped;
+                            }
+                        };
+                        ReserveResult::Balancer { pool_addr, meta, b0, b1, w0, w1 }
                     }
                     _ => {
                         debug!(%pool_addr, protocol = ?meta.protocol, "Reserve fetch not yet implemented for this protocol");
@@ -843,6 +967,59 @@ impl AetherEngine {
                             fetched += 1;
                             debug!(%pool_addr, %sqrt_price_x96, tick, "V3 slot0 fetched");
                         }
+                    }
+                    ReserveResult::Curve { pool_addr, meta, a, b0, b1 } => {
+                        // Bootstrap-only Curve cache populate. The graph
+                        // edge for Curve isn't seeded here — the existing
+                        // engine code path doesn't fetch / construct Curve
+                        // edges yet (see PoolEvent::TokenExchange follow-up).
+                        // This commit only fills `pool_states` so the
+                        // mempool post-state simulator has live state to
+                        // call `predict_post_state` against; downstream
+                        // graph integration is its own commit.
+                        let amp_u64: u64 = if a > U256::from(u64::MAX) {
+                            warn!(%pool_addr, %a, "Curve A() overflows u64; saturating");
+                            u64::MAX
+                        } else {
+                            a.try_into().unwrap_or(u64::MAX)
+                        };
+                        let mut curve = aether_pools::curve::CurvePool::new(
+                            pool_addr,
+                            vec![meta.token0, meta.token1],
+                            amp_u64,
+                            meta.fee_bps,
+                        );
+                        curve.balances = vec![b0, b1];
+                        self.pool_states
+                            .insert(pool_addr, Arc::new(PoolState::Curve(curve)));
+                        fetched += 1;
+                        debug!(%pool_addr, %a, %b0, %b1, "Curve state fetched");
+                    }
+                    ReserveResult::Balancer { pool_addr, meta, b0, b1, w0, w1 } => {
+                        // Bootstrap-only Balancer cache populate. Same
+                        // graph-edge caveat as the Curve branch: this
+                        // commit only fills `pool_states`.
+                        //
+                        // BalancerPool::new takes weights as u64. Balancer
+                        // V2 weights are e18-fixed (1.0 = 1e18). Saturate
+                        // on overflow — real weights are below 1e18 and
+                        // fit in u64 fine.
+                        let to_u64 = |x: U256| -> u64 {
+                            x.try_into().unwrap_or(u64::MAX)
+                        };
+                        let mut bal = aether_pools::balancer::BalancerPool::new(
+                            pool_addr,
+                            meta.token0,
+                            meta.token1,
+                            to_u64(w0),
+                            to_u64(w1),
+                            meta.fee_bps,
+                        );
+                        bal.update_state(b0, b1);
+                        self.pool_states
+                            .insert(pool_addr, Arc::new(PoolState::Balancer(bal)));
+                        fetched += 1;
+                        debug!(%pool_addr, %b0, %b1, %w0, %w1, "Balancer state fetched");
                     }
                     ReserveResult::Skipped => {}
                 }
@@ -1890,6 +2067,82 @@ mod tests {
                 assert_eq!(p.reserve1, U256::from(500_000_000_000_000_000u64));
             }
             other => panic!("expected UniswapV2 variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_curve_pool_state_cache_can_be_populated_directly() {
+        // Bootstrap-time Curve cache writes happen inside the RPC join
+        // set, which we can't drive headlessly here. Exercise the same
+        // shape by populating the cache directly the way the bootstrap
+        // result handler does, and verify the variant + balances + A
+        // round-trip cleanly.
+        use alloy::primitives::address;
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"); // 3pool (canonical)
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let usdt = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let mut curve = aether_pools::curve::CurvePool::new(
+            pool,
+            vec![usdc, usdt],
+            100, // A
+            4,   // 4 bps
+        );
+        curve.balances = vec![
+            U256::from(10_000_000_000_000u64),
+            U256::from(10_000_000_000_000u64),
+        ];
+        engine
+            .pool_states
+            .insert(pool, Arc::new(PoolState::Curve(curve)));
+
+        let entry = engine.pool_states().get(&pool).expect("present").clone();
+        match entry.as_ref() {
+            PoolState::Curve(p) => {
+                assert_eq!(p.address, pool);
+                assert_eq!(p.amplification, U256::from(100u64));
+                assert_eq!(p.balances.len(), 2);
+                assert_eq!(p.balances[0], U256::from(10_000_000_000_000u64));
+            }
+            other => panic!("expected Curve variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_balancer_pool_state_cache_can_be_populated_directly() {
+        use alloy::primitives::address;
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = address!("32296969Ef14EB0c6d29669C550D4a0449130230"); // wstETH/WETH 50/50
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let wsteth = address!("7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0");
+        let mut bal = aether_pools::balancer::BalancerPool::new(
+            pool,
+            wsteth,
+            weth,
+            500_000_000_000_000_000, // 0.5 e18 (alloy weight units)
+            500_000_000_000_000_000,
+            10,
+        );
+        bal.update_state(
+            U256::from(5_000_000_000_000_000_000u128),
+            U256::from(5_000_000_000_000_000_000u128),
+        );
+        engine
+            .pool_states
+            .insert(pool, Arc::new(PoolState::Balancer(bal)));
+
+        let entry = engine.pool_states().get(&pool).expect("present").clone();
+        match entry.as_ref() {
+            PoolState::Balancer(p) => {
+                assert_eq!(p.address, pool);
+                assert_eq!(p.token0, wsteth);
+                assert_eq!(p.weight0, p.weight1, "50/50 fixture");
+            }
+            other => panic!("expected Balancer variant, got {other:?}"),
         }
     }
 
