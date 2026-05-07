@@ -89,6 +89,11 @@ pub struct PoolMetadata {
     pub pool_id: PoolId,
     pub protocol: ProtocolType,
     pub fee_bps: u32,
+    /// V3-only — tick spacing from `pools.toml`. `None` for non-V3
+    /// protocols (where the field is meaningless) and as a fallback
+    /// when the config entry omitted it. Required to construct a valid
+    /// `UniswapV3Pool` for the post-state cache.
+    pub tick_spacing: Option<i32>,
 }
 
 impl PoolMetadata {
@@ -429,6 +434,25 @@ impl AetherEngine {
         protocol: ProtocolType,
         fee_bps: u32,
     ) {
+        self.register_pool_with_tick_spacing(pool_addr, token0, token1, protocol, fee_bps, None)
+            .await
+    }
+
+    /// Same as [`Self::register_pool`] but accepts a tick_spacing hint
+    /// for V3-family pools. Required so the post-state cache can build
+    /// a valid `UniswapV3Pool` (which needs tick_spacing to know where
+    /// the active tick bucket ends). Non-V3 callers pass `None` and the
+    /// metadata stores it as `None` — the field is ignored at the
+    /// graph-edge update path which doesn't care about ticks.
+    pub async fn register_pool_with_tick_spacing(
+        &self,
+        pool_addr: Address,
+        token0: Address,
+        token1: Address,
+        protocol: ProtocolType,
+        fee_bps: u32,
+        tick_spacing: Option<i32>,
+    ) {
         let (t0_idx, t1_idx, num_tokens) = {
             let mut ti = (**self.token_index.load()).clone();
             let t0 = ti.get_or_insert(token0);
@@ -450,6 +474,7 @@ impl AetherEngine {
             pool_id,
             protocol,
             fee_bps,
+            tick_spacing,
         };
 
         {
@@ -609,7 +634,9 @@ impl AetherEngine {
                 continue;
             }
 
-            self.register_pool(pool_addr, token0, token1, protocol, entry.fee_bps)
+            self.register_pool_with_tick_spacing(
+                pool_addr, token0, token1, protocol, entry.fee_bps, entry.tick_spacing,
+            )
                 .await;
             loaded += 1;
 
@@ -660,7 +687,7 @@ impl AetherEngine {
         // Result type for each concurrent RPC fetch.
         enum ReserveResult {
             V2 { pool_addr: Address, meta: PoolMetadata, r0: U256, r1: U256 },
-            V3 { pool_addr: Address, meta: PoolMetadata, sqrt_price_x96: U256 },
+            V3 { pool_addr: Address, meta: PoolMetadata, sqrt_price_x96: U256, tick: i32 },
             Skipped,
         }
 
@@ -702,7 +729,20 @@ impl AetherEngine {
                         match provider.call(tx).await {
                             Ok(output) if output.len() >= 64 => {
                                 let sqrt_price_x96 = U256::from_be_slice(&output[0..32]);
-                                ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 }
+                                // slot0 returns int24 tick, ABI-encoded as a
+                                // sign-extended 32-byte word at offset 32. Read
+                                // the high byte's MSB to detect a negative
+                                // value, then take the low 24 bits and apply
+                                // two's-complement if needed.
+                                let raw = &output[32..64];
+                                let mut tick_low24: i32 = ((raw[29] as i32) << 16)
+                                    | ((raw[30] as i32) << 8)
+                                    | (raw[31] as i32);
+                                if raw[0] != 0 {
+                                    // Top bytes set → negative; sign-extend.
+                                    tick_low24 -= 1 << 24;
+                                }
+                                ReserveResult::V3 { pool_addr, meta, sqrt_price_x96, tick: tick_low24 }
                             }
                             Ok(output) => {
                                 warn!(%pool_addr, len = output.len(), "slot0 output too short");
@@ -761,7 +801,7 @@ impl AetherEngine {
                             debug!(%pool_addr, reserve0 = %r0, reserve1 = %r1, "V2 reserves fetched");
                         }
                     }
-                    ReserveResult::V3 { pool_addr, meta, sqrt_price_x96 } => {
+                    ReserveResult::V3 { pool_addr, meta, sqrt_price_x96, tick } => {
                         const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
                         let sqrt_f64 = u256_to_f64(sqrt_price_x96);
                         let price = (sqrt_f64 / TWO_POW_96).powi(2);
@@ -778,8 +818,30 @@ impl AetherEngine {
                                 (1.0 / price) * fee, meta.pool_id, pool_addr,
                                 meta.protocol, liq,
                             );
+                            // Seed the V3 pool-state cache. Liquidity is set
+                            // to zero here because slot0 does not expose it —
+                            // a separate `liquidity()` RPC would be required
+                            // for an exact bootstrap value, and that adds a
+                            // second concurrent fan-out that we defer for
+                            // now. Real liquidity arrives via the first
+                            // `PoolEvent::V3Update` (which carries sqrt +
+                            // liquidity + tick together) once block-level
+                            // event ingestion comes online; until then the
+                            // mempool sim's `predict_post_state` returns
+                            // None for these entries, which is the correct
+                            // behaviour for a zero-liquidity edge.
+                            let mut v3 = aether_pools::uniswap_v3::UniswapV3Pool::new(
+                                pool_addr,
+                                meta.token0,
+                                meta.token1,
+                                meta.fee_bps,
+                                meta.tick_spacing.unwrap_or(0),
+                            );
+                            v3.update_sqrt_price(sqrt_price_x96, 0u128, tick);
+                            self.pool_states
+                                .insert(pool_addr, Arc::new(PoolState::UniswapV3(v3)));
                             fetched += 1;
-                            debug!(%pool_addr, %sqrt_price_x96, "V3 slot0 fetched");
+                            debug!(%pool_addr, %sqrt_price_x96, tick, "V3 slot0 fetched");
                         }
                     }
                     ReserveResult::Skipped => {}
@@ -918,9 +980,9 @@ impl AetherEngine {
                 pool,
                 sqrt_price_x96,
                 liquidity,
-                tick: _,
+                tick,
             } => {
-                debug!(%pool, %sqrt_price_x96, liquidity, "V3 pool update");
+                debug!(%pool, %sqrt_price_x96, liquidity, tick, "V3 pool update");
 
                 let meta = self.pool_registry.load().get(&pool).cloned();
 
@@ -953,6 +1015,21 @@ impl AetherEngine {
                             liq,
                         );
                         // Snapshot is published once per detection cycle, not per event.
+                        // Refresh the V3 pool-state cache entry. The event
+                        // carries everything `predict_post_state` needs
+                        // (sqrt + liquidity + tick), so this is the path
+                        // that actually populates real liquidity onto a
+                        // V3 cache seeded with `liquidity = 0` at bootstrap.
+                        let mut v3 = aether_pools::uniswap_v3::UniswapV3Pool::new(
+                            pool,
+                            meta.token0,
+                            meta.token1,
+                            meta.fee_bps,
+                            meta.tick_spacing.unwrap_or(0),
+                        );
+                        v3.update_sqrt_price(sqrt_price_x96, liquidity, tick);
+                        self.pool_states
+                            .insert(pool, Arc::new(PoolState::UniswapV3(v3)));
                     }
                 }
             }
@@ -1817,6 +1894,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v3_pool_state_cache_populated_on_v3_update() {
+        use alloy::primitives::address;
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let token0 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let token1 = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        engine
+            .register_pool_with_tick_spacing(
+                pool,
+                token0,
+                token1,
+                ProtocolType::UniswapV3,
+                5,
+                Some(10),
+            )
+            .await;
+
+        // Sanity: tick_spacing landed on the registry entry.
+        let stored_ts = engine
+            .pool_registry
+            .load()
+            .get(&pool)
+            .expect("registered")
+            .tick_spacing;
+        assert_eq!(stored_ts, Some(10));
+
+        let sqrt = U256::from(79_228_162_514_264_337_593_543_950_336u128); // ≈ Q96
+        engine
+            .handle_pool_update(PoolEvent::V3Update {
+                pool,
+                sqrt_price_x96: sqrt,
+                liquidity: 12_345_678_900_000u128,
+                tick: 0,
+            })
+            .await;
+
+        let entry = engine
+            .pool_states()
+            .get(&pool)
+            .expect("V3 cache entry written")
+            .clone();
+        match entry.as_ref() {
+            PoolState::UniswapV3(p) => {
+                assert_eq!(p.address, pool);
+                assert_eq!(p.sqrt_price_x96, sqrt);
+                assert_eq!(p.liquidity, 12_345_678_900_000u128);
+                assert_eq!(p.tick, 0);
+                assert_eq!(p.tick_spacing, 10);
+            }
+            other => panic!("expected UniswapV3 variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_sushiswap_pool_state_cache_uses_sushiswap_variant() {
         use alloy::primitives::address;
         let (tx, _rx) = broadcast::channel(100);
@@ -1893,6 +2026,7 @@ mod tests {
             },
             protocol: ProtocolType::UniswapV2,
             fee_bps: 30,
+            tick_spacing: None,
         };
         assert!((meta.fee_factor() - 0.997).abs() < 1e-10);
 
