@@ -2038,12 +2038,15 @@ mod tests {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let config_path = format!("{manifest_dir}/../../config/pools.toml");
         let loaded = engine.bootstrap_pools(&config_path).await;
-        assert_eq!(loaded, 3, "All 3 pools from config/pools.toml should be loaded");
+        assert!(
+            loaded >= 3,
+            "expected at least the 3 anchor USDC/WETH pools to load, got {loaded}"
+        );
 
-        // 2. Verify all real pools are registered with correct metadata.
+        // 2. Verify the 3 anchor USDC/WETH pools are registered with correct metadata.
         {
             let registry = engine.pool_registry.load();
-            assert_eq!(registry.len(), 3);
+            assert!(registry.len() >= 3);
 
             let meta_v2 = registry.get(&uni_v2_pool).expect("Uniswap V2 pool should be registered");
             assert_eq!(meta_v2.protocol, ProtocolType::UniswapV2);

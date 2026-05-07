@@ -291,11 +291,14 @@ func TestLoadBuildersConfig_ValidFile(t *testing.T) {
 		t.Fatalf("LoadBuildersConfig(%q): %v", path, err)
 	}
 
-	if len(cfg.Builders) != 2 {
-		t.Fatalf("expected 2 builders, got %d", len(cfg.Builders))
+	wantNames := []string{"flashbots", "titan", "eden", "rsync"}
+	if len(cfg.Builders) != len(wantNames) {
+		t.Fatalf("expected %d builders, got %d", len(wantNames), len(cfg.Builders))
 	}
-	if cfg.Builders[0].Name != "flashbots" {
-		t.Errorf("builders[0].name = %q, want %q", cfg.Builders[0].Name, "flashbots")
+	for i, want := range wantNames {
+		if cfg.Builders[i].Name != want {
+			t.Errorf("builders[%d].name = %q, want %q", i, cfg.Builders[i].Name, want)
+		}
 	}
 	if cfg.Builders[0].URL != "https://relay.flashbots.net" {
 		t.Errorf("builders[0].url = %q, want %q", cfg.Builders[0].URL, "https://relay.flashbots.net")
@@ -305,9 +308,6 @@ func TestLoadBuildersConfig_ValidFile(t *testing.T) {
 	}
 	if cfg.Builders[0].TimeoutMs != 2000 {
 		t.Errorf("builders[0].timeout_ms = %d, want 2000", cfg.Builders[0].TimeoutMs)
-	}
-	if cfg.Builders[1].Name != "titan" {
-		t.Errorf("builders[1].name = %q, want %q", cfg.Builders[1].Name, "titan")
 	}
 	if !cfg.Submission.FanOut {
 		t.Error("submission.fan_out = false, want true")
