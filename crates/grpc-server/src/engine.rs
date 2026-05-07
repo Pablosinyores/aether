@@ -20,6 +20,7 @@ use aether_detector::gas::{estimate_total_gas, gas_cost_wei};
 use aether_detector::optimizer::ternary_search_optimal_input;
 use aether_ingestion::event_decoder::PoolEvent;
 use aether_ingestion::subscription::{EventChannels, NewBlockEvent};
+use aether_pools::{new_pool_state_cache, PoolStateCache};
 use aether_simulator::calldata::build_execute_arb_calldata;
 use aether_simulator::fork::{prewarm_state, ForkedState, PrewarmedState, RpcForkedState};
 use aether_simulator::EvmSimulator;
@@ -123,6 +124,14 @@ pub struct AetherEngine {
     /// Pool address → metadata mapping for event handling.
     /// Writers clone-modify-swap; readers load() zero-copy.
     pool_registry: Arc<ArcSwap<HashMap<Address, PoolMetadata>>>,
+    /// Live pool-state cache for the mempool post-state simulator.
+    /// Holds `Arc<PoolState>` values keyed by pool address; readers
+    /// (mempool decode pipeline) clone the inner Arc for a snapshot, while
+    /// the engine writes new entries on bootstrap and replaces them on
+    /// every pool-update event. Intentionally distinct from
+    /// `pool_registry` (which carries static metadata only) — this cache
+    /// owns the *mutable* protocol state that `predict_post_state` needs.
+    pool_states: PoolStateCache,
     /// Optional type-erased alloy provider for RPC-backed simulation.
     /// When `Some`, `run_detection_cycle` uses `RpcForkedState` instead of
     /// the empty `ForkedState`.
@@ -350,10 +359,23 @@ impl AetherEngine {
             current_block: Arc::new(ArcSwap::from_pointee(BlockInfo::default())),
             token_index: Arc::new(ArcSwap::from_pointee(TokenIndex::new())),
             pool_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            pool_states: new_pool_state_cache(),
             rpc_provider,
             metrics,
             ledger,
         }
+    }
+
+    /// Borrow the live pool-state cache so external consumers (mempool
+    /// post-state simulator, future analytics) can read accurate per-
+    /// protocol state without round-tripping to RPC. The returned
+    /// reference is to the engine's own clone of the `Arc<DashMap>` —
+    /// callers typically `Arc::clone` it for their own `SimContext`.
+    /// `dead_code` until the mempool decode pipeline lands on this
+    /// branch (or the pipeline branch rebases on top).
+    #[allow(dead_code)]
+    pub fn pool_states(&self) -> &PoolStateCache {
+        &self.pool_states
     }
 
     /// Get a reference to the event channels for external use (e.g., the
