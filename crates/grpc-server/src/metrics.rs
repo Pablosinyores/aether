@@ -87,10 +87,10 @@ pub struct EngineMetrics {
     ///
     /// Stable label set:
     ///   - `not_in_registry` — neither (token_in, token_out, protocol)
-    ///                         tuple is present in `pool_registry`
-    ///   - `same_token`      — decoder returned a self-swap
-    ///                         (likely fee-on-transfer wrapper)
-    ///   - `zero_amount`     — `amount_in == 0` (no profit possible)
+    ///     tuple is present in `pool_registry`
+    ///   - `same_token` — decoder returned a self-swap (likely
+    ///     fee-on-transfer wrapper)
+    ///   - `zero_amount` — `amount_in == 0` (no profit possible)
     mempool_filtered_total: IntCounterVec,
 }
 
