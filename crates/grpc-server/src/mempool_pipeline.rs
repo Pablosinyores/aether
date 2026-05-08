@@ -27,6 +27,7 @@ use aether_common::types::ProtocolType;
 use aether_detector::bellman_ford::BellmanFord;
 use aether_ingestion::subscription::{EventChannels, PendingTxEvent};
 use aether_pools::router_decoder::{decode_pending, DecodeError, DecodedSwap, Protocol};
+use aether_pools::{predict_post_state_with_fallback, PoolStateCache, UnifiedPostState};
 use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
 use alloy::primitives::{Address, U256};
@@ -73,6 +74,12 @@ pub struct SimContext {
     pub token_index: Arc<ArcSwap<TokenIndex>>,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub detector: BellmanFord,
+    /// Live per-pool analytical state (V3 sqrt + tick + liquidity, Curve A +
+    /// balances, Balancer balances + weights) populated by the engine at
+    /// bootstrap and refreshed on `PoolEvent` updates. Used by the V3 /
+    /// Balancer mempool sim path to call `predict_post_state_with_fallback`
+    /// without round-tripping through the pool registry RPC.
+    pub pool_states: PoolStateCache,
     /// Cached `(registry_ptr, PairIndex)` so the second and following pending
     /// swaps under the same registry generation lookup in O(1). The Mutex
     /// guards rebuild only — the steady-state path is `lock + ptr_eq + read`.
@@ -85,12 +92,14 @@ impl SimContext {
         token_index: Arc<ArcSwap<TokenIndex>>,
         snapshot_manager: Arc<SnapshotManager>,
         detector: BellmanFord,
+        pool_states: PoolStateCache,
     ) -> Self {
         Self {
             pool_registry,
             token_index,
             snapshot_manager,
             detector,
+            pool_states,
             pair_index_cache: Mutex::new(None),
         }
     }
@@ -236,10 +245,10 @@ fn pre_sim_filter(metrics: &EngineMetrics, ctx: &SimContext, swap: &DecodedSwap)
     }
     let target_protocol = match decoder_protocol_to_type(swap.protocol) {
         Some(p) => p,
-        // Protocols whose post-state predictor we don't ship yet still
-        // surface in `pending_arb_sim_skipped{protocol_unsupported}` so the
-        // existing dashboard panel keeps measuring the V3/Curve/Balancer
-        // gap. Don't double-count under `mempool_filtered_total`.
+        // Decoder-side protocols with no analytical predictor (none today —
+        // all four decoded variants land here). Pass through so the sim
+        // task can bump `pending_arb_sim_skipped{protocol_unsupported}`
+        // without double-counting under `mempool_filtered_total`.
         None => return true,
     };
     if ctx
@@ -261,7 +270,8 @@ fn decoder_protocol_to_type(p: Protocol) -> Option<ProtocolType> {
     match p {
         Protocol::UniswapV2 => Some(ProtocolType::UniswapV2),
         Protocol::SushiSwap => Some(ProtocolType::SushiSwap),
-        Protocol::UniswapV3 | Protocol::BalancerV2 => None,
+        Protocol::UniswapV3 => Some(ProtocolType::UniswapV3),
+        Protocol::BalancerV2 => Some(ProtocolType::BalancerV2),
     }
 }
 
@@ -312,14 +322,11 @@ fn try_post_state_scan(
     router_label: &str,
     swap: &DecodedSwap,
 ) {
-    // V2/Sushi only — V3/Curve/Balancer need the revm-backed sim.
     let target_protocol = match swap.protocol {
         Protocol::UniswapV2 => ProtocolType::UniswapV2,
         Protocol::SushiSwap => ProtocolType::SushiSwap,
-        Protocol::UniswapV3 | Protocol::BalancerV2 => {
-            metrics.inc_pending_arb_sim_skipped("protocol_unsupported");
-            return;
-        }
+        Protocol::UniswapV3 => ProtocolType::UniswapV3,
+        Protocol::BalancerV2 => ProtocolType::BalancerV2,
     };
 
     let token_idx = ctx.token_index.load();
@@ -362,13 +369,46 @@ fn try_post_state_scan(
         return;
     }
 
-    // Apply the V2 constant-product math to the in/out reserves. `dx` is
-    // the victim's amountIn — bound to f64 via `u256_to_f64_saturating`
-    // since the f64 mantissa is enough for token amount magnitudes seen
-    // on-chain (up to ~2^53 ≈ 9e15 units of the smallest decimal).
-    let dx = u256_to_f64_saturating(swap.amount_in);
-    let (post_in, post_out) =
-        predict_v2_post_state(edge_fwd.reserve_in, edge_fwd.reserve_out, dx, fee_factor);
+    // Compute the post-state reserves the graph clone should adopt. V2 /
+    // Sushi reuse the inline constant-product formula because the predictor
+    // for those protocols intentionally lives outside `aether-pools`. V3 /
+    // Balancer route through the analytical post-state predictor in
+    // `aether-pools` and the result is mapped back onto graph-edge reserves
+    // so Bellman-Ford treats the two protocol families identically.
+    let (post_in, post_out) = match swap.protocol {
+        Protocol::UniswapV2 | Protocol::SushiSwap => {
+            // V2 constant-product: `dx` is the victim's amountIn — bound to
+            // f64 via `u256_to_f64_saturating` since the f64 mantissa is
+            // enough for token amount magnitudes seen on-chain
+            // (up to ~2^53 ≈ 9e15 units of the smallest decimal).
+            let dx = u256_to_f64_saturating(swap.amount_in);
+            predict_v2_post_state(edge_fwd.reserve_in, edge_fwd.reserve_out, dx, fee_factor)
+        }
+        Protocol::UniswapV3 | Protocol::BalancerV2 => {
+            let pool_addr = meta.pool_id.address;
+            let Some(state_arc) = ctx.pool_states.get(&pool_addr).map(|r| Arc::clone(r.value()))
+            else {
+                metrics.inc_pending_arb_sim_skipped("pool_state_missing");
+                return;
+            };
+            let post = predict_post_state_with_fallback(
+                &state_arc,
+                swap.token_in,
+                swap.amount_in,
+                |reason| metrics.inc_sim_evm_fallback(reason),
+            );
+            let Some(unified) = post else {
+                metrics.inc_pending_arb_sim_skipped("predictor_low_confidence");
+                return;
+            };
+            let (pin, pout) = unified_to_post_reserves(swap.token_in, &meta, &unified);
+            if pin <= 0.0 || pout <= 0.0 {
+                metrics.inc_pending_arb_sim_skipped("post_state_invalid");
+                return;
+            }
+            (pin, pout)
+        }
+    };
 
     // Clone the graph and apply the post-state to both directions of the
     // affected pair. update_edge_from_reserves is idempotent for a given
@@ -403,6 +443,59 @@ fn try_post_state_scan(
         best_profit_bps = (profitable[0].profit_factor() * 10_000.0) as i64,
         "MEMPOOL ARB CANDIDATE"
     );
+}
+
+/// Map a V3 / Balancer post-state into the (post_in, post_out) reserves the
+/// price graph stores per edge. Curve cannot reach here — the router
+/// decoder rejects every Curve calldata shape with `CurveUnsupported`
+/// before the pipeline sees it — but the variant is matched explicitly so
+/// new protocol families fail the build instead of silently routing to
+/// reserves of `(0.0, 0.0)`.
+///
+/// **V3 mapping.** The predictor returns `new_sqrt_price_x96`. The marginal
+/// post-state spot price (token1 per token0) is `(sqrt / 2^96)^2`. The
+/// graph's `update_edge_from_reserves` derives the edge weight as
+/// `(reserve_out / reserve_in) * fee_factor`, so we set the synthetic pair
+/// `(reserve_in, reserve_out) = (1.0, spot_price_post)` for the
+/// `token0 → token1` direction and the inverse for the reverse direction.
+/// `fee_factor` is applied at the graph layer, matching the bootstrap
+/// path that originally seeded the V3 edge with `price * fee`.
+///
+/// **Balancer mapping.** For equal-weight 2-token pools the rate equals
+/// `balance_out / balance_in` — directly usable as graph reserves with the
+/// pool's `fee_factor`. The predictor only returns `analytical = true` for
+/// the equal-weight case (unequal weights surface a low-confidence flag
+/// and the call short-circuits to the EVM fallback metric).
+fn unified_to_post_reserves(
+    swap_token_in: Address,
+    meta: &PoolMetadata,
+    post: &UnifiedPostState,
+) -> (f64, f64) {
+    match post {
+        UnifiedPostState::UniswapV3(v3) => {
+            const TWO_POW_96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+            let sqrt_f = u256_to_f64_saturating(v3.new_sqrt_price_x96);
+            let price_t1_per_t0 = (sqrt_f / TWO_POW_96).powi(2);
+            if price_t1_per_t0 <= 0.0 {
+                return (0.0, 0.0);
+            }
+            if swap_token_in == meta.token0 {
+                (1.0, price_t1_per_t0)
+            } else {
+                (1.0, 1.0 / price_t1_per_t0)
+            }
+        }
+        UnifiedPostState::Balancer(b) => {
+            let b0 = u256_to_f64_saturating(b.new_balance0);
+            let b1 = u256_to_f64_saturating(b.new_balance1);
+            if swap_token_in == meta.token0 {
+                (b0, b1)
+            } else {
+                (b1, b0)
+            }
+        }
+        UnifiedPostState::Curve(_) => (0.0, 0.0),
+    }
 }
 
 /// Predict V2 reserves after a swap of `dx` of `reserve_in` for `reserve_out`.
@@ -634,12 +727,14 @@ mod tests {
     /// empty, snapshot has a zero-vertex graph. Any `lookup_pool` returns
     /// `None`, which is what the `not_in_registry` test wants anyway.
     fn empty_sim_ctx() -> Arc<SimContext> {
+        use aether_pools::new_pool_state_cache;
         use aether_state::price_graph::PriceGraph;
         Arc::new(SimContext::new(
             Arc::new(ArcSwap::from_pointee(HashMap::<Address, PoolMetadata>::new())),
             Arc::new(ArcSwap::from_pointee(TokenIndex::default())),
             Arc::new(SnapshotManager::new(PriceGraph::new(0))),
             BellmanFord::new(3, 1_000),
+            new_pool_state_cache(),
         ))
     }
 
@@ -694,26 +789,27 @@ mod tests {
     }
 
     #[test]
-    fn pre_sim_filter_passes_unsupported_protocols_through() {
-        // V3 / Balancer have no analytical predictor yet — filter must NOT
-        // drop them under `not_in_registry`. They flow into the sim task and
-        // hit the existing `protocol_unsupported` skip path so the gap stays
-        // visible on its own counter.
+    fn pre_sim_filter_drops_v3_and_balancer_when_pair_not_registered() {
+        // V3 / Balancer now route through the same registry-membership
+        // check as V2 / Sushi: if the (token_in, token_out, protocol)
+        // triple is absent from `pool_registry`, the filter drops the
+        // swap under `not_in_registry` so the spawn_blocking + 3.8 MB
+        // graph clone is never scheduled.
         let metrics = EngineMetrics::new();
         let ctx = empty_sim_ctx();
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         for proto in [Protocol::UniswapV3, Protocol::BalancerV2] {
             let swap = fake_swap(proto, weth, usdc, U256::from(1_000u64));
-            assert!(pre_sim_filter(&metrics, &ctx, &swap));
+            assert!(!pre_sim_filter(&metrics, &ctx, &swap));
         }
-        assert_eq!(filtered_count(&metrics, "not_in_registry"), 0);
+        assert_eq!(filtered_count(&metrics, "not_in_registry"), 2);
         assert_eq!(filtered_count(&metrics, "same_token"), 0);
         assert_eq!(filtered_count(&metrics, "zero_amount"), 0);
     }
 
     #[test]
-    fn decoder_protocol_to_type_maps_supported_protocols() {
+    fn decoder_protocol_to_type_maps_all_decoded_protocols() {
         assert_eq!(
             decoder_protocol_to_type(Protocol::UniswapV2),
             Some(ProtocolType::UniswapV2)
@@ -722,7 +818,13 @@ mod tests {
             decoder_protocol_to_type(Protocol::SushiSwap),
             Some(ProtocolType::SushiSwap)
         );
-        assert_eq!(decoder_protocol_to_type(Protocol::UniswapV3), None);
-        assert_eq!(decoder_protocol_to_type(Protocol::BalancerV2), None);
+        assert_eq!(
+            decoder_protocol_to_type(Protocol::UniswapV3),
+            Some(ProtocolType::UniswapV3)
+        );
+        assert_eq!(
+            decoder_protocol_to_type(Protocol::BalancerV2),
+            Some(ProtocolType::BalancerV2)
+        );
     }
 }

@@ -154,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     engine_cfg.max_hops,
                     engine_cfg.detection_time_budget_us,
                 ),
+                Arc::clone(engine.pool_states()),
             ));
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
