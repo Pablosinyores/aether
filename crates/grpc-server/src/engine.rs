@@ -35,6 +35,26 @@ use aether_grpc_server::EngineMetrics;
 use crate::pipeline;
 use crate::service::aether_proto::ValidatedArb as ProtoValidatedArb;
 
+/// Rewrite a `wss://` / `ws://` URL into the corresponding `https://` /
+/// `http://` URL so the revm fork backend (HTTP-only `eth_getStorageAt`
+/// requests via AlloyDB) can talk to the same provider the streaming
+/// subscription uses. Returns the input unchanged if the scheme is
+/// already HTTP(S) or anything else — the URL parser downstream will
+/// surface a clear error in the unknown-scheme case.
+///
+/// Only the scheme portion is rewritten; host, path, and query string
+/// are left intact, so Alchemy / Infura / QuickNode endpoints that share
+/// the same hostname across transports map cleanly.
+fn normalize_to_http_scheme(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
 /// Configuration for the AetherEngine.
 pub struct EngineConfig {
     /// Maximum hops in arbitrage path.
@@ -336,8 +356,22 @@ impl AetherEngine {
         let simulator = EvmSimulator::with_defaults();
 
         // Build the RPC provider when an RPC URL is configured.
+        //
+        // `ETH_RPC_URL` is shared with the streaming subscription path (newHeads,
+        // logs, pending tx) which requires a `wss://` or `ws://` scheme for the
+        // persistent connection. The revm-backed fork backend, by contrast,
+        // issues one-shot `eth_getStorageAt` / `eth_getBalance` requests and
+        // only speaks `http(s)`. Without normalisation, a wss URL is rejected
+        // by `connect_http` and every detected cycle fails to simulate with
+        // `Transport error: builder error for url (wss://...)`.
+        //
+        // Major providers (Alchemy, Infura, QuickNode) expose both transports
+        // on the same hostname + path differing only in scheme, so a literal
+        // scheme rewrite produces the correct HTTP endpoint without forcing
+        // operators to maintain a second env var.
         let rpc_provider = config.rpc_url.as_ref().and_then(|url_str| {
-            let parsed: url::Url = match url_str.parse() {
+            let http_url = normalize_to_http_scheme(url_str);
+            let parsed: url::Url = match http_url.parse() {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(error = %e, url = %url_str, "Invalid RPC URL, falling back to empty state");
@@ -345,7 +379,11 @@ impl AetherEngine {
                 }
             };
             let provider = alloy::providers::ProviderBuilder::new().connect_http(parsed);
-            info!(url = %url_str, "RPC provider created for fork simulation");
+            info!(
+                original = %url_str,
+                fork_url = %http_url,
+                "RPC provider created for fork simulation"
+            );
             Some(provider.erased())
         });
 
@@ -1865,6 +1903,50 @@ mod tests {
         assert_eq!(config.min_profit_threshold_wei, 1_000_000_000_000_000);
         assert!((config.gas_price_gwei - 30.0).abs() < f64::EPSILON);
         assert_eq!(config.tip_bps, 9000);
+    }
+
+    #[test]
+    fn normalize_to_http_rewrites_wss_to_https() {
+        assert_eq!(
+            normalize_to_http_scheme("wss://eth-mainnet.g.alchemy.com/v2/abc"),
+            "https://eth-mainnet.g.alchemy.com/v2/abc"
+        );
+    }
+
+    #[test]
+    fn normalize_to_http_rewrites_ws_to_http() {
+        assert_eq!(
+            normalize_to_http_scheme("ws://127.0.0.1:8545/"),
+            "http://127.0.0.1:8545/"
+        );
+    }
+
+    #[test]
+    fn normalize_to_http_passes_https_unchanged() {
+        let url = "https://eth-mainnet.g.alchemy.com/v2/abc";
+        assert_eq!(normalize_to_http_scheme(url), url);
+    }
+
+    #[test]
+    fn normalize_to_http_passes_http_unchanged() {
+        let url = "http://127.0.0.1:8545/";
+        assert_eq!(normalize_to_http_scheme(url), url);
+    }
+
+    #[test]
+    fn normalize_to_http_passes_unknown_scheme_unchanged() {
+        // IPC paths, file URLs, anything not ws(s) — leave for the downstream
+        // parser to either accept or reject with a clear error.
+        let url = "ipc:///tmp/reth.ipc";
+        assert_eq!(normalize_to_http_scheme(url), url);
+    }
+
+    #[test]
+    fn normalize_to_http_preserves_query_string_and_path() {
+        assert_eq!(
+            normalize_to_http_scheme("wss://example.com/ws/v2?key=secret&foo=bar"),
+            "https://example.com/ws/v2?key=secret&foo=bar"
+        );
     }
 
     #[test]

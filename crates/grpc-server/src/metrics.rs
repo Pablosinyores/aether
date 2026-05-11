@@ -25,15 +25,14 @@ pub struct EngineMetrics {
     /// stay stable across releases.
     ///
     /// Stable label set:
-    ///   - `v3_tick_crossed`        — V3 swap moved sqrt_price out of
-    ///                                its single-tick bucket
-    ///   - `curve_unconverged`      — Curve Newton iteration produced
-    ///                                an invalid post-state
-    ///   - `balancer_unequal_weight`— Balancer first-order Taylor
-    ///                                approximation deemed too coarse
-    ///                                under heavy weight skew
-    ///   - `unknown_protocol`       — protocol family with no analytical
-    ///                                predictor on this build
+    ///   - `v3_tick_crossed` — V3 swap moved sqrt_price out of its
+    ///     single-tick bucket
+    ///   - `curve_unconverged` — Curve Newton iteration produced an
+    ///     invalid post-state
+    ///   - `balancer_unequal_weight` — Balancer first-order Taylor
+    ///     approximation deemed too coarse under heavy weight skew
+    ///   - `unknown_protocol` — protocol family with no analytical
+    ///     predictor on this build
     sim_evm_fallback_total: IntCounterVec,
 }
 
