@@ -1572,10 +1572,14 @@ impl AetherEngine {
                     Err(_) => return None,
                 };
                 if net_profit < self.config.min_profit_threshold_wei {
-                    debug!(
-                        net_profit,
-                        threshold = self.config.min_profit_threshold_wei,
-                        "Below min profit threshold"
+                    let net_profit_eth = net_profit as f64 / 1e18;
+                    let threshold_eth = self.config.min_profit_threshold_wei as f64 / 1e18;
+                    info!(
+                        net_profit_wei = net_profit,
+                        net_profit_eth = format!("{:.6}", net_profit_eth),
+                        threshold_eth = format!("{:.6}", threshold_eth),
+                        hops = candidate.hops.len(),
+                        "CYCLE REJECTED: below min profit threshold"
                     );
                     return None;
                 }
@@ -1812,9 +1816,22 @@ impl AetherEngine {
             self.metrics.observe_simulation_latency_us(sim_us);
 
             if !sim_result.success {
-                debug!(sim_us, reason = ?sim_result.revert_reason, "Simulation failed, skipping");
+                info!(
+                    sim_us,
+                    reason = ?sim_result.revert_reason,
+                    hops = input.opp.hops.len(),
+                    expected_net_wei = input.net_profit,
+                    "REVM SIM REVERTED"
+                );
                 continue;
             }
+            info!(
+                sim_us,
+                hops = input.opp.hops.len(),
+                expected_net_wei = input.net_profit,
+                expected_net_eth = format!("{:.6}", input.net_profit as f64 / 1e18),
+                "REVM SIM OK"
+            );
 
             // Post-sim cross-check (gate 4 of the candidate gating layer).
             // The pre-sim gates catch corruption signatures visible from

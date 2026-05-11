@@ -237,10 +237,25 @@ fn handle_event(
 fn pre_sim_filter(metrics: &EngineMetrics, ctx: &SimContext, swap: &DecodedSwap) -> bool {
     if swap.token_in == swap.token_out {
         metrics.inc_mempool_filtered("same_token");
+        info!(
+            target: "aether::mempool",
+            reason = "same_token",
+            protocol = ?swap.protocol,
+            token = %swap.token_in,
+            "FILTER DROP"
+        );
         return false;
     }
     if swap.amount_in.is_zero() {
         metrics.inc_mempool_filtered("zero_amount");
+        info!(
+            target: "aether::mempool",
+            reason = "zero_amount",
+            protocol = ?swap.protocol,
+            token_in = %swap.token_in,
+            token_out = %swap.token_out,
+            "FILTER DROP"
+        );
         return false;
     }
     let target_protocol = match decoder_protocol_to_type(swap.protocol) {
@@ -256,8 +271,24 @@ fn pre_sim_filter(metrics: &EngineMetrics, ctx: &SimContext, swap: &DecodedSwap)
         .is_none()
     {
         metrics.inc_mempool_filtered("not_in_registry");
+        info!(
+            target: "aether::mempool",
+            reason = "not_in_registry",
+            protocol = ?swap.protocol,
+            token_in = %swap.token_in,
+            token_out = %swap.token_out,
+            "FILTER DROP"
+        );
         return false;
     }
+    info!(
+        target: "aether::mempool",
+        protocol = ?swap.protocol,
+        token_in = %swap.token_in,
+        token_out = %swap.token_out,
+        amount_in = %swap.amount_in,
+        "FILTER PASS"
+    );
     true
 }
 
