@@ -34,6 +34,25 @@ pub struct EngineMetrics {
     ///   - `unknown_protocol` — protocol family with no analytical
     ///     predictor on this build
     sim_evm_fallback_total: IntCounterVec,
+    /// Detected cycles dropped by the multi-signal candidate gating layer
+    /// before they reach the EVM fork simulator. Each label corresponds to
+    /// a specific corruption signature the gating recognises; the cardinality
+    /// is fixed at compile time so dashboards can pre-render every panel.
+    ///
+    /// Stable label set:
+    ///   - `profit_factor_impossible` — `profit_factor > 100.0` (10000%);
+    ///     pure f64-overflow / NaN territory, never a real opportunity
+    ///   - `reserves_too_low` — at least one edge in the cycle has
+    ///     `reserve_in < MIN_RESERVE_F64` (default 1e6 wei); pool is
+    ///     effectively empty and the implied rate is noise
+    ///   - `fingerprint_cluster` — five or more sibling cycles share the
+    ///     same `profit_factor` (quantised to 1e-6); signature of a single
+    ///     corrupt edge being walked through many path permutations
+    ///   - `revm_contradicts` — post-sim check: `actual_profit_wei` from
+    ///     revm differs from `expected_net_wei` by more than 50%; either
+    ///     the detector's local graph is wrong or the simulation reverted
+    ///     in a way that masked the failure
+    cycle_gate_dropped_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -92,6 +111,14 @@ impl EngineMetrics {
             &["reason"],
         )
         .expect("aether_sim_evm_fallback_total counter vec");
+        let cycle_gate_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "aether_cycle_gate_dropped_total",
+                "Detected cycles dropped by the multi-signal candidate gating layer, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_cycle_gate_dropped_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -117,6 +144,9 @@ impl EngineMetrics {
         registry
             .register(Box::new(sim_evm_fallback_total.clone()))
             .expect("register aether_sim_evm_fallback_total");
+        registry
+            .register(Box::new(cycle_gate_dropped_total.clone()))
+            .expect("register aether_cycle_gate_dropped_total");
 
         Self {
             registry,
@@ -128,6 +158,7 @@ impl EngineMetrics {
             blocks_processed,
             decode_errors,
             sim_evm_fallback_total,
+            cycle_gate_dropped_total,
         }
     }
 
@@ -187,6 +218,25 @@ impl EngineMetrics {
     /// Prometheus text parsing.
     pub fn sim_evm_fallback_count(&self, reason: &str) -> u64 {
         self.sim_evm_fallback_total
+            .with_label_values(&[reason])
+            .get()
+    }
+
+    /// Bump `aether_cycle_gate_dropped_total{reason="..."}` for a cycle
+    /// rejected by the candidate gating layer. See the field doc on
+    /// `cycle_gate_dropped_total` for the stable label set; callers must
+    /// pick from the documented reasons so dashboards stay enumerable.
+    pub fn inc_cycle_gate_dropped(&self, reason: &str) {
+        self.cycle_gate_dropped_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Read the current value of `aether_cycle_gate_dropped_total{reason}`.
+    /// `pub` so tests can assert gating rates without re-implementing
+    /// Prometheus text parsing.
+    pub fn cycle_gate_dropped_count(&self, reason: &str) -> u64 {
+        self.cycle_gate_dropped_total
             .with_label_values(&[reason])
             .get()
     }

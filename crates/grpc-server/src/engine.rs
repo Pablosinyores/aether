@@ -32,6 +32,9 @@ use aether_state::token_index::TokenIndex;
 // Import the proto ValidatedArb type from service module
 use aether_grpc_server::EngineMetrics;
 
+use crate::cycle_gating::{
+    self, GatingConfig, PostSimGateVerdict, PreSimGateVerdict,
+};
 use crate::pipeline;
 use crate::service::aether_proto::ValidatedArb as ProtoValidatedArb;
 
@@ -79,6 +82,13 @@ pub struct EngineConfig {
     /// Maximum number of parallel EVM simulations per block cycle.
     /// Should match the number of pinned CPUs (CPU 0-3 → 4).
     pub max_parallel_sims: usize,
+    /// Configuration for the multi-signal candidate gating layer that
+    /// sits between cycle detection and EVM simulation. See
+    /// [`crate::cycle_gating::GatingConfig`] for per-gate semantics.
+    /// Tests that exercise the detection cycle with synthetic graphs
+    /// (`add_edge` without seeded reserves) should override this with a
+    /// permissive config; production runs use the strict default.
+    pub gating: GatingConfig,
 }
 
 impl Default for EngineConfig {
@@ -93,6 +103,7 @@ impl Default for EngineConfig {
             tip_bps: 9000,
             slippage_bps: 100,
             max_parallel_sims: 4,
+            gating: GatingConfig::default(),
         }
     }
 }
@@ -1328,8 +1339,33 @@ impl AetherEngine {
             let pool_registry = self.pool_registry.load();
             let mut candidates = Vec::new();
 
+            // Build the fingerprint index once over the full cycle batch
+            // so the multi-cycle gate is O(1) per cycle. Without this the
+            // gate degenerates to O(N) per cycle = O(N^2) across the
+            // batch, which dominates the detection budget on dense
+            // graphs.
+            let gating_config = self.config.gating;
+            let fingerprint_index =
+                cycle_gating::build_fingerprint_index(&cycles, &gating_config);
+
             for cycle in &cycles {
                 if !cycle.is_profitable() {
+                    continue;
+                }
+
+                // Pre-sim multi-signal gating. Drops cycles whose
+                // profit_factor is f64-overflow-territory (`> 10000%`),
+                // whose edges are below the TVL floor, or whose
+                // profit fingerprint clusters with five or more siblings
+                // — all signatures of corrupt graph state rather than
+                // real opportunity.
+                if let PreSimGateVerdict::Drop(_) = cycle_gating::gate_pre_sim(
+                    cycle,
+                    graph,
+                    &fingerprint_index,
+                    &gating_config,
+                    &self.metrics,
+                ) {
                     continue;
                 }
 
@@ -1777,6 +1813,27 @@ impl AetherEngine {
 
             if !sim_result.success {
                 debug!(sim_us, reason = ?sim_result.revert_reason, "Simulation failed, skipping");
+                continue;
+            }
+
+            // Post-sim cross-check (gate 4 of the candidate gating layer).
+            // The pre-sim gates catch corruption signatures visible from
+            // the graph alone; this gate catches the residual case where
+            // revm's fork sim reveals a graph-vs-chain mismatch the pre-
+            // sim gates could not have detected. `sim_result.profit_wei`
+            // is the gross profit revm measured against current chain
+            // state; `input.net_profit` is the detector's pre-sim
+            // estimate. A >50% fractional disagreement between the two
+            // indicates the local graph snapshot was stale at detection
+            // time — trust revm and drop the candidate before it ever
+            // reaches the executor or the published-arb stream.
+            let actual_profit_u128: u128 = sim_result.profit_wei.try_into().unwrap_or(u128::MAX);
+            if let PostSimGateVerdict::Drop(_) = cycle_gating::gate_post_sim(
+                input.net_profit,
+                actual_profit_u128,
+                &self.config.gating,
+                &self.metrics,
+            ) {
                 continue;
             }
 
@@ -2527,6 +2584,7 @@ mod tests {
             EngineConfig {
                 min_profit_threshold_wei: 0, // Accept any profit for testing.
                 gas_price_gwei: 0.0,         // Zero gas for testing.
+                gating: GatingConfig::permissive(),
                 ..EngineConfig::default()
             },
             tx,
@@ -2634,6 +2692,7 @@ mod tests {
             EngineConfig {
                 min_profit_threshold_wei: 0, // Accept any profit for testing.
                 gas_price_gwei: 0.0,         // Zero gas for testing.
+                gating: GatingConfig::permissive(),
                 ..EngineConfig::default()
             },
             tx,
@@ -2839,6 +2898,12 @@ fee_bps = 30
                 min_profit_threshold_wei: 0,
                 gas_price_gwei: 0.0,
                 slippage_bps,
+                // Synthetic triangle graph populates edges via
+                // `add_edge` with `reserve_in = 0.0`, which the strict
+                // production gating drops on the TVL gate. Tests assert
+                // detection-cycle behaviour, not gating behaviour, so
+                // use the permissive config here.
+                gating: GatingConfig::permissive(),
                 ..EngineConfig::default()
             },
             tx,
@@ -3124,6 +3189,7 @@ fee_bps = 30
                 min_profit_threshold_wei: 0,
                 gas_price_gwei: 0.0,
                 slippage_bps: 100,
+                gating: GatingConfig::permissive(),
                 ..EngineConfig::default()
             },
             tx,
