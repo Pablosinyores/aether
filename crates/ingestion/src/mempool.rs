@@ -45,11 +45,15 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 /// other value (including unset) disables the subscription, so default
 /// behaviour on `main` is unchanged.
 pub fn is_enabled() -> bool {
+    is_enabled_from_str(&std::env::var("MEMPOOL_TRACKING").unwrap_or_default())
+}
+
+/// Pure parser used by [`is_enabled`]; split out so unit tests can exercise the
+/// truthy-string rules without mutating process-wide env (which is `unsafe` on
+/// edition 2024 and race-prone under parallel `cargo test`).
+fn is_enabled_from_str(value: &str) -> bool {
     matches!(
-        std::env::var("MEMPOOL_TRACKING")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
+        value.to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
@@ -277,17 +281,12 @@ mod tests {
 
     #[test]
     fn is_enabled_respects_truthy_strings() {
-        // Each thread sees its own env, so we set + unset within the test.
-        std::env::set_var("MEMPOOL_TRACKING", "1");
-        assert!(is_enabled());
-        std::env::set_var("MEMPOOL_TRACKING", "TRUE");
-        assert!(is_enabled());
-        std::env::set_var("MEMPOOL_TRACKING", "yes");
-        assert!(is_enabled());
-        std::env::set_var("MEMPOOL_TRACKING", "off");
-        assert!(!is_enabled());
-        std::env::remove_var("MEMPOOL_TRACKING");
-        assert!(!is_enabled());
+        for v in ["1", "true", "TRUE", "True", "yes", "YES", "on", "On"] {
+            assert!(is_enabled_from_str(v), "{v} should enable");
+        }
+        for v in ["", "0", "false", "no", "off", "anything", "  1  "] {
+            assert!(!is_enabled_from_str(v), "{v} should not enable");
+        }
     }
 
     #[test]
