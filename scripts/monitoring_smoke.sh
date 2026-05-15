@@ -51,6 +51,7 @@ EXPECTED_ALERTS=(
   AetherETHBalanceLow
   AetherGasHigh
   AetherBuilderDown
+  AlertmanagerDown
   AetherServiceDown
   AetherNoBlocksProcessed
   AetherHighSimulationLatency
