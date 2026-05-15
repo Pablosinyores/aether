@@ -171,11 +171,25 @@ assert_rules_loaded() {
 assert_scrape_targets_up() {
   echo ""
   echo "--- asserting Prometheus discovered scrape targets ---"
-  local targets_json
-  if ! targets_json=$(curl -sf --max-time 10 "${PROMETHEUS_URL}/api/v1/targets" 2>/dev/null); then
-    fail "could not fetch ${PROMETHEUS_URL}/api/v1/targets"
-    return
-  fi
+
+  # Prometheus /-/ready turns 200 as soon as storage + HTTP API are up, but
+  # activeTargets is populated asynchronously and lags ready by ~5 s on a cold
+  # boot. Retry the fetch until every expected job appears or the deadline
+  # passes, otherwise reviewers see this assertion fail on every clean run.
+  local timeout=20 elapsed=0 interval=2 targets_json
+  while [[ $elapsed -lt $timeout ]]; do
+    targets_json=$(curl -sf --max-time 10 "${PROMETHEUS_URL}/api/v1/targets" 2>/dev/null || echo '{}')
+    local all_found=1
+    for job in "${EXPECTED_TARGETS[@]}"; do
+      local c
+      c=$(echo "${targets_json}" | jq --arg j "${job}" \
+        '[.data.activeTargets[]? | select(.labels.job == $j)] | length')
+      [[ "${c:-0}" -lt 1 ]] && all_found=0
+    done
+    [[ $all_found -eq 1 ]] && break
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
 
   for job in "${EXPECTED_TARGETS[@]}"; do
     local count
@@ -184,7 +198,7 @@ assert_scrape_targets_up() {
     if [[ "${count}" -ge 1 ]]; then
       pass "scrape job ${job} discovered (${count} target(s))"
     else
-      fail "scrape job ${job} not discovered by Prometheus"
+      fail "scrape job ${job} not discovered by Prometheus within ${timeout}s"
     fi
   done
 }
