@@ -14,6 +14,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 mod cycle_gating;
 mod engine;
 mod mempool_pipeline;
+mod mempool_writer;
 mod pipeline;
 mod service;
 mod tracing_init;
@@ -146,6 +147,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the engine's BellmanFord config so the analytical scan
             // honours the same hop / latency budget as the main path.
             let engine_cfg = EngineConfig::default();
+            // Mempool prediction writer: optional persistence to a separate
+            // Postgres DSN. MEMPOOL_LEDGER_DSN unset → NoopMempoolSink, no
+            // DB writes, behaviour identical to today. Distinct from the
+            // trade ledger's DATABASE_URL so an operator can enable mempool
+            // observability without provisioning the executor schema.
+            let writer_metrics =
+                mempool_writer::MempoolWriterMetrics::register(metrics.registry());
+            let prediction_sink = mempool_writer::mempool_writer_from_env(writer_metrics).await;
+            let engine_git_sha = std::env::var("AETHER_GIT_SHA").ok();
             let sim_ctx = Arc::new(mempool_pipeline::SimContext::new(
                 Arc::clone(engine.pool_registry()),
                 Arc::clone(engine.token_index()),
@@ -155,6 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     engine_cfg.detection_time_budget_us,
                 ),
                 Arc::clone(engine.pool_states()),
+                prediction_sink,
+                engine_git_sha,
             ));
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),

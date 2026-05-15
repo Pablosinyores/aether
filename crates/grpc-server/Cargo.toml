@@ -48,6 +48,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = "0.10"
+sqlx = { workspace = true }
+bigdecimal = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 prost-build = { workspace = true }

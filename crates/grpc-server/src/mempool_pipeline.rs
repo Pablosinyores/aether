@@ -32,10 +32,16 @@ use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
 use alloy::primitives::{Address, U256};
 use arc_swap::ArcSwap;
+use chrono::Utc;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::engine::PoolMetadata;
+use crate::mempool_writer::{
+    MempoolPredictionSink, NewMempoolPrediction, PredictedPostState, PROTOCOL_BALANCER,
+    PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
+};
 use crate::EngineMetrics;
 
 /// Pair-keyed pool index built from the live pool registry. Lookup is O(1)
@@ -80,6 +86,15 @@ pub struct SimContext {
     /// Balancer mempool sim path to call `predict_post_state_with_fallback`
     /// without round-tripping through the pool registry RPC.
     pub pool_states: PoolStateCache,
+    /// Optional persistence sink for mempool predictions. `Arc<NoopMempoolSink>`
+    /// when `MEMPOOL_LEDGER_DSN` is unset (no DB writes, no behaviour
+    /// change); `Arc<PgMempoolWriter>` when set. Always present so the
+    /// post-state path can call `insert_prediction` unconditionally.
+    pub prediction_sink: Arc<dyn MempoolPredictionSink>,
+    /// Engine build's git sha, copied onto every persisted prediction so
+    /// the reconciler / scorer can correlate row outcomes with the engine
+    /// version that produced them. `None` when the env var is unset.
+    pub engine_git_sha: Option<String>,
     /// Cached `(registry_ptr, PairIndex)` so the second and following pending
     /// swaps under the same registry generation lookup in O(1). The Mutex
     /// guards rebuild only — the steady-state path is `lock + ptr_eq + read`.
@@ -87,12 +102,15 @@ pub struct SimContext {
 }
 
 impl SimContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_registry: Arc<ArcSwap<HashMap<Address, PoolMetadata>>>,
         token_index: Arc<ArcSwap<TokenIndex>>,
         snapshot_manager: Arc<SnapshotManager>,
         detector: BellmanFord,
         pool_states: PoolStateCache,
+        prediction_sink: Arc<dyn MempoolPredictionSink>,
+        engine_git_sha: Option<String>,
     ) -> Self {
         Self {
             pool_registry,
@@ -100,6 +118,8 @@ impl SimContext {
             snapshot_manager,
             detector,
             pool_states,
+            prediction_sink,
+            engine_git_sha,
             pair_index_cache: Mutex::new(None),
         }
     }
@@ -215,8 +235,9 @@ fn handle_event(
                 let ctx = Arc::clone(ctx);
                 let swap = swap.clone();
                 let router_label = router_label.clone();
+                let tx_hash = event.tx_hash;
                 tokio::task::spawn_blocking(move || {
-                    try_post_state_scan(&metrics, &ctx, &router_label, &swap);
+                    try_post_state_scan(&metrics, &ctx, &router_label, &swap, tx_hash, to);
                 });
             }
         }
@@ -352,6 +373,8 @@ fn try_post_state_scan(
     ctx: &SimContext,
     router_label: &str,
     swap: &DecodedSwap,
+    event_tx_hash: alloy::primitives::B256,
+    event_to: Address,
 ) {
     let target_protocol = match swap.protocol {
         Protocol::UniswapV2 => ProtocolType::UniswapV2,
@@ -453,6 +476,47 @@ fn try_post_state_scan(
         .detect_from_affected(&graph, &[in_idx, out_idx]);
     let profitable: Vec<_> = cycles.into_iter().filter(|c| c.is_profitable()).collect();
 
+    // Persist the prediction unconditionally — both profitable and
+    // unprofitable swaps are useful signal for the reconciler (issue #131
+    // Go half), which needs the full population of decoded mempool swaps
+    // to compute block / ordering / pool-path accuracy. The
+    // `profit_factor_predicted` column is the SQL signal that the engine
+    // would have considered acting on the swap.
+    let post_state_json = match swap.protocol {
+        Protocol::UniswapV2 | Protocol::SushiSwap => PredictedPostState::V2 {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
+        Protocol::UniswapV3 => PredictedPostState::V3 {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
+        Protocol::BalancerV2 => PredictedPostState::Balancer {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
+    }
+    .into_json();
+    let prediction = NewMempoolPrediction {
+        prediction_id: Uuid::new_v4(),
+        decoded_at: Utc::now(),
+        pending_tx_hash: event_tx_hash,
+        router_address: event_to,
+        protocol: decoder_protocol_label(swap.protocol),
+        token_in: swap.token_in,
+        token_out: swap.token_out,
+        amount_in: swap.amount_in,
+        pool_address: Some(meta.pool_id.address),
+        predicted_target_block: snapshot.block_number.saturating_add(1),
+        predicted_post_state: post_state_json,
+        profit_factor_predicted: profitable.first().map(|c| c.profit_factor()),
+        // Reserved for the MEV-Share SSE path; Alchemy WS pendings carry
+        // no builder-side timestamp today.
+        detection_lead_ms: None,
+        engine_git_sha: ctx.engine_git_sha.clone(),
+    };
+    ctx.prediction_sink.insert_prediction(prediction);
+
     if profitable.is_empty() {
         metrics.inc_pending_arb_sim_skipped("no_profitable_cycle");
         return;
@@ -474,6 +538,18 @@ fn try_post_state_scan(
         best_profit_bps = (profitable[0].profit_factor() * 10_000.0) as i64,
         "MEMPOOL ARB CANDIDATE"
     );
+}
+
+/// Wire label for the `protocol` column on `mempool_predictions`. Pinned to
+/// the strings declared in [`crate::mempool_writer`] so the writer and the
+/// pipeline cannot drift. Matches issue #131's schema body.
+fn decoder_protocol_label(p: Protocol) -> &'static str {
+    match p {
+        Protocol::UniswapV2 => PROTOCOL_UNI_V2,
+        Protocol::SushiSwap => PROTOCOL_SUSHI,
+        Protocol::UniswapV3 => PROTOCOL_UNI_V3,
+        Protocol::BalancerV2 => PROTOCOL_BALANCER,
+    }
 }
 
 /// Map a V3 / Balancer post-state into the (post_in, post_out) reserves the
@@ -758,6 +834,7 @@ mod tests {
     /// empty, snapshot has a zero-vertex graph. Any `lookup_pool` returns
     /// `None`, which is what the `not_in_registry` test wants anyway.
     fn empty_sim_ctx() -> Arc<SimContext> {
+        use crate::mempool_writer::NoopMempoolSink;
         use aether_pools::new_pool_state_cache;
         use aether_state::price_graph::PriceGraph;
         Arc::new(SimContext::new(
@@ -766,6 +843,8 @@ mod tests {
             Arc::new(SnapshotManager::new(PriceGraph::new(0))),
             BellmanFord::new(3, 1_000),
             new_pool_state_cache(),
+            Arc::new(NoopMempoolSink::new()),
+            None,
         ))
     }
 
