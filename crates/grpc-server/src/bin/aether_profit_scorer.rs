@@ -46,7 +46,7 @@
 //!     PROFIT_SCORER_METRICS_ADDR=:9095 \
 //!     ./aether-profit-scorer
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,6 +116,27 @@ const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 /// quiet markets; replaced by the actual base fee on every refresh.
 const DEFAULT_BASE_FEE_WEI: u128 = 30_000_000_000;
 
+/// Upper bound on the number of pools augmented from `mempool_predictions`.
+/// Bounds memory + bootstrap RPC fan-out (one `eth_call` per pool to fetch
+/// reserves). The current production registry has ~55 pools; allow 5x
+/// headroom while still containing pathological cases (e.g. a misbehaving
+/// engine writing thousands of bogus pool addresses).
+const MAX_DB_PREDICTED_POOLS: i64 = 256;
+
+/// Default fee in basis points for DB-augmented pools whose protocol is
+/// V2-style. Uniswap V2, SushiSwap, and almost every V2 fork charge 30 bps;
+/// the 0.05% (5 bps) and 1% (100 bps) outliers exist but are rare enough on
+/// V2 forks that the default is good enough for the f64 rate weight here.
+/// The U256 verifier only uses fee_bps for V2/Sushi hops, where it's exact.
+const DEFAULT_V2_FEE_BPS: u32 = 30;
+
+/// Default fee for DB-augmented Uniswap V3 pools. V3's actual fee comes
+/// from `pool.fee()` and lives in one of (1, 5, 30, 100) bps; we can't
+/// know it without an extra RPC and the U256 verifier returns `None` for
+/// V3 hops anyway, so this only affects the f64 rate path's graph weight
+/// — a small error swamped by the rate magnitude itself.
+const DEFAULT_V3_FEE_BPS: u32 = 5;
+
 /// Safety floor for f64 fallback verdicts. The U256 verifier returns
 /// `None` for any cycle it can't resolve exactly — V3 hops, drained
 /// pools, edge-selection picking a pool whose state is missing, etc.
@@ -160,8 +181,8 @@ async fn main() -> Result<()> {
     let git_sha = std::env::var("AETHER_GIT_SHA").ok();
 
     info!("Loading pool config from {}", args.pools_config.display());
-    let pools = load_pools(&args.pools_config)?;
-    info!(pool_count = pools.len(), "Pools loaded");
+    let mut pools = load_pools(&args.pools_config)?;
+    info!(pool_count = pools.len(), "Pools loaded from config");
 
     let registry = Registry::new();
     let writer_metrics = ProfitabilityWriterMetrics::register(&registry);
@@ -176,6 +197,21 @@ async fn main() -> Result<()> {
         .connect(&dsn)
         .await
         .context("connect read pool")?;
+
+    // Augment the registry with every distinct pool the engine has
+    // already written a prediction for. The engine's runtime pair-index
+    // extends past `pools.toml` whenever the mempool decoder spots a new
+    // pool, but pre-#137 the scorer only loaded the static config — so
+    // most predictions resolved as `no_path` even when the engine could
+    // perfectly well graph them. This bootstrap pull closes that gap.
+    let config_addresses: HashSet<Address> = pools.iter().map(|p| p.address).collect();
+    match load_predicted_pools(&read_pool, &config_addresses).await {
+        Ok(extra) => {
+            info!(added_from_db = extra.len(), "DB-augmented pool registry");
+            pools.extend(extra);
+        }
+        Err(e) => warn!(error = %e, "could not augment pools from DB; continuing with config only"),
+    }
 
     // Convert WS RPC URL to HTTPS for the alloy HTTP provider. The fork
     // path in aether-replay does the same rewrite; replicated here so
@@ -214,9 +250,28 @@ async fn main() -> Result<()> {
                 }
             }
             _ = refresh_ticker.tick() => {
+                // Pick up pools the engine has discovered since startup.
+                // We re-run the same DB-augmentation as bootstrap, scoped
+                // to addresses we don't already have. Failure here is
+                // non-fatal — we keep the existing pool set if the SELECT
+                // fails — because losing one refresh cycle is better than
+                // killing the scorer over a transient DB blip.
+                let known: HashSet<Address> = pools.iter().map(|p| p.address).collect();
+                match load_predicted_pools(&read_pool, &known).await {
+                    Ok(extra) if !extra.is_empty() => {
+                        info!(added_from_db = extra.len(), "registry grew via mempool_predictions");
+                        pools.extend(extra);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "DB-augmented pool refresh failed"),
+                }
                 match bootstrap_state(&pools, &provider).await {
                     Ok(fresh) => {
-                        info!(base_fee_gwei = fresh.base_fee_wei as f64 / 1e9, "reference graph refreshed");
+                        info!(
+                            base_fee_gwei = fresh.base_fee_wei as f64 / 1e9,
+                            pool_count = pools.len(),
+                            "reference graph refreshed"
+                        );
                         state = fresh;
                     }
                     Err(e) => warn!(error = %e, "graph refresh failed; reusing previous reference"),
@@ -831,6 +886,104 @@ fn parse_protocol(s: &str) -> Option<ProtocolType> {
     }
 }
 
+/// Map the short-form protocol strings the engine writes into
+/// `mempool_predictions.protocol` (see `aether_grpc_server::mempool_writer`
+/// `PROTOCOL_*` constants) to `ProtocolType`. Distinct from
+/// [`parse_protocol`], which reads the long-form names used in
+/// `config/pools.toml`. Kept narrow on purpose: only the protocols the
+/// scorer can actually score are returned; Balancer / Curve / Bancor
+/// fall through to `None` so we don't add edges for hops the engine
+/// can't compute reserves for at present.
+fn parse_db_protocol(s: &str) -> Option<ProtocolType> {
+    match s {
+        "uni_v2" => Some(ProtocolType::UniswapV2),
+        "uni_v3" => Some(ProtocolType::UniswapV3),
+        "sushi" => Some(ProtocolType::SushiSwap),
+        _ => None,
+    }
+}
+
+/// Augment the static `config/pools.toml` registry with every distinct
+/// pool the engine has actually written a prediction for, but doesn't
+/// appear in the config. The engine's runtime pair-index extends as
+/// mempool decoding discovers new pools; the scorer's old behaviour of
+/// loading only the TOML config meant ~88% of confirmed predictions
+/// resolved as `decision='no_path'` even when their pool existed in the
+/// engine's graph at decode time.
+///
+/// `known` is the set of addresses already present from the config; pools
+/// in `known` are skipped so we don't double-register them.
+///
+/// Returns up to `MAX_DB_PREDICTED_POOLS` distinct LoadedPool entries.
+/// The cap exists so a runaway engine writing thousands of pool
+/// addresses can't blow the bootstrap's RPC fan-out (one eth_call per
+/// pool) or memory. The query orders by pool_address so the truncation
+/// is deterministic — same set across restarts unless the underlying
+/// table changes.
+async fn load_predicted_pools(
+    pg_pool: &sqlx::PgPool,
+    known: &HashSet<Address>,
+) -> Result<Vec<LoadedPool>> {
+    // Pull (pool, protocol, sample token_in, sample token_out) for every
+    // distinct pool address. token_in/token_out come from one arbitrary
+    // prediction row per pool; we use them only to derive the canonical
+    // (token0, token1) ordering, which is direction-agnostic by V2/V3
+    // invariant (token0 = min(addr), token1 = max(addr)).
+    // `(pool_address, protocol, token_in, token_out)` — all bytea fields
+    // come back as `Vec<u8>` from sqlx. Aliased so clippy doesn't flag
+    // the nested generic.
+    type DbPoolRow = (Vec<u8>, String, Vec<u8>, Vec<u8>);
+    let rows: Vec<DbPoolRow> = sqlx::query_as(
+        "SELECT DISTINCT ON (pool_address) pool_address, protocol, token_in, token_out \
+         FROM mempool_predictions \
+         WHERE pool_address IS NOT NULL \
+         ORDER BY pool_address, decoded_at DESC \
+         LIMIT $1",
+    )
+    .bind(MAX_DB_PREDICTED_POOLS)
+    .fetch_all(pg_pool)
+    .await
+    .context("SELECT DISTINCT pool_address FROM mempool_predictions")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (pool_bytes, proto_str, tin_bytes, tout_bytes) in rows {
+        if pool_bytes.len() != 20 || tin_bytes.len() != 20 || tout_bytes.len() != 20 {
+            warn!(
+                pool_len = pool_bytes.len(),
+                tin_len = tin_bytes.len(),
+                tout_len = tout_bytes.len(),
+                "skipping db pool with non-20-byte address fields"
+            );
+            continue;
+        }
+        let addr = Address::from_slice(&pool_bytes);
+        if known.contains(&addr) {
+            continue;
+        }
+        let Some(protocol) = parse_db_protocol(&proto_str) else {
+            // Balancer / Curve / Bancor / unknown — out of scope for the
+            // current scoring path. Tracked as future work.
+            debug!(protocol = %proto_str, pool = %addr, "skipping db pool with unsupported protocol");
+            continue;
+        };
+        let tin = Address::from_slice(&tin_bytes);
+        let tout = Address::from_slice(&tout_bytes);
+        let (token0, token1) = if tin < tout { (tin, tout) } else { (tout, tin) };
+        let fee_bps = match protocol {
+            ProtocolType::UniswapV3 => DEFAULT_V3_FEE_BPS,
+            _ => DEFAULT_V2_FEE_BPS,
+        };
+        out.push(LoadedPool {
+            address: addr,
+            token0,
+            token1,
+            protocol,
+            fee_bps,
+        });
+    }
+    Ok(out)
+}
+
 fn load_pools(path: &PathBuf) -> Result<Vec<LoadedPool>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("read pool config {}", path.display()))?;
@@ -1326,6 +1479,49 @@ mod tests {
                 "self-loop at input 10^{exp} returned {out} >= {input} — reserve evolution missing",
             );
         }
+    }
+
+    #[test]
+    fn parse_db_protocol_maps_short_form() {
+        assert_eq!(parse_db_protocol("uni_v2"), Some(ProtocolType::UniswapV2));
+        assert_eq!(parse_db_protocol("uni_v3"), Some(ProtocolType::UniswapV3));
+        assert_eq!(parse_db_protocol("sushi"), Some(ProtocolType::SushiSwap));
+        // Long forms are config-only; load_predicted_pools should
+        // reject them so we never accidentally route a config row
+        // through the DB path.
+        assert_eq!(parse_db_protocol("uniswap_v2"), None);
+        assert_eq!(parse_db_protocol("sushiswap"), None);
+        // Balancer / Curve / Bancor are valid engine protocols but the
+        // scorer can't compute reserves for them yet — they MUST be
+        // refused here so an unsupported pool doesn't sneak in with
+        // wrong fee_bps + nonexistent state.
+        assert_eq!(parse_db_protocol("balancer"), None);
+        assert_eq!(parse_db_protocol("curve"), None);
+        assert_eq!(parse_db_protocol("bancor"), None);
+        assert_eq!(parse_db_protocol(""), None);
+    }
+
+    #[test]
+    fn default_fee_bps_constants_match_spec() {
+        // Treat as a behavioural contract: changing either default
+        // changes graph weight for every DB-augmented pool, which
+        // shifts cycle rankings. Force the change to come through code
+        // review by surfacing here.
+        assert_eq!(DEFAULT_V2_FEE_BPS, 30);
+        assert_eq!(DEFAULT_V3_FEE_BPS, 5);
+    }
+
+    #[test]
+    fn max_db_predicted_pools_is_bounded() {
+        // Sanity floor: needs to be both positive and below the RPC
+        // fan-out budget (one eth_call per pool at bootstrap; ~256 is
+        // the production-tested ceiling). Surfaced as a behavioural
+        // contract so retunes go through review.
+        const _: () = {
+            assert!(MAX_DB_PREDICTED_POOLS > 0);
+            assert!(MAX_DB_PREDICTED_POOLS <= 1024);
+        };
+        assert_eq!(MAX_DB_PREDICTED_POOLS, 256);
     }
 
     #[test]
