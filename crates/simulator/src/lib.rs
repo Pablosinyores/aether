@@ -9,6 +9,7 @@ use revm::context::{BlockEnv, TxEnv};
 use revm::database::{CacheDB, EmptyDBTyped};
 use revm::handler::{ExecuteEvm, MainBuilder};
 use revm::primitives::hardfork::SpecId;
+use revm::state::AccountInfo;
 use revm::Context;
 use tracing::{debug, error, info};
 
@@ -317,6 +318,250 @@ impl EvmSimulator {
                     profit_wei: U256::ZERO,
                     gas_used: 0,
                     revert_reason: Some(format!("EVM error: {}", e)),
+                }
+            }
+        }
+    }
+
+    /// Deploy a contract via CREATE and then CALL it, measuring the ERC20
+    /// balance delta on `profit_recipient` for `profit_token` as profit.
+    ///
+    /// Two `transact` calls on the same revm `Context` share state: the
+    /// deployed contract's runtime bytecode is visible to the second CALL.
+    /// This lets us deploy AetherExecutor and immediately invoke
+    /// `executeArb` without an external provider or Anvil.
+    ///
+    /// `deployer` must be funded (ETH balance) in the provided `state`
+    /// before calling this method. The method funds the deployer
+    /// internally with 100 ETH as a convenience.
+    ///
+    /// Returns `SimulationResult` where `profit_wei` is the post-call
+    /// balance of `profit_recipient` minus the pre-call balance (in
+    /// `profit_token` ERC20, read via `balance_slot`). On any failure
+    /// (CREATE revert, CALL revert), returns `success: false`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deploy_and_simulate_with_erc20_profit(
+        &self,
+        mut state: RpcForkedState,
+        deployer: Address,
+        init_bytecode: &[u8],
+        constructor_args: &[u8],
+        calldata: Vec<u8>,
+        profit_token: Address,
+        profit_recipient: Address,
+        balance_slot: U256,
+    ) -> SimulationResult {
+        use revm::context::result::Output;
+        use revm::database::DatabaseRef;
+
+        // Fund the deployer so CREATE and CALL can proceed without
+        // balance-check failures even when `disable_balance_check` is set.
+        let hundred_eth = U256::from(100u64) * U256::from(10u64).pow(U256::from(18u64));
+        state.insert_account_balance(deployer, hundred_eth);
+
+        // Concatenate init bytecode + constructor args.
+        let mut deploy_data = Vec::with_capacity(init_bytecode.len() + constructor_args.len());
+        deploy_data.extend_from_slice(init_bytecode);
+        deploy_data.extend_from_slice(constructor_args);
+
+        // Destructure state for revm consumption.
+        let RpcForkedState {
+            db,
+            block_number,
+            block_timestamp,
+            base_fee,
+            chain_id,
+        } = state;
+
+        let block = BlockEnv {
+            number: U256::from(block_number),
+            timestamp: U256::from(block_timestamp),
+            basefee: base_fee,
+            ..Default::default()
+        };
+
+        // === Transact 1: CREATE ===
+        let create_tx = TxEnv::builder()
+            .caller(deployer)
+            .kind(revm::primitives::TxKind::Create)
+            .data(revm::primitives::Bytes::copy_from_slice(&deploy_data))
+            .value(U256::ZERO)
+            .gas_limit(8_000_000)
+            .gas_price(base_fee as u128)
+            .nonce(0)
+            .chain_id(Some(chain_id))
+            .build_fill();
+
+        let ctx = Context::<BlockEnv, TxEnv, _, RpcDB, revm::context::Journal<RpcDB>, ()>::new(
+            db, SpecId::CANCUN,
+        )
+        .with_block(block.clone())
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+        });
+
+        let mut evm = ctx.build_mainnet();
+
+        let create_result = match evm.transact(create_tx) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "CREATE transact error");
+                return SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some(format!("CREATE EVM error: {e}")),
+                };
+            }
+        };
+
+        let deployed_addr = match create_result.result {
+            ExecutionResult::Success { output: Output::Create(_, Some(addr)), .. } => addr,
+            ExecutionResult::Success { output: Output::Create(_, None), .. } => {
+                return SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some("CREATE succeeded but no address returned".into()),
+                };
+            }
+            ExecutionResult::Revert { gas_used, output } => {
+                let reason = format!("0x{}", alloy::hex::encode(&output));
+                return SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used,
+                    revert_reason: Some(format!("CREATE reverted: {reason}")),
+                };
+            }
+            ExecutionResult::Halt { reason, gas_used } => {
+                return SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used,
+                    revert_reason: Some(format!("CREATE halted: {reason:?}")),
+                };
+            }
+            _ => {
+                return SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some("CREATE returned unexpected output variant".into()),
+                };
+            }
+        };
+
+        debug!(%deployed_addr, "CREATE succeeded, proceeding to CALL");
+
+        // Commit CREATE state diffs into the DB so the CALL sees them.
+        let mut db = evm.ctx.journaled_state.database;
+        for (addr, account) in create_result.state.iter() {
+            if account.is_selfdestructed() {
+                continue;
+            }
+            let info = &account.info;
+            db.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: info.balance,
+                    nonce: info.nonce,
+                    code_hash: info.code_hash,
+                    code: info.code.clone(),
+                    ..Default::default()
+                },
+            );
+            for (slot, slot_val) in account.storage.iter() {
+                let _ = db.insert_account_storage(*addr, *slot, slot_val.present_value);
+            }
+        }
+
+        // === Pre-call balance read ===
+        let mut key_input = [0u8; 64];
+        key_input[12..32].copy_from_slice(profit_recipient.as_slice());
+        key_input[32..64].copy_from_slice(&balance_slot.to_be_bytes::<32>());
+        let storage_key = U256::from_be_slice(
+            alloy::primitives::keccak256(key_input).as_slice(),
+        );
+        let pre_balance = db
+            .storage_ref(profit_token, storage_key)
+            .unwrap_or_default();
+
+        // === Transact 2: CALL the deployed contract ===
+        let call_tx = TxEnv::builder()
+            .caller(deployer)
+            .kind(revm::primitives::TxKind::Call(deployed_addr))
+            .data(revm::primitives::Bytes::copy_from_slice(&calldata))
+            .value(U256::ZERO)
+            .gas_limit(self.config.gas_limit)
+            .gas_price(base_fee as u128)
+            .nonce(1)
+            .chain_id(Some(chain_id))
+            .build_fill();
+
+        let ctx2 = Context::<BlockEnv, TxEnv, _, RpcDB, revm::context::Journal<RpcDB>, ()>::new(
+            db, SpecId::CANCUN,
+        )
+        .with_block(block)
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = chain_id;
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+        });
+
+        let mut evm2 = ctx2.build_mainnet();
+
+        match evm2.transact(call_tx) {
+            Ok(result_and_state) => match result_and_state.result {
+                ExecutionResult::Success { gas_used, .. } => {
+                    let post_balance = result_and_state
+                        .state
+                        .get(&profit_token)
+                        .and_then(|acc| acc.storage.get(&storage_key))
+                        .map(|slot| slot.present_value)
+                        .unwrap_or(pre_balance);
+
+                    let profit = post_balance.saturating_sub(pre_balance);
+                    debug!(gas_used, %profit, "deploy+call simulation succeeded");
+                    SimulationResult {
+                        success: true,
+                        profit_wei: profit,
+                        gas_used,
+                        revert_reason: None,
+                    }
+                }
+                ExecutionResult::Revert { gas_used, output } => {
+                    let reason = format!("0x{}", alloy::hex::encode(&output));
+                    debug!(gas_used, reason = %reason, "CALL reverted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason),
+                    }
+                }
+                ExecutionResult::Halt { reason, gas_used } => {
+                    let reason_str = format!("{reason:?}");
+                    debug!(gas_used, reason = %reason_str, "CALL halted");
+                    SimulationResult {
+                        success: false,
+                        profit_wei: U256::ZERO,
+                        gas_used,
+                        revert_reason: Some(reason_str),
+                    }
+                }
+            },
+            Err(e) => {
+                error!(error = %e, "CALL transact error");
+                SimulationResult {
+                    success: false,
+                    profit_wei: U256::ZERO,
+                    gas_used: 0,
+                    revert_reason: Some(format!("CALL EVM error: {e}")),
                 }
             }
         }
