@@ -53,11 +53,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::network::Ethereum;
 use alloy::primitives::{address, Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
@@ -68,7 +69,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use aether_common::types::{PoolId, ProtocolType};
+use aether_common::types::{PoolId, ProtocolType, SwapStep};
 use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::gas as gas_model;
 use aether_detector::opportunity::DetectedCycle;
@@ -78,6 +79,11 @@ use aether_grpc_server::profitability_writer::{
     ProfitabilityWriterMetrics, UnscoredConfirmedPrediction, DECISION_NO_PATH,
     DECISION_PROFITABLE, DECISION_REVERTED, DECISION_UNPROFITABLE,
 };
+use aether_simulator::calldata::{
+    build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
+};
+use aether_simulator::fork::{RpcForkedState, SimConfig};
+use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
 
@@ -149,6 +155,24 @@ const DEFAULT_V3_FEE_BPS: u32 = 5;
 /// in the starting token's base units, which matches `net_profit_wei`.
 const MAX_PLAUSIBLE_F64_NET_WEI: i128 = 1_000_000_000_000_000_000; // 1 ETH worth
 
+// ── revm V3 verifier constants ─────────────────────────────────────
+
+/// Mainnet infra addresses — constructor args for AetherExecutor.
+const AAVE_POOL: Address = address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+const BANCOR_NETWORK: Address = address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB");
+const WETH_ADDR: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+const USDC_ADDR: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+const DAI_ADDR: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+const USDT_ADDR: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+/// Deterministic deployer/owner for the scorer's in-revm executor.
+const SIM_OWNER: Address = address!("1111111111111111111111111111111111111111");
+
+/// Default executor artifact path (relative to CWD).
+const DEFAULT_EXECUTOR_ARTIFACT: &str =
+    "contracts/out/AetherExecutor.sol/AetherExecutor.json";
+
 sol! {
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
@@ -160,6 +184,13 @@ struct Args {
     /// Path to the pool registry TOML. Defaults to ./config/pools.toml.
     #[arg(long, default_value = "config/pools.toml")]
     pools_config: PathBuf,
+
+    /// Path to the forge-compiled AetherExecutor JSON artifact. Used by the
+    /// revm verifier to deploy the executor inside pure-revm simulation for
+    /// V3-touching cycles. If absent or unreadable, the revm path is
+    /// disabled and V3 cycles fall back to the f64 absurdity floor.
+    #[arg(long, default_value = DEFAULT_EXECUTOR_ARTIFACT)]
+    executor_artifact: PathBuf,
 }
 
 #[tokio::main]
@@ -179,6 +210,28 @@ async fn main() -> Result<()> {
         .parse()
         .context("PROFIT_SCORER_METRICS_ADDR must be host:port")?;
     let git_sha = std::env::var("AETHER_GIT_SHA").ok();
+
+    // Load executor init bytecode for the revm V3 verifier. If the artifact
+    // doesn't exist (e.g. forge not run, or scorer deployed without contracts/),
+    // we log and continue — V3 cycles will fall back to the f64 absurdity floor.
+    let executor_bytecode: Option<Arc<Vec<u8>>> = match load_executor_init_bytecode(&args.executor_artifact) {
+        Ok(bc) => {
+            info!(
+                artifact = %args.executor_artifact.display(),
+                bytecode_len = bc.len(),
+                "Loaded executor init bytecode for revm V3 verifier"
+            );
+            Some(Arc::new(bc))
+        }
+        Err(e) => {
+            warn!(
+                artifact = %args.executor_artifact.display(),
+                error = %e,
+                "Could not load executor artifact; revm V3 verifier disabled (f64 fallback only)"
+            );
+            None
+        }
+    };
 
     info!("Loading pool config from {}", args.pools_config.display());
     let mut pools = load_pools(&args.pools_config)?;
@@ -219,6 +272,8 @@ async fn main() -> Result<()> {
     let http_url = rewrite_ws_to_http(&rpc_url);
     let provider = ProviderBuilder::new()
         .connect_http(http_url.parse().context("parse RPC URL")?);
+    // Type-erased provider for the revm verifier (requires DynProvider<Ethereum>).
+    let dyn_provider: DynProvider<Ethereum> = DynProvider::new(provider.clone());
 
     info!("Bootstrapping reference graph (this fetches reserves for every pool at latest block)");
     let initial_state = bootstrap_state(&pools, &provider).await?;
@@ -245,6 +300,8 @@ async fn main() -> Result<()> {
                 if let Err(e) = score_batch(
                     &read_pool, &provider, &pools, &state, sink.as_ref(),
                     git_sha.as_deref(),
+                    executor_bytecode.as_ref(),
+                    &dyn_provider,
                 ).await {
                     warn!(error = %e, "score batch failed");
                 }
@@ -288,6 +345,7 @@ async fn main() -> Result<()> {
 
 /// Single tick of the score loop: pull a batch of unscored confirmed
 /// predictions and score each one.
+#[allow(clippy::too_many_arguments)]
 async fn score_batch(
     read_pool: &sqlx::PgPool,
     provider: &impl Provider,
@@ -295,6 +353,8 @@ async fn score_batch(
     state: &ScorerState,
     sink: &dyn ProfitabilitySink,
     git_sha: Option<&str>,
+    executor_bytecode: Option<&Arc<Vec<u8>>>,
+    dyn_provider: &DynProvider<Ethereum>,
 ) -> Result<()> {
     let batch = PgProfitabilityWriter::fetch_unscored_confirmed(read_pool, SCORE_BATCH_LIMIT)
         .await
@@ -305,7 +365,7 @@ async fn score_batch(
     }
     info!(count = batch.len(), "scoring batch");
     for pred in batch {
-        match score_one(provider, pools, state, &pred).await {
+        match score_one(provider, pools, state, &pred, executor_bytecode, dyn_provider).await {
             Ok(score) => sink.insert_score(NewProfitabilityScore {
                 prediction_id: pred.prediction_id,
                 scored_at: Utc::now(),
@@ -340,6 +400,8 @@ async fn score_one(
     pools: &[LoadedPool],
     state: &ScorerState,
     pred: &UnscoredConfirmedPrediction,
+    executor_bytecode: Option<&Arc<Vec<u8>>>,
+    dyn_provider: &DynProvider<Ethereum>,
 ) -> Result<ScoreOutcome> {
     // Locate the prediction's pool in the registry. A prediction whose
     // pool is no longer in the registry (rare; registry change between
@@ -414,68 +476,62 @@ async fn score_one(
     let gas_wei = optimisation.gas_cost_wei;
     let optimal_input_wei = optimisation.optimal_input_wei;
 
-    // U256-precision re-check at the f64 optimiser's chosen input. The
-    // optimiser uses f64 throughout — fine for ranking cycles, but at
-    // mainnet-scale reserves (USDC pools hold ~1e14 base units, WETH pools
-    // ~1e22) the f64 mantissa loses ulps and overstates gross output by
-    // factors that can fabricate ETH-scale ghost profits (see soak's 5.29
-    // ETH USDC/WETH/DAI row). `verify_cycle_u256` walks the cycle's V2 hops
-    // with exact U256 `getAmountOut` math at the same `running_states`
-    // reserves the optimiser saw; if the walk yields gross < input, the row
-    // is downgraded to `DECISION_REVERTED` regardless of what the f64
-    // optimiser said. Cycles touching V3 (or any hop with missing reserve
-    // state) come back as `None` — we keep the f64 verdict in that case
-    // since the rate-only fallback was the only signal available anyway.
-    let verified_gross = verify_cycle_u256(
-        best,
-        &graph,
-        token_index,
-        pools,
-        &running_states,
-        optimal_input_wei,
-    );
+    // Decide: V2-only cycles get exact U256 math; V3-touching cycles route
+    // through the revm verifier (deploy AetherExecutor + executeArb in pure
+    // revm). Cycles that neither path can resolve fall back to the f64
+    // absurdity floor.
+    let v3_touching = is_v3_touching_cycle(best, &graph, token_index, pools, &running_states);
 
-    let (net, realized_wei_i128, decision) = match verified_gross {
-        Some(gross_out) => {
-            // Exact: gross_profit_i128 may be negative when the cycle would
-            // burn capital. saturating subs prevent panics on extreme inputs.
-            let gross_i128 = u256_to_i128_saturating(gross_out)
-                .saturating_sub(u256_to_i128_saturating(optimal_input_wei));
-            let exact_net = gross_i128.saturating_sub(gas_wei as i128);
-            let realised = gross_i128.max(0);
-            let decision = if gross_out < optimal_input_wei {
-                // Gross < input → cycle would unwind at a loss before gas
-                // even mattered. This is the precision-bias signature.
-                DECISION_REVERTED
-            } else if exact_net > 0 {
-                DECISION_PROFITABLE
-            } else {
-                DECISION_UNPROFITABLE
-            };
-            (exact_net, realised, decision)
+    let (net, realized_wei_i128, decision) = if !v3_touching {
+        // V2-only: exact U256 getAmountOut walk (unchanged from pre-V3 scorer).
+        let verified_gross = verify_cycle_u256(
+            best,
+            &graph,
+            token_index,
+            pools,
+            &running_states,
+            optimal_input_wei,
+        );
+        match verified_gross {
+            Some(gross_out) => {
+                let gross_i128 = u256_to_i128_saturating(gross_out)
+                    .saturating_sub(u256_to_i128_saturating(optimal_input_wei));
+                let exact_net = gross_i128.saturating_sub(gas_wei as i128);
+                let realised = gross_i128.max(0);
+                let decision = if gross_out < optimal_input_wei {
+                    DECISION_REVERTED
+                } else if exact_net > 0 {
+                    DECISION_PROFITABLE
+                } else {
+                    DECISION_UNPROFITABLE
+                };
+                (exact_net, realised, decision)
+            }
+            None => f64_fallback_verdict(optimisation.net_profit_wei, gas_wei),
         }
-        None => {
-            // Inconclusive (V3 hop, missing pool state, or some other case
-            // the U256 walker can't resolve). Fall back to the f64 number,
-            // but apply the absurdity floor: f64 nets above
-            // `MAX_PLAUSIBLE_F64_NET_WEI` are taken as precision-bias
-            // artefacts (a real >1 ETH arb wouldn't survive intra-block
-            // competition long enough to land in our soak) and downgraded
-            // to `DECISION_REVERTED` rather than written through as
-            // "profitable". Below the floor the f64 verdict is honoured
-            // unchanged — sub-ETH V3 arbs are exactly the kind of small
-            // signal we want to keep.
-            let f64_net = optimisation.net_profit_wei;
-            let realised = f64_net.saturating_add(gas_wei as i128).max(0);
-            let decision = if f64_net > MAX_PLAUSIBLE_F64_NET_WEI {
-                DECISION_REVERTED
-            } else if f64_net > 0 {
-                DECISION_PROFITABLE
-            } else {
-                DECISION_UNPROFITABLE
-            };
-            (f64_net, realised, decision)
+    } else if let Some(executor_bc) = executor_bytecode {
+        // V3-touching: deploy+simulate via pure revm.
+        let verdict = verify_cycle_revm(
+            best,
+            &graph,
+            token_index,
+            pools,
+            &running_states,
+            optimal_input_wei,
+            dyn_provider,
+            executor_bc,
+            state.block_number,
+            state.block_timestamp,
+            state.base_fee_wei as u64,
+        );
+        match verdict {
+            Some(rv) => revm_verdict_to_decision(rv, gas_wei),
+            // revm couldn't resolve (unsupported token, Curve hop, etc.)
+            None => f64_fallback_verdict(optimisation.net_profit_wei, gas_wei),
         }
+    } else {
+        // No executor bytecode available — pure f64 fallback.
+        f64_fallback_verdict(optimisation.net_profit_wei, gas_wei)
     };
 
     let realized_wei = U256::from(realized_wei_i128 as u128);
@@ -797,6 +853,309 @@ fn gas_estimate_for_protocols(protocols: &[ProtocolType], base_fee_wei: u128) ->
     gas_model::gas_cost_wei(units, base_fee_wei as f64 / 1e9)
 }
 
+// ── V3 revm verifier ──────────────────────────────────────────────
+
+/// Result from the revm deploy+simulate verifier.
+#[derive(Debug, Clone, Copy)]
+struct RevmVerdict {
+    /// Gross profit in the cycle's starting token (ERC20 balance delta on
+    /// SIM_OWNER after executeArb). Zero on revert.
+    gross_profit_wei: U256,
+    /// Gas consumed by the executeArb CALL (excludes CREATE overhead).
+    /// Currently informational only — the decision mapping uses the
+    /// scorer's static `gas_estimate_for_protocols` rather than revm's
+    /// measured cost, so this field is populated but not yet read by
+    /// the decision path. Kept for forthcoming gas-model calibration.
+    #[allow(dead_code)]
+    gas_used: u64,
+    /// True if the executeArb CALL reverted or halted.
+    reverted: bool,
+}
+
+/// Map a `RevmVerdict` into `(net, realised_i128, decision)`.
+fn revm_verdict_to_decision(rv: RevmVerdict, gas_cost_wei: u128) -> (i128, i128, &'static str) {
+    if rv.reverted {
+        let gas_i128 = gas_cost_wei as i128;
+        (-(gas_i128), 0, DECISION_REVERTED)
+    } else {
+        let gross_i128 = u256_to_i128_saturating(rv.gross_profit_wei);
+        let net = gross_i128.saturating_sub(gas_cost_wei as i128);
+        let realised = gross_i128.max(0);
+        let decision = if net > 0 {
+            DECISION_PROFITABLE
+        } else {
+            DECISION_UNPROFITABLE
+        };
+        (net, realised, decision)
+    }
+}
+
+/// Fallback for cycles that neither the U256 walker nor revm can resolve.
+/// Applies the absurdity floor: f64 nets above 1 ETH are downgraded to
+/// REVERTED (precision-bias artefact).
+fn f64_fallback_verdict(f64_net: i128, gas_cost_wei: u128) -> (i128, i128, &'static str) {
+    let realised = f64_net.saturating_add(gas_cost_wei as i128).max(0);
+    let decision = if f64_net > MAX_PLAUSIBLE_F64_NET_WEI {
+        DECISION_REVERTED
+    } else if f64_net > 0 {
+        DECISION_PROFITABLE
+    } else {
+        DECISION_UNPROFITABLE
+    };
+    (f64_net, realised, decision)
+}
+
+/// Walk the cycle's hops and return `true` if any hop's pool state is
+/// `PoolState::V3`. O(hops) — typically 2-4 iterations.
+fn is_v3_touching_cycle(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    running_states: &HashMap<usize, PoolState>,
+) -> bool {
+    for pair in cycle.path.windows(2) {
+        let [from_v, to_v] = [pair[0], pair[1]];
+        let edge = match graph
+            .edges_from(from_v)
+            .iter()
+            .filter(|e| e.to == to_v)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Some(e) => e,
+            None => continue,
+        };
+        // Resolve to a pool, check if it has a V3 state.
+        if token_index.get_address(from_v).is_none() {
+            continue;
+        }
+        let pool_idx = match pools.iter().position(|p| p.address == edge.pool_address) {
+            Some(i) => i,
+            None => continue,
+        };
+        if matches!(running_states.get(&pool_idx), Some(PoolState::V3 { .. })) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the ERC20 `_balances` mapping storage slot for well-known mainnet
+/// tokens. Returns `None` for tokens without a known slot — the revm verifier
+/// returns `None` (f64 fallback) for those cycles.
+fn balance_slot_for_token(token: Address) -> Option<U256> {
+    if token == WETH_ADDR {
+        Some(U256::from(3u64))
+    } else if token == USDC_ADDR {
+        Some(U256::from(9u64))
+    } else if token == DAI_ADDR || token == USDT_ADDR {
+        Some(U256::from(2u64))
+    } else {
+        None
+    }
+}
+
+/// Load AetherExecutor init-bytecode from the forge-compiled JSON artifact.
+fn load_executor_init_bytecode(artifact_path: &PathBuf) -> Result<Vec<u8>> {
+    let raw = std::fs::read_to_string(artifact_path)
+        .with_context(|| format!("read executor artifact {}", artifact_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parse executor artifact JSON")?;
+    let hex_str = v
+        .pointer("/bytecode/object")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing /bytecode/object in artifact"))?;
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = alloy::hex::decode(stripped).context("decode bytecode hex")?;
+    if bytes.is_empty() {
+        anyhow::bail!("executor bytecode is empty");
+    }
+    Ok(bytes)
+}
+
+/// Build `Vec<SwapStep>` from a detected cycle using pre-fetched running
+/// states (synchronous — no RPC calls). Ported from aether_replay's
+/// `build_steps_from_cycle` but sync and fed from `running_states`.
+///
+/// Returns `None` if any hop touches Curve/Balancer/Bancor, has missing
+/// state, or produces zero output.
+fn build_steps_from_cycle_sync(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    running_states: &HashMap<usize, PoolState>,
+    executor_addr: Address,
+    flashloan_amount: U256,
+) -> Option<Vec<SwapStep>> {
+    if cycle.path.len() < 2 {
+        return None;
+    }
+    let mut current_amount = flashloan_amount;
+    let mut steps: Vec<SwapStep> = Vec::with_capacity(cycle.path.len() - 1);
+
+    for pair in cycle.path.windows(2) {
+        let [from_v, to_v] = [pair[0], pair[1]];
+        let edge = graph
+            .edges_from(from_v)
+            .iter()
+            .filter(|e| e.to == to_v)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))?;
+
+        let token_in = *token_index.get_address(from_v)?;
+        let token_out = *token_index.get_address(to_v)?;
+        let (pool_idx, pool_entry) = pools
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.address == edge.pool_address)?;
+
+        let state = running_states.get(&pool_idx).copied()?;
+        let (amount_out, inner_calldata) = match (pool_entry.protocol, state) {
+            (ProtocolType::UniswapV2 | ProtocolType::SushiSwap, PoolState::V2 { r0, r1 }) => {
+                let (reserve_in, reserve_out, zero_for_one) = if token_in == pool_entry.token0 {
+                    (r0, r1, true)
+                } else {
+                    (r1, r0, false)
+                };
+                let out = uniswap_v2_get_amount_out(current_amount, reserve_in, reserve_out, pool_entry.fee_bps)?;
+                if out.is_zero() {
+                    return None;
+                }
+                let (amount0_out, amount1_out) = if zero_for_one {
+                    (U256::ZERO, out)
+                } else {
+                    (out, U256::ZERO)
+                };
+                let cd = build_univ2_swap_calldata(amount0_out, amount1_out, executor_addr);
+                (out, cd)
+            }
+            (ProtocolType::UniswapV3, PoolState::V3 { .. }) => {
+                // V3: approximate output from graph edge rate; the revm sim
+                // produces the real executable amount via tick traversal.
+                let rate = (-edge.weight).exp();
+                let approx_out = U256::from((u256_to_f64(current_amount) * rate).max(0.0) as u128);
+                if approx_out.is_zero() {
+                    return None;
+                }
+                let zero_for_one = token_in == pool_entry.token0;
+                let sqrt_limit = if zero_for_one {
+                    U256::from(4_295_128_740u64) // MIN_SQRT_RATIO + 1
+                } else {
+                    (U256::from(1u8) << 160) - U256::from(2u8) // MAX_SQRT_RATIO - 1
+                };
+                let amt_i128 = i128::try_from(current_amount.saturating_to::<u128>()).ok()?;
+                let cd = build_univ3_swap_calldata(executor_addr, zero_for_one, amt_i128, sqrt_limit);
+                (approx_out, cd)
+            }
+            // Curve / Balancer / Bancor: out of scope for V3 verifier.
+            _ => return None,
+        };
+
+        steps.push(SwapStep {
+            protocol: pool_entry.protocol,
+            pool_address: pool_entry.address,
+            token_in,
+            token_out,
+            amount_in: current_amount,
+            min_amount_out: U256::ZERO,
+            calldata: inner_calldata,
+        });
+
+        current_amount = amount_out;
+    }
+
+    Some(steps)
+}
+
+/// Verify a V3-touching cycle by deploying AetherExecutor inside pure revm
+/// and calling `executeArb`. Returns `None` when the cycle can't be resolved
+/// (unsupported token for balance-slot, Curve/Balancer hop, build failure).
+///
+/// Runs synchronously — callers should wrap in `spawn_blocking` if on an
+/// async context (the scorer's `score_one` is already async but the revm
+/// transact calls `block_in_place` internally via AlloyDB).
+#[allow(clippy::too_many_arguments)]
+fn verify_cycle_revm(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    running_states: &HashMap<usize, PoolState>,
+    optimal_input_wei: U256,
+    provider: &DynProvider<Ethereum>,
+    executor_init_bytecode: &[u8],
+    block_number: u64,
+    block_timestamp: u64,
+    base_fee: u64,
+) -> Option<RevmVerdict> {
+    if cycle.path.len() < 2 || optimal_input_wei.is_zero() {
+        return None;
+    }
+    // The cycle's starting token = flashloan asset = profit token.
+    let start_token = *token_index.get_address(cycle.path[0])?;
+    let balance_slot = balance_slot_for_token(start_token)?;
+
+    // We need a temporary executor address for inner-calldata recipients.
+    // Since we don't know the deployed address yet, we pre-compute it:
+    // CREATE from SIM_OWNER at nonce 0 → deterministic address.
+    let executor_addr = SIM_OWNER.create(0);
+
+    let steps = build_steps_from_cycle_sync(
+        cycle,
+        graph,
+        token_index,
+        pools,
+        running_states,
+        executor_addr,
+        optimal_input_wei,
+    )?;
+
+    if steps.is_empty() {
+        return None;
+    }
+
+    let calldata = build_execute_arb_calldata(
+        &steps,
+        start_token,
+        optimal_input_wei,
+        U256::from(u64::MAX), // deadline
+        U256::ZERO,           // minProfitOut
+        U256::ZERO,           // tipBps
+    );
+
+    let ctor_args = (AAVE_POOL, BALANCER_VAULT, BANCOR_NETWORK).abi_encode_params();
+
+    let fork_state = RpcForkedState::new(
+        provider.clone(),
+        block_number,
+        block_timestamp,
+        base_fee,
+    )?;
+
+    let sim = EvmSimulator::new(SimConfig {
+        gas_limit: 8_000_000,
+        chain_id: 1,
+        caller: SIM_OWNER,
+        value: U256::ZERO,
+    });
+
+    let result = sim.deploy_and_simulate_with_erc20_profit(
+        fork_state,
+        SIM_OWNER,
+        executor_init_bytecode,
+        &ctor_args,
+        calldata,
+        start_token,
+        SIM_OWNER,
+        balance_slot,
+    );
+
+    Some(RevmVerdict {
+        gross_profit_wei: result.profit_wei,
+        gas_used: result.gas_used,
+        reverted: !result.success,
+    })
+}
+
 /// Serialise a DetectedCycle into the JSONB shape the dashboard reads.
 /// Each hop carries `pool`, `token_in`, `token_out`, `protocol`.
 fn cycle_to_json(
@@ -1069,6 +1428,11 @@ struct ScorerState {
     /// position rather than by address.
     latest_states: HashMap<usize, PoolState>,
     base_fee_wei: u128,
+    /// Block number the reference graph was bootstrapped at. Used by the
+    /// revm verifier to pin `RpcForkedState` to a specific block.
+    block_number: u64,
+    /// Block timestamp at the reference-graph block.
+    block_timestamp: u64,
 }
 
 async fn bootstrap_state(
@@ -1076,16 +1440,22 @@ async fn bootstrap_state(
     provider: &impl Provider,
 ) -> Result<ScorerState> {
     let head = provider.get_block_number().await.context("get_block_number")?;
-    // Pull latest base fee for the gas model; default if it's missing
-    // (e.g. archive-only provider that doesn't fill base_fee_per_gas).
-    let base_fee_wei = provider
+    // Pull the full block header for base fee + timestamp (revm verifier
+    // needs both for accurate simulation).
+    let head_block = provider
         .get_block(BlockId::Number(BlockNumberOrTag::Number(head)))
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let base_fee_wei = head_block
+        .as_ref()
         .and_then(|b| b.header.base_fee_per_gas)
         .map(u128::from)
         .unwrap_or(DEFAULT_BASE_FEE_WEI);
+    let block_timestamp = head_block
+        .as_ref()
+        .map(|b| b.header.timestamp)
+        .unwrap_or(0);
 
     let mut latest_states: HashMap<usize, PoolState> = HashMap::new();
     for (idx, pool) in pools.iter().enumerate() {
@@ -1147,6 +1517,8 @@ async fn bootstrap_state(
         token_index,
         latest_states,
         base_fee_wei,
+        block_number: head,
+        block_timestamp,
     })
 }
 
@@ -1530,5 +1902,184 @@ mod tests {
         // → REVERTED. If anyone retunes it, this test reminds them to
         // re-read the comment block and re-run the soak.
         assert_eq!(MAX_PLAUSIBLE_F64_NET_WEI, 1_000_000_000_000_000_000i128);
+    }
+
+    // ── V3 verifier tests ─────────────────────────────────────────
+
+    fn loaded_v3(addr_byte: u8, token0: Address, token1: Address) -> LoadedPool {
+        let mut raw = [0u8; 20];
+        raw.fill(addr_byte);
+        LoadedPool {
+            address: Address::from(raw),
+            token0,
+            token1,
+            protocol: ProtocolType::UniswapV3,
+            fee_bps: 5,
+        }
+    }
+
+    fn loaded_curve(addr_byte: u8, token0: Address, token1: Address) -> LoadedPool {
+        let mut raw = [0u8; 20];
+        raw.fill(addr_byte);
+        LoadedPool {
+            address: Address::from(raw),
+            token0,
+            token1,
+            protocol: ProtocolType::Curve,
+            fee_bps: 4,
+        }
+    }
+
+    #[test]
+    fn is_v3_touching_cycle_v2_only_returns_false() {
+        let (token_index, [ta, tb, tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let c = *token_index.get_address(tc).unwrap();
+        let pools = vec![loaded(0x11, a, b), loaded(0x22, b, c), loaded(0x33, a, c)];
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        for (i, &(from, to)) in [(ta, tb), (tb, tc), (tc, ta)].iter().enumerate() {
+            graph.add_edge(
+                from, to, 0.0,
+                PoolId { address: pools[i].address, protocol: pools[i].protocol },
+                pools[i].address, pools[i].protocol, U256::ZERO,
+            );
+        }
+        let r = U256::from(1_000_000u64);
+        let mut states = HashMap::new();
+        for i in 0..3 { states.insert(i, PoolState::V2 { r0: r, r1: r }); }
+        let cycle = DetectedCycle { path: vec![ta, tb, tc, ta], total_weight: 0.0 };
+        assert!(!is_v3_touching_cycle(&cycle, &graph, &token_index, &pools, &states));
+    }
+
+    #[test]
+    fn is_v3_touching_cycle_mixed_returns_true() {
+        let (token_index, [ta, tb, _tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        // Pool 0 is V2, pool 1 is V3 — mixed cycle.
+        let pools = vec![loaded(0x11, a, b), loaded_v3(0x22, a, b)];
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        graph.add_edge(
+            ta, tb, 0.0,
+            PoolId { address: pools[0].address, protocol: pools[0].protocol },
+            pools[0].address, pools[0].protocol, U256::ZERO,
+        );
+        graph.add_edge(
+            tb, ta, 0.0,
+            PoolId { address: pools[1].address, protocol: pools[1].protocol },
+            pools[1].address, pools[1].protocol, U256::ZERO,
+        );
+        let mut states = HashMap::new();
+        states.insert(0, PoolState::V2 { r0: U256::from(1u64), r1: U256::from(1u64) });
+        states.insert(1, PoolState::V3 { sqrt_price_x96: U256::from(1u64) });
+        let cycle = DetectedCycle { path: vec![ta, tb, ta], total_weight: 0.0 };
+        assert!(is_v3_touching_cycle(&cycle, &graph, &token_index, &pools, &states));
+    }
+
+    #[test]
+    fn is_v3_touching_cycle_v3_only_returns_true() {
+        let (token_index, [ta, tb, _tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let pools = vec![loaded_v3(0x44, a, b)];
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        let pid = PoolId { address: pools[0].address, protocol: pools[0].protocol };
+        graph.add_edge(ta, tb, 0.0, pid, pools[0].address, pools[0].protocol, U256::ZERO);
+        graph.add_edge(tb, ta, 0.0, pid, pools[0].address, pools[0].protocol, U256::ZERO);
+        let mut states = HashMap::new();
+        states.insert(0, PoolState::V3 { sqrt_price_x96: U256::from(1u64) });
+        let cycle = DetectedCycle { path: vec![ta, tb, ta], total_weight: 0.0 };
+        assert!(is_v3_touching_cycle(&cycle, &graph, &token_index, &pools, &states));
+    }
+
+    #[test]
+    fn build_steps_returns_none_for_curve_hop() {
+        let (token_index, [ta, tb, _tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let pools = vec![loaded_curve(0x77, a, b)];
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        let pid = PoolId { address: pools[0].address, protocol: pools[0].protocol };
+        graph.add_edge(ta, tb, 0.0, pid, pools[0].address, pools[0].protocol, U256::ZERO);
+        let mut states = HashMap::new();
+        states.insert(0, PoolState::V2 { r0: U256::from(1_000_000u64), r1: U256::from(1_000_000u64) });
+        let cycle = DetectedCycle { path: vec![ta, tb], total_weight: 0.0 };
+        let executor_addr = address!("1111111111111111111111111111111111111111");
+        assert!(build_steps_from_cycle_sync(
+            &cycle, &graph, &token_index, &pools, &states, executor_addr, U256::from(1_000u64),
+        ).is_none());
+    }
+
+    #[test]
+    fn revm_verdict_decision_mapping_reverted() {
+        let rv = RevmVerdict { gross_profit_wei: U256::ZERO, gas_used: 100_000, reverted: true };
+        let (net, realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        assert_eq!(dec, DECISION_REVERTED);
+        assert!(net < 0);
+        assert_eq!(realised, 0);
+    }
+
+    #[test]
+    fn revm_verdict_decision_mapping_profitable() {
+        let rv = RevmVerdict {
+            gross_profit_wei: U256::from(200_000u64),
+            gas_used: 100_000,
+            reverted: false,
+        };
+        let (net, _realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        assert_eq!(dec, DECISION_PROFITABLE);
+        assert!(net > 0);
+    }
+
+    #[test]
+    fn revm_verdict_decision_mapping_unprofitable() {
+        let rv = RevmVerdict {
+            gross_profit_wei: U256::from(10_000u64),
+            gas_used: 100_000,
+            reverted: false,
+        };
+        let (net, _realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        assert_eq!(dec, DECISION_UNPROFITABLE);
+        assert!(net <= 0);
+    }
+
+    #[test]
+    fn f64_fallback_verdict_above_floor_reverted() {
+        let big_net = MAX_PLAUSIBLE_F64_NET_WEI + 1;
+        let (_net, _realised, dec) = f64_fallback_verdict(big_net, 50_000);
+        assert_eq!(dec, DECISION_REVERTED);
+    }
+
+    #[test]
+    fn f64_fallback_verdict_below_floor_profitable() {
+        let small_net = 1_000_000i128;
+        let (_net, _realised, dec) = f64_fallback_verdict(small_net, 50_000);
+        assert_eq!(dec, DECISION_PROFITABLE);
+    }
+
+    #[test]
+    fn f64_fallback_verdict_negative_unprofitable() {
+        let neg = -500_000i128;
+        let (net, _realised, dec) = f64_fallback_verdict(neg, 50_000);
+        assert_eq!(dec, DECISION_UNPROFITABLE);
+        assert!(net < 0);
+    }
+
+    #[test]
+    fn balance_slot_for_known_tokens() {
+        assert_eq!(balance_slot_for_token(WETH_ADDR), Some(U256::from(3u64)));
+        assert_eq!(balance_slot_for_token(USDC_ADDR), Some(U256::from(9u64)));
+        assert_eq!(balance_slot_for_token(DAI_ADDR), Some(U256::from(2u64)));
+        assert_eq!(balance_slot_for_token(USDT_ADDR), Some(U256::from(2u64)));
+        // Unknown token → None.
+        assert_eq!(
+            balance_slot_for_token(address!("0000000000000000000000000000000000000042")),
+            None,
+        );
     }
 }
