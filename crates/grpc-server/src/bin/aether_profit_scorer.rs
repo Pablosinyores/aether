@@ -76,7 +76,7 @@ use aether_detector::optimizer::ternary_search_optimal_input;
 use aether_grpc_server::profitability_writer::{
     profit_writer_from_env, NewProfitabilityScore, PgProfitabilityWriter, ProfitabilitySink,
     ProfitabilityWriterMetrics, UnscoredConfirmedPrediction, DECISION_NO_PATH,
-    DECISION_PROFITABLE, DECISION_UNPROFITABLE,
+    DECISION_PROFITABLE, DECISION_REVERTED, DECISION_UNPROFITABLE,
 };
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
@@ -115,6 +115,18 @@ const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 /// unavailable. 30 gwei matches the engine's typical assumption in
 /// quiet markets; replaced by the actual base fee on every refresh.
 const DEFAULT_BASE_FEE_WEI: u128 = 30_000_000_000;
+
+/// Safety floor for f64 fallback verdicts. The U256 verifier returns
+/// `None` for any cycle it can't resolve exactly — V3 hops, drained
+/// pools, edge-selection picking a pool whose state is missing, etc.
+/// In those cases the score falls back to the f64 optimiser's number,
+/// which is exactly the precision-biased path this PR set out to
+/// contain. So: cap the trust. Any f64-only verdict claiming net
+/// profit above this floor is downgraded to `DECISION_REVERTED` because
+/// a 1+ ETH arb on mainnet would be captured intra-block by faster
+/// searchers and never reach our scorer. The threshold is denominated
+/// in the starting token's base units, which matches `net_profit_wei`.
+const MAX_PLAUSIBLE_F64_NET_WEI: i128 = 1_000_000_000_000_000_000; // 1 ETH worth
 
 sol! {
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
@@ -344,19 +356,75 @@ async fn score_one(
         return Ok(no_path_outcome(Some(gas)));
     };
 
-    let net = optimisation.net_profit_wei;
     let gas_wei = optimisation.gas_cost_wei;
-    // Realised gross profit = net + gas (we subtracted gas inside the
-    // optimiser to score the cycle, so add it back to expose the gross
-    // signal separately).
-    let realized_wei_i128 = net.saturating_add(gas_wei as i128).max(0);
+    let optimal_input_wei = optimisation.optimal_input_wei;
+
+    // U256-precision re-check at the f64 optimiser's chosen input. The
+    // optimiser uses f64 throughout — fine for ranking cycles, but at
+    // mainnet-scale reserves (USDC pools hold ~1e14 base units, WETH pools
+    // ~1e22) the f64 mantissa loses ulps and overstates gross output by
+    // factors that can fabricate ETH-scale ghost profits (see soak's 5.29
+    // ETH USDC/WETH/DAI row). `verify_cycle_u256` walks the cycle's V2 hops
+    // with exact U256 `getAmountOut` math at the same `running_states`
+    // reserves the optimiser saw; if the walk yields gross < input, the row
+    // is downgraded to `DECISION_REVERTED` regardless of what the f64
+    // optimiser said. Cycles touching V3 (or any hop with missing reserve
+    // state) come back as `None` — we keep the f64 verdict in that case
+    // since the rate-only fallback was the only signal available anyway.
+    let verified_gross = verify_cycle_u256(
+        best,
+        &graph,
+        token_index,
+        pools,
+        &running_states,
+        optimal_input_wei,
+    );
+
+    let (net, realized_wei_i128, decision) = match verified_gross {
+        Some(gross_out) => {
+            // Exact: gross_profit_i128 may be negative when the cycle would
+            // burn capital. saturating subs prevent panics on extreme inputs.
+            let gross_i128 = u256_to_i128_saturating(gross_out)
+                .saturating_sub(u256_to_i128_saturating(optimal_input_wei));
+            let exact_net = gross_i128.saturating_sub(gas_wei as i128);
+            let realised = gross_i128.max(0);
+            let decision = if gross_out < optimal_input_wei {
+                // Gross < input → cycle would unwind at a loss before gas
+                // even mattered. This is the precision-bias signature.
+                DECISION_REVERTED
+            } else if exact_net > 0 {
+                DECISION_PROFITABLE
+            } else {
+                DECISION_UNPROFITABLE
+            };
+            (exact_net, realised, decision)
+        }
+        None => {
+            // Inconclusive (V3 hop, missing pool state, or some other case
+            // the U256 walker can't resolve). Fall back to the f64 number,
+            // but apply the absurdity floor: f64 nets above
+            // `MAX_PLAUSIBLE_F64_NET_WEI` are taken as precision-bias
+            // artefacts (a real >1 ETH arb wouldn't survive intra-block
+            // competition long enough to land in our soak) and downgraded
+            // to `DECISION_REVERTED` rather than written through as
+            // "profitable". Below the floor the f64 verdict is honoured
+            // unchanged — sub-ETH V3 arbs are exactly the kind of small
+            // signal we want to keep.
+            let f64_net = optimisation.net_profit_wei;
+            let realised = f64_net.saturating_add(gas_wei as i128).max(0);
+            let decision = if f64_net > MAX_PLAUSIBLE_F64_NET_WEI {
+                DECISION_REVERTED
+            } else if f64_net > 0 {
+                DECISION_PROFITABLE
+            } else {
+                DECISION_UNPROFITABLE
+            };
+            (f64_net, realised, decision)
+        }
+    };
+
     let realized_wei = U256::from(realized_wei_i128 as u128);
     let gas_estimate_wei = U256::from(gas_wei);
-    let decision = if net > 0 {
-        DECISION_PROFITABLE
-    } else {
-        DECISION_UNPROFITABLE
-    };
 
     let cycle_json = cycle_to_json(best, &graph, token_index, pools);
 
@@ -418,6 +486,12 @@ fn collect_running_states(
 struct OptimiserSuccess {
     net_profit_wei: i128,
     gas_cost_wei: u128,
+    /// Input amount the ternary search converged on. Exposed so the
+    /// post-optimiser U256 verifier (`verify_cycle_u256`) can re-walk
+    /// the cycle with exact integer math at the same input the f64
+    /// optimiser scored, and either confirm the profit or downgrade the
+    /// row to `DECISION_REVERTED` when f64 precision overstated reserves.
+    optimal_input_wei: U256,
 }
 
 fn optimise_cycle(
@@ -513,7 +587,7 @@ fn optimise_cycle(
             .saturating_sub(gas_cost_wei as i128)
     };
 
-    let (_optimal_input_wei, net_profit_wei) = if min_input < max_input {
+    let (optimal_input_wei, net_profit_wei) = if min_input < max_input {
         ternary_search_optimal_input(min_input, max_input, 80, profit_fn)
     } else {
         let p = profit_fn(min_input);
@@ -523,7 +597,143 @@ fn optimise_cycle(
     Some(OptimiserSuccess {
         net_profit_wei,
         gas_cost_wei,
+        optimal_input_wei,
     })
+}
+
+/// Re-walk the optimiser's chosen cycle with exact U256 V2 math and return
+/// the gross output amount in the cycle's starting token, or `None` when
+/// the cycle isn't fully V2-decidable.
+///
+/// Returns `None` (inconclusive — caller falls back to the f64 optimiser's
+/// verdict) when:
+/// - any hop's running state is missing
+/// - any hop is V3 (`PoolState::V3`) — V3 amount-out needs tick traversal;
+///   replicating that here is out of scope for the precision fix
+/// - any hop has zero-or-degenerate reserves
+/// - the graph edge doesn't resolve cleanly back to a registry pool
+///
+/// Returns `Some(gross_wei)` when every hop resolves to a V2/Sushi pool
+/// with positive reserves. The caller compares `gross_wei` against the
+/// starting input: `gross < input` ⇒ `DECISION_REVERTED` (f64 bias),
+/// otherwise the exact net = gross − input − gas drives the decision.
+fn verify_cycle_u256(
+    cycle: &DetectedCycle,
+    graph: &PriceGraph,
+    token_index: &TokenIndex,
+    pools: &[LoadedPool],
+    running_states: &HashMap<usize, PoolState>,
+    optimal_input_wei: U256,
+) -> Option<U256> {
+    if cycle.path.len() < 2 || optimal_input_wei.is_zero() {
+        return None;
+    }
+    // Per-pool reserve copy that we mutate as the cycle progresses. When
+    // a multi-hop cycle revisits the same pool (e.g. A→B→A self-loops the
+    // Bellman-Ford detector can emit whenever both edge directions exist
+    // on a single pool), the second hop MUST see reserves shifted by hop
+    // 1's swap; otherwise the verifier double-uses the pre-swap reserves
+    // and lets the second hop "regenerate" the input out of thin air,
+    // producing ETH-scale ghost profit identical in shape to the f64
+    // precision bias this PR set out to remove.
+    //
+    // Keyed by `pool_idx` so address-collision is impossible. Entries are
+    // only ever V2 `(r0, r1)` pairs — V3 hops short-circuit to `None` on
+    // first encounter, so any present entry is guaranteed V2.
+    let mut local_reserves: HashMap<usize, (U256, U256)> = HashMap::new();
+
+    let mut current_amount = optimal_input_wei;
+    for pair in cycle.path.windows(2) {
+        let [from_v, to_v] = [pair[0], pair[1]];
+        let edge = graph
+            .edges_from(from_v)
+            .iter()
+            .filter(|e| e.to == to_v)
+            .min_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal))?;
+        let token_in = *token_index.get_address(from_v)?;
+        let (pool_idx, pool_entry) = pools
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.address == edge.pool_address)?;
+
+        let (r0, r1) = match local_reserves.get(&pool_idx).copied() {
+            Some(rs) => rs,
+            None => match running_states.get(&pool_idx).copied()? {
+                PoolState::V2 { r0, r1 } => (r0, r1),
+                // V3 hop: out of scope for the U256 verifier; signal
+                // caller to keep the f64 verdict.
+                PoolState::V3 { .. } => return None,
+            },
+        };
+        let zero_for_one = token_in == pool_entry.token0;
+        let (r_in, r_out) = if zero_for_one { (r0, r1) } else { (r1, r0) };
+        let amount_out =
+            uniswap_v2_get_amount_out(current_amount, r_in, r_out, pool_entry.fee_bps)?;
+        if amount_out.is_zero() {
+            return None;
+        }
+
+        // Apply the swap to the local copy so subsequent hops on this
+        // pool see the post-swap reserves. V2 invariant
+        // (`r_in_new * r_out_new ≥ r_in * r_out`) is preserved exactly by
+        // construction since `uniswap_v2_get_amount_out` returns the
+        // largest `amount_out` consistent with the curve.
+        let r_in_new = r_in.checked_add(current_amount)?;
+        let r_out_new = r_out.checked_sub(amount_out)?;
+        let new_state = if zero_for_one {
+            (r_in_new, r_out_new)
+        } else {
+            (r_out_new, r_in_new)
+        };
+        local_reserves.insert(pool_idx, new_state);
+
+        current_amount = amount_out;
+    }
+    Some(current_amount)
+}
+
+/// UniswapV2 `getAmountOut` — exact U256 math, no rounding. Same formula
+/// the pool's `swap()` invariant check enforces on-chain, so the verifier
+/// here is byte-identical to what would actually execute. Returns `None`
+/// when any leg has zero reserves / zero input (drained-pool guard) or any
+/// intermediate multiplication overflows U256.
+fn uniswap_v2_get_amount_out(
+    amount_in: U256,
+    reserve_in: U256,
+    reserve_out: U256,
+    fee_bps: u32,
+) -> Option<U256> {
+    if reserve_in.is_zero() || reserve_out.is_zero() || amount_in.is_zero() {
+        return None;
+    }
+    // fee_bps = 30 (0.30%) → multiplier 9970/10000. The 10_000 - fee_bps
+    // form matches the contract's hard-coded numerator for the default 30
+    // bps pool and generalises to lower-fee Uni V2 forks.
+    let fee_multiplier = U256::from(10_000u64.saturating_sub(fee_bps as u64));
+    let amount_in_with_fee = amount_in.checked_mul(fee_multiplier)?;
+    let numerator = amount_in_with_fee.checked_mul(reserve_out)?;
+    let denominator = reserve_in
+        .checked_mul(U256::from(10_000u64))?
+        .checked_add(amount_in_with_fee)?;
+    if denominator.is_zero() {
+        return None;
+    }
+    Some(numerator / denominator)
+}
+
+/// U256 → i128 with saturating overflow. The scorer's `net_profit_wei`
+/// column is i128; profits beyond i128::MAX wei (≈170 quadrillion ETH —
+/// numerically unreachable on Ethereum) saturate rather than wrap. The
+/// guard exists for the precision-bias path where an unbounded f64 may
+/// have proposed an input larger than i128 can hold.
+fn u256_to_i128_saturating(v: U256) -> i128 {
+    let limbs = v.as_limbs();
+    // i128 fits in limbs[0] + limbs[1] (each limb is u64). Anything beyond
+    // limbs[1]'s sign bit overflows.
+    if limbs[2] != 0 || limbs[3] != 0 || (limbs[1] >> 63) == 1 {
+        return i128::MAX;
+    }
+    ((limbs[1] as i128) << 64) | (limbs[0] as i128)
 }
 
 fn gas_estimate_for_protocols(protocols: &[ProtocolType], base_fee_wei: u128) -> u128 {
@@ -917,5 +1127,212 @@ mod tests {
         assert_eq!(out.decision, DECISION_NO_PATH);
         assert_eq!(out.net_profit_wei, -50_000);
         assert_eq!(out.gas_estimate_wei, U256::from(50_000u64));
+    }
+
+    #[test]
+    fn uniswap_v2_get_amount_out_matches_constant_product() {
+        // 1 WETH in, 100 WETH / 200_000 USDC pool, 30 bps fee.
+        // Exact math: amount_in_with_fee = 1e18 * 9970 = 9.97e21
+        // numerator = 9.97e21 * 200e9 = 1.994e33
+        // denominator = 100e18 * 10_000 + 9.97e21 ≈ 1.00997e24
+        // out = 1.994e33 / 1.00997e24 ≈ 1.974e9 USDC (input is ~1% of pool
+        // depth so slippage compounds with the fee). Range below brackets
+        // the exact value while keeping wiggle room for unrelated changes
+        // to the formula.
+        let amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 WETH (18 dec)
+        let reserve_in = U256::from(100_000_000_000_000_000_000u128); // 100 WETH
+        let reserve_out = U256::from(200_000_000_000u128); // 200_000 USDC (6 dec)
+        let out = uniswap_v2_get_amount_out(amount_in, reserve_in, reserve_out, 30).unwrap();
+        let out_u64 = out.try_into().unwrap_or(u64::MAX);
+        assert!(
+            (1_970_000_000..=1_980_000_000).contains(&out_u64),
+            "expected ~1974 USDC, got {out_u64}"
+        );
+    }
+
+    #[test]
+    fn uniswap_v2_get_amount_out_rejects_zero_inputs() {
+        let r = U256::from(1_000_000u64);
+        assert!(uniswap_v2_get_amount_out(U256::ZERO, r, r, 30).is_none());
+        assert!(uniswap_v2_get_amount_out(r, U256::ZERO, r, 30).is_none());
+        assert!(uniswap_v2_get_amount_out(r, r, U256::ZERO, 30).is_none());
+    }
+
+    #[test]
+    fn u256_to_i128_saturating_handles_full_range() {
+        assert_eq!(u256_to_i128_saturating(U256::ZERO), 0);
+        assert_eq!(u256_to_i128_saturating(U256::from(42u64)), 42);
+        // i128::MAX fits exactly: high limb = i64::MAX, low limb = u64::MAX
+        let max_i128_as_u256 = U256::from(i128::MAX as u128);
+        assert_eq!(u256_to_i128_saturating(max_i128_as_u256), i128::MAX);
+        // Anything beyond i128::MAX saturates rather than wrapping.
+        let too_big = U256::from(1u128) << 127; // 2^127 — first value over i128::MAX
+        assert_eq!(u256_to_i128_saturating(too_big), i128::MAX);
+        // 2^192 lives in limb 3 — must saturate, not panic.
+        let huge = U256::from(1u128) << 192;
+        assert_eq!(u256_to_i128_saturating(huge), i128::MAX);
+    }
+
+    fn make_token_index() -> (TokenIndex, [usize; 3]) {
+        let a = address!("AAaaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaaaa");
+        let b = address!("BBbbBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBbbbb");
+        let c = address!("CCccCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCcccc");
+        let mut idx = TokenIndex::new();
+        let ia = idx.get_or_insert(a);
+        let ib = idx.get_or_insert(b);
+        let ic = idx.get_or_insert(c);
+        (idx, [ia, ib, ic])
+    }
+
+    fn loaded(addr_byte: u8, token0: Address, token1: Address) -> LoadedPool {
+        // Construct a unique address by repeating addr_byte across all 20 bytes.
+        let mut raw = [0u8; 20];
+        raw.fill(addr_byte);
+        LoadedPool {
+            address: Address::from(raw),
+            token0,
+            token1,
+            protocol: ProtocolType::UniswapV2,
+            fee_bps: 30,
+        }
+    }
+
+    #[test]
+    fn verify_cycle_u256_returns_none_when_v3_hop_present() {
+        // A two-hop cycle with a V3 hop in the middle must return None so
+        // the caller falls back to the f64 optimiser verdict.
+        let (token_index, [ta, tb, _tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let mut pool_v3 = loaded(0x33, a, b);
+        pool_v3.protocol = ProtocolType::UniswapV3;
+        let pools = vec![pool_v3];
+
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        graph.add_edge(
+            ta,
+            tb,
+            1.0,
+            PoolId { address: pools[0].address, protocol: pools[0].protocol },
+            pools[0].address,
+            pools[0].protocol,
+            U256::ZERO,
+        );
+
+        let mut states = HashMap::new();
+        states.insert(0, PoolState::V3 { sqrt_price_x96: U256::from(1u64) });
+
+        let cycle = DetectedCycle {
+            path: vec![ta, tb],
+            total_weight: 0.0,
+        };
+        assert!(
+            verify_cycle_u256(&cycle, &graph, &token_index, &pools, &states, U256::from(1u64))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verify_cycle_u256_walks_balanced_triangle() {
+        // Three V2 pools forming a balanced triangle. With balanced
+        // reserves and 30bps fee on each hop, an input of 1e18 should
+        // round-trip back to ~(1 - 3*0.003) * 1e18 ≈ 9.91e17 (lossy: the
+        // arb is unprofitable, which is the correct expected behaviour
+        // for a flat, no-edge triangle).
+        let (token_index, [ta, tb, tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let c = *token_index.get_address(tc).unwrap();
+
+        let pools = vec![
+            loaded(0x11, a, b),
+            loaded(0x22, b, c),
+            loaded(0x33, a, c),
+        ];
+
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        // Three balanced edges at rate=1.0; only the U256 walk matters
+        // for the verifier's behaviour, so we don't bother making the
+        // weights realistic.
+        for (i, (from, to)) in [(ta, tb), (tb, tc), (tc, ta)].iter().enumerate() {
+            graph.add_edge(
+                *from,
+                *to,
+                0.0,
+                PoolId { address: pools[i].address, protocol: pools[i].protocol },
+                pools[i].address,
+                pools[i].protocol,
+                U256::ZERO,
+            );
+        }
+
+        let mut states = HashMap::new();
+        // Balanced reserves: every pool 1e21 / 1e21 (no inter-pool edge).
+        let r = U256::from(1_000_000_000_000_000_000_000u128);
+        for i in 0..3 {
+            states.insert(i, PoolState::V2 { r0: r, r1: r });
+        }
+
+        let cycle = DetectedCycle {
+            path: vec![ta, tb, tc, ta],
+            total_weight: 0.0,
+        };
+        let input = U256::from(1_000_000_000_000_000_000u128); // 1.0
+        let out = verify_cycle_u256(&cycle, &graph, &token_index, &pools, &states, input).unwrap();
+        assert!(out < input);
+    }
+
+    #[test]
+    fn verify_cycle_u256_rejects_self_loop_with_shifted_reserves() {
+        // A→B→A on a single V2 pool. Without per-hop reserve evolution,
+        // the verifier returns gross_out >> input for large inputs
+        // because hop 2 sees the pre-swap reserves and "regenerates" the
+        // input. With evolution, gross_out < input for *every* input
+        // (double 30 bps fee is always lossy on a self-loop, regardless
+        // of input size). This is the exact bug that fabricated 80B ETH
+        // ghost profit on the soak's DAI/USDC self-loop row.
+        let (token_index, [ta, tb, _tc]) = make_token_index();
+        let a = *token_index.get_address(ta).unwrap();
+        let b = *token_index.get_address(tb).unwrap();
+        let pools = vec![loaded(0x55, a, b)];
+
+        let mut graph = PriceGraph::new(token_index.len());
+        graph.resize(token_index.len());
+        let pid = PoolId { address: pools[0].address, protocol: pools[0].protocol };
+        graph.add_edge(ta, tb, 1.0, pid, pools[0].address, pools[0].protocol, U256::ZERO);
+        graph.add_edge(tb, ta, 1.0, pid, pools[0].address, pools[0].protocol, U256::ZERO);
+
+        // DAI/USDC-shaped reserves: 5M DAI (1e25 base units) / 5M USDC
+        // (5e12 base units). Mainnet-scale where the f64 precision bias
+        // would otherwise bite.
+        let r_a = U256::from(5_000_000u128) * U256::from(10u128).pow(U256::from(18u64));
+        let r_b = U256::from(5_000_000u128) * U256::from(10u128).pow(U256::from(6u64));
+        let mut states = HashMap::new();
+        states.insert(0, PoolState::V2 { r0: r_a, r1: r_b });
+
+        let cycle = DetectedCycle { path: vec![ta, tb, ta], total_weight: 0.0 };
+
+        // Sweep inputs across four orders of magnitude — small inputs,
+        // pool-fraction inputs, and oversized inputs all must come back
+        // strictly less than input (double fee + slippage compound).
+        for &exp in &[16u32, 18, 21, 24] {
+            let input = U256::from(10u128).pow(U256::from(exp));
+            let out = verify_cycle_u256(&cycle, &graph, &token_index, &pools, &states, input)
+                .expect("self-loop should resolve");
+            assert!(
+                out < input,
+                "self-loop at input 10^{exp} returned {out} >= {input} — reserve evolution missing",
+            );
+        }
+    }
+
+    #[test]
+    fn absurdity_floor_is_set_at_one_eth() {
+        // The constant gates "verifier inconclusive but f64 says huge"
+        // → REVERTED. If anyone retunes it, this test reminds them to
+        // re-read the comment block and re-run the soak.
+        assert_eq!(MAX_PLAUSIBLE_F64_NET_WEI, 1_000_000_000_000_000_000i128);
     }
 }
