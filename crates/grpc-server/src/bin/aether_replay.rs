@@ -29,6 +29,10 @@ use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::gas as gas_model;
 use aether_detector::opportunity::DetectedCycle;
 use aether_detector::optimizer::ternary_search_optimal_input;
+use aether_grpc_server::historical::{
+    fetch_pool_state_at, getReservesCall, load_executor_init_bytecode, load_pools, slot0Call,
+    u256_to_f64, uniswap_v2_get_amount_out, LoadedPool, PoolState, Q96,
+};
 use aether_simulator::calldata::{
     build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
 };
@@ -36,22 +40,6 @@ use aether_simulator::fork::{RpcForkedState, SimConfig};
 use aether_simulator::EvmSimulator;
 use aether_state::price_graph::PriceGraph;
 use aether_state::token_index::TokenIndex;
-
-sol! {
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
-}
-
-/// 2^96 as f64, used to convert UniswapV3 `sqrtPriceX96` into a floating-point price.
-const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
-
-/// Per-pool state fetched from the chain. V3 carries `sqrtPriceX96`; V2/Sushi
-/// carry `(reserve0, reserve1)`.
-#[derive(Clone, Copy)]
-enum PoolState {
-    V2 { r0: U256, r1: U256 },
-    V3 { sqrt_price_x96: U256 },
-}
 
 /// Well-known mainnet token labels for readable output.
 fn token_label(addr: &Address) -> String {
@@ -183,41 +171,6 @@ struct Args {
     no_optimizer: bool,
 }
 
-#[derive(serde::Deserialize)]
-struct PoolEntry {
-    protocol: String,
-    address: String,
-    token0: String,
-    token1: String,
-    fee_bps: u32,
-}
-
-#[derive(serde::Deserialize)]
-struct PoolsConfig {
-    #[serde(default)]
-    pools: Vec<PoolEntry>,
-}
-
-struct LoadedPool {
-    address: Address,
-    token0: Address,
-    token1: Address,
-    protocol: ProtocolType,
-    fee_bps: u32,
-}
-
-fn parse_protocol(s: &str) -> Option<ProtocolType> {
-    match s {
-        "uniswap_v2" => Some(ProtocolType::UniswapV2),
-        "sushiswap" => Some(ProtocolType::SushiSwap),
-        "uniswap_v3" => Some(ProtocolType::UniswapV3),
-        "curve" => Some(ProtocolType::Curve),
-        "balancer_v2" => Some(ProtocolType::BalancerV2),
-        "bancor_v3" => Some(ProtocolType::BancorV3),
-        _ => None,
-    }
-}
-
 /// Built-in 7-pool set matching the integration tests. Enough token diversity
 /// (WETH/USDC/USDT/DAI) to produce real triangle-arb cycles when reserves are
 /// fetched from any recent mainnet block.
@@ -264,83 +217,6 @@ fn default_pool_set() -> Vec<LoadedPool> {
         mk(address!("D75EA151a61d06868E31F8988D28DFE5E9df57B4"), AAVE, WETH, ProtocolType::SushiSwap, 30),
         mk(address!("5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"), AAVE, WETH, ProtocolType::UniswapV3, 30),
     ]
-}
-
-fn load_pools(path: &PathBuf) -> Result<Vec<LoadedPool>> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read pool config {}", path.display()))?;
-    let cfg: PoolsConfig = toml::from_str(&raw).context("parse pool config")?;
-
-    let mut out = Vec::new();
-    for entry in cfg.pools {
-        // Phase 1 supports V2/Sushi (via `getReserves`) and UniswapV3 (via
-        // `slot0().sqrtPriceX96`). Curve / Balancer / Bancor are deferred.
-        let Some(protocol) = parse_protocol(&entry.protocol) else {
-            continue;
-        };
-        if !matches!(
-            protocol,
-            ProtocolType::UniswapV2 | ProtocolType::SushiSwap | ProtocolType::UniswapV3
-        ) {
-            continue;
-        }
-        out.push(LoadedPool {
-            address: entry.address.parse().context("pool address")?,
-            token0: entry.token0.parse().context("token0")?,
-            token1: entry.token1.parse().context("token1")?,
-            protocol,
-            fee_bps: entry.fee_bps,
-        });
-    }
-    Ok(out)
-}
-
-async fn fetch_pool_state_at(
-    provider: &impl Provider,
-    pool: &LoadedPool,
-    block: u64,
-) -> Option<PoolState> {
-    let block_id = BlockId::Number(BlockNumberOrTag::Number(block));
-    match pool.protocol {
-        ProtocolType::UniswapV2 | ProtocolType::SushiSwap => {
-            let calldata = getReservesCall {}.abi_encode();
-            let tx = TransactionRequest::default()
-                .to(pool.address)
-                .input(calldata.into());
-            match provider.call(tx).block(block_id).await {
-                Ok(out) if out.len() >= 64 => Some(PoolState::V2 {
-                    r0: U256::from_be_slice(&out[0..32]),
-                    r1: U256::from_be_slice(&out[32..64]),
-                }),
-                _ => None,
-            }
-        }
-        ProtocolType::UniswapV3 => {
-            let calldata = slot0Call {}.abi_encode();
-            let tx = TransactionRequest::default()
-                .to(pool.address)
-                .input(calldata.into());
-            match provider.call(tx).block(block_id).await {
-                // slot0 returns 7 values; only the first 32-byte word (sqrtPriceX96) is used.
-                Ok(out) if out.len() >= 32 => Some(PoolState::V3 {
-                    sqrt_price_x96: U256::from_be_slice(&out[0..32]),
-                }),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Truncate a U256 reserve to f64 for graph weight computation.
-/// Loss of precision is acceptable: we only care about the ratio.
-fn u256_to_f64(v: U256) -> f64 {
-    let limbs = v.as_limbs();
-    let mut acc = 0.0f64;
-    for (i, &limb) in limbs.iter().enumerate() {
-        acc += (limb as f64) * (2f64).powi((64 * i) as i32);
-    }
-    acc
 }
 
 fn build_graph(
@@ -535,7 +411,11 @@ async fn main() -> Result<()> {
     let pre_state_block = args.block - 1;
     let mut states = Vec::with_capacity(pools.len());
     for (i, pool) in pools.iter().enumerate() {
-        if let Some(state) = fetch_pool_state_at(&provider, pool, pre_state_block).await {
+        if let Some(state) = fetch_pool_state_at(&provider, pool, pre_state_block)
+            .await
+            .ok()
+            .flatten()
+        {
             states.push((i, state));
         }
     }
@@ -1697,22 +1577,6 @@ struct SimOutcome {
 /// We use `bytecode.object` (deploy bytecode, runs constructor + installs
 /// runtime) not `deployedBytecode` — the constructor fills `aavePool`
 /// immutable and sets `owner = msg.sender`.
-fn load_executor_init_bytecode(artifact_path: &PathBuf) -> Result<Vec<u8>> {
-    let raw = std::fs::read_to_string(artifact_path)
-        .with_context(|| format!("read executor artifact {}", artifact_path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw).context("parse executor artifact JSON")?;
-    let hex_str = v
-        .pointer("/bytecode/object")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing /bytecode/object in artifact"))?;
-    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = alloy::hex::decode(stripped).context("decode bytecode hex")?;
-    if bytes.is_empty() {
-        anyhow::bail!("executor bytecode is empty — artifact may be abstract / interface-only");
-    }
-    Ok(bytes)
-}
-
 /// Deploy `AetherExecutor` on the Anvil fork from `SIM_OWNER` with constructor
 /// args `(AAVE_POOL, BALANCER_VAULT, BANCOR_NETWORK)`. Returns the deployed
 /// contract address. Impersonation + balance seeding are done here so the
@@ -1890,29 +1754,6 @@ async fn build_steps_from_cycle<P: Provider>(
     }
 
     Some(steps)
-}
-
-/// UniswapV2 `getAmountOut` — exact math, no rounding. Returns `None` on
-/// zero-liquidity input (prevents the "drained pool" outlier from producing
-/// a non-zero forecast).
-fn uniswap_v2_get_amount_out(
-    amount_in: U256,
-    reserve_in: U256,
-    reserve_out: U256,
-    fee_bps: u32,
-) -> Option<U256> {
-    if reserve_in.is_zero() || reserve_out.is_zero() || amount_in.is_zero() {
-        return None;
-    }
-    // Default UniV2 fee: 30 bps → multiplier 997/1000.
-    let fee_multiplier = U256::from(10_000u64 - fee_bps as u64);
-    let amount_in_with_fee = amount_in.checked_mul(fee_multiplier)?;
-    let numerator = amount_in_with_fee.checked_mul(reserve_out)?;
-    let denom = reserve_in.checked_mul(U256::from(10_000u64))?.checked_add(amount_in_with_fee)?;
-    if denom.is_zero() {
-        return None;
-    }
-    Some(numerator / denom)
 }
 
 /// WETH's `balanceOf` mapping is at storage slot 3 (verified against mainnet
@@ -2107,6 +1948,7 @@ fn truncate_err(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aether_grpc_server::historical::parse_protocol;
 
     #[test]
     fn token_label_known_symbols() {

@@ -5,6 +5,7 @@
 /// without depending on the binary entry point. The `metrics` module is
 /// crate-private; only the two types the binary and integration tests
 /// actually need are re-exported publicly.
+pub mod historical;
 pub(crate) mod metrics;
 pub mod profitability_writer;
 pub mod provider;
