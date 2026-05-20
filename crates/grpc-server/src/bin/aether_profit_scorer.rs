@@ -78,7 +78,8 @@ use aether_grpc_server::historical::{
 use aether_grpc_server::profitability_writer::{
     profit_writer_from_env, NewProfitabilityScore, PgProfitabilityWriter, ProfitabilitySink,
     ProfitabilityWriterMetrics, UnscoredConfirmedPrediction, DECISION_NO_PATH,
-    DECISION_PROFITABLE, DECISION_REVERTED, DECISION_UNPROFITABLE,
+    DECISION_PROFITABLE, DECISION_REVERTED, DECISION_UNPROFITABLE, REASON_ABSURDITY_FLOOR,
+    REASON_NA, REASON_REVM_REVERT, REASON_REVM_VERDICT, REASON_U256_WALKER,
 };
 use aether_simulator::calldata::{
     build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
@@ -366,6 +367,7 @@ async fn score_batch(
                 gas_estimate_wei: score.gas_estimate_wei,
                 net_profit_wei: score.net_profit_wei,
                 decision: score.decision,
+                reason: score.reason,
                 scoring_engine_git_sha: git_sha.map(str::to_string),
             }),
             Err(e) => warn!(
@@ -385,6 +387,10 @@ struct ScoreOutcome {
     gas_estimate_wei: U256,
     net_profit_wei: i128,
     decision: &'static str,
+    /// Prometheus-only sub-label describing which code path produced the
+    /// decision. Pinned to one of the `REASON_*` constants in
+    /// `profitability_writer`. Not persisted to Postgres.
+    reason: &'static str,
 }
 
 async fn score_one(
@@ -474,7 +480,7 @@ async fn score_one(
     // absurdity floor.
     let v3_touching = is_v3_touching_cycle(best, &graph, token_index, pools, &running_states);
 
-    let (net, realized_wei_i128, decision) = if !v3_touching {
+    let (net, realized_wei_i128, decision, reason) = if !v3_touching {
         // V2-only: exact U256 getAmountOut walk (unchanged from pre-V3 scorer).
         let verified_gross = verify_cycle_u256(
             best,
@@ -497,7 +503,7 @@ async fn score_one(
                 } else {
                     DECISION_UNPROFITABLE
                 };
-                (exact_net, realised, decision)
+                (exact_net, realised, decision, REASON_U256_WALKER)
             }
             None => f64_fallback_verdict(optimisation.net_profit_wei, gas_wei),
         }
@@ -537,6 +543,7 @@ async fn score_one(
         gas_estimate_wei,
         net_profit_wei: net,
         decision,
+        reason,
     })
 }
 
@@ -548,6 +555,11 @@ fn no_path_outcome(gas: Option<u128>) -> ScoreOutcome {
         gas_estimate_wei: U256::from(gas_wei),
         net_profit_wei: -(gas_wei as i128),
         decision: DECISION_NO_PATH,
+        // `no_path` has no sub-source worth distinguishing today — the
+        // upstream causes (pool absent, eth_call empty, optimiser bailed,
+        // ...) collapse to the same dashboard slice. Add a sub-reason
+        // when one of those proves operationally interesting.
+        reason: REASON_NA,
     }
 }
 
@@ -840,11 +852,17 @@ struct RevmVerdict {
     reverted: bool,
 }
 
-/// Map a `RevmVerdict` into `(net, realised_i128, decision)`.
-fn revm_verdict_to_decision(rv: RevmVerdict, gas_cost_wei: u128) -> (i128, i128, &'static str) {
+/// Map a `RevmVerdict` into `(net, realised_i128, decision, reason)`.
+/// Reverted verdicts carry `REASON_REVM_REVERT`; non-reverted verdicts
+/// carry `REASON_REVM_VERDICT` so the dashboard can distinguish revm-
+/// executed decisions from f64-fallback or U256-walker decisions.
+fn revm_verdict_to_decision(
+    rv: RevmVerdict,
+    gas_cost_wei: u128,
+) -> (i128, i128, &'static str, &'static str) {
     if rv.reverted {
         let gas_i128 = gas_cost_wei as i128;
-        (-(gas_i128), 0, DECISION_REVERTED)
+        (-(gas_i128), 0, DECISION_REVERTED, REASON_REVM_REVERT)
     } else {
         let gross_i128 = u256_to_i128_saturating(rv.gross_profit_wei);
         let net = gross_i128.saturating_sub(gas_cost_wei as i128);
@@ -854,23 +872,27 @@ fn revm_verdict_to_decision(rv: RevmVerdict, gas_cost_wei: u128) -> (i128, i128,
         } else {
             DECISION_UNPROFITABLE
         };
-        (net, realised, decision)
+        (net, realised, decision, REASON_REVM_VERDICT)
     }
 }
 
 /// Fallback for cycles that neither the U256 walker nor revm can resolve.
 /// Applies the absurdity floor: f64 nets above 1 ETH are downgraded to
-/// REVERTED (precision-bias artefact).
-fn f64_fallback_verdict(f64_net: i128, gas_cost_wei: u128) -> (i128, i128, &'static str) {
+/// REVERTED (precision-bias artefact). Reverts via the floor carry
+/// `REASON_ABSURDITY_FLOOR`; below-floor verdicts carry `REASON_NA`
+/// because the f64-fallback path doesn't subdivide further.
+fn f64_fallback_verdict(
+    f64_net: i128,
+    gas_cost_wei: u128,
+) -> (i128, i128, &'static str, &'static str) {
     let realised = f64_net.saturating_add(gas_cost_wei as i128).max(0);
-    let decision = if f64_net > MAX_PLAUSIBLE_F64_NET_WEI {
-        DECISION_REVERTED
+    if f64_net > MAX_PLAUSIBLE_F64_NET_WEI {
+        (f64_net, realised, DECISION_REVERTED, REASON_ABSURDITY_FLOOR)
     } else if f64_net > 0 {
-        DECISION_PROFITABLE
+        (f64_net, realised, DECISION_PROFITABLE, REASON_NA)
     } else {
-        DECISION_UNPROFITABLE
-    };
-    (f64_net, realised, decision)
+        (f64_net, realised, DECISION_UNPROFITABLE, REASON_NA)
+    }
 }
 
 /// Walk the cycle's hops and return `true` if any hop's pool state is
@@ -1484,6 +1506,7 @@ mod tests {
     fn no_path_outcome_carries_negative_net_when_gas_given() {
         let out = no_path_outcome(Some(50_000));
         assert_eq!(out.decision, DECISION_NO_PATH);
+        assert_eq!(out.reason, REASON_NA);
         assert_eq!(out.net_profit_wei, -50_000);
         assert_eq!(out.gas_estimate_wei, U256::from(50_000u64));
     }
@@ -1852,8 +1875,9 @@ mod tests {
     #[test]
     fn revm_verdict_decision_mapping_reverted() {
         let rv = RevmVerdict { gross_profit_wei: U256::ZERO, gas_used: 100_000, reverted: true };
-        let (net, realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        let (net, realised, dec, reason) = revm_verdict_to_decision(rv, 50_000);
         assert_eq!(dec, DECISION_REVERTED);
+        assert_eq!(reason, REASON_REVM_REVERT);
         assert!(net < 0);
         assert_eq!(realised, 0);
     }
@@ -1865,8 +1889,9 @@ mod tests {
             gas_used: 100_000,
             reverted: false,
         };
-        let (net, _realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        let (net, _realised, dec, reason) = revm_verdict_to_decision(rv, 50_000);
         assert_eq!(dec, DECISION_PROFITABLE);
+        assert_eq!(reason, REASON_REVM_VERDICT);
         assert!(net > 0);
     }
 
@@ -1877,30 +1902,34 @@ mod tests {
             gas_used: 100_000,
             reverted: false,
         };
-        let (net, _realised, dec) = revm_verdict_to_decision(rv, 50_000);
+        let (net, _realised, dec, reason) = revm_verdict_to_decision(rv, 50_000);
         assert_eq!(dec, DECISION_UNPROFITABLE);
+        assert_eq!(reason, REASON_REVM_VERDICT);
         assert!(net <= 0);
     }
 
     #[test]
     fn f64_fallback_verdict_above_floor_reverted() {
         let big_net = MAX_PLAUSIBLE_F64_NET_WEI + 1;
-        let (_net, _realised, dec) = f64_fallback_verdict(big_net, 50_000);
+        let (_net, _realised, dec, reason) = f64_fallback_verdict(big_net, 50_000);
         assert_eq!(dec, DECISION_REVERTED);
+        assert_eq!(reason, REASON_ABSURDITY_FLOOR);
     }
 
     #[test]
     fn f64_fallback_verdict_below_floor_profitable() {
         let small_net = 1_000_000i128;
-        let (_net, _realised, dec) = f64_fallback_verdict(small_net, 50_000);
+        let (_net, _realised, dec, reason) = f64_fallback_verdict(small_net, 50_000);
         assert_eq!(dec, DECISION_PROFITABLE);
+        assert_eq!(reason, REASON_NA);
     }
 
     #[test]
     fn f64_fallback_verdict_negative_unprofitable() {
         let neg = -500_000i128;
-        let (net, _realised, dec) = f64_fallback_verdict(neg, 50_000);
+        let (net, _realised, dec, reason) = f64_fallback_verdict(neg, 50_000);
         assert_eq!(dec, DECISION_UNPROFITABLE);
+        assert_eq!(reason, REASON_NA);
         assert!(net < 0);
     }
 

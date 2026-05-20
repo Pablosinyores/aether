@@ -506,8 +506,8 @@
     {
       "id": 19,
       "type": "piechart",
-      "title": "Decision breakdown",
-      "description": "Cumulative scored-prediction split across profitable / unprofitable / reverted / no_path. PR #136's absurdity floor and PR #144's revm V3 verifier both feed the `reverted` bucket today; splitting them needs a sub-label on the counter (follow-up PR).",
+      "title": "Decision breakdown (by reason)",
+      "description": "Cumulative scored-prediction split across (decision, reason) pairs. Reason distinguishes which code path produced the decision: `u256_walker` (V2 exact walker, PR #136), `absurdity_floor` (f64 fallback above 1 ETH plausibility, PR #136), `revm_verdict` (V3-touching revm sim ran to completion, PR #144), `revm_revert` (V3-touching revm sim explicitly reverted, PR #144), `n/a` (path with no sub-source).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -515,8 +515,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (decision) (aether_mempool_profit_scored_total{job=\"aether-host-scorer\"})",
-          "legendFormat": "{{decision}}"
+          "expr": "sum by (decision, reason) (aether_mempool_profit_scored_total{job=\"aether-host-scorer\"})",
+          "legendFormat": "{{decision}} / {{reason}}"
         }
       ],
       "options": {
@@ -532,8 +532,8 @@
     {
       "id": 20,
       "type": "timeseries",
-      "title": "Scored rate by decision",
-      "description": "Per-decision scoring throughput. Stable non-zero `profitable` or `unprofitable` after the PR #145 engine restart is the V3-verifier end-to-end signal.",
+      "title": "Scored rate by decision and reason",
+      "description": "Per-(decision, reason) scoring throughput. Stable non-zero `profitable / revm_verdict` after the PR #145 engine restart is the V3-verifier end-to-end signal. Sustained `reverted / absurdity_floor` indicates f64 precision bias is firing without a U256/revm path to catch it.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -541,8 +541,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (decision) (rate(aether_mempool_profit_scored_total{job=\"aether-host-scorer\"}[5m]))",
-          "legendFormat": "{{decision}}"
+          "expr": "sum by (decision, reason) (rate(aether_mempool_profit_scored_total{job=\"aether-host-scorer\"}[5m]))",
+          "legendFormat": "{{decision}} / {{reason}}"
         }
       ],
       "gridPos": {

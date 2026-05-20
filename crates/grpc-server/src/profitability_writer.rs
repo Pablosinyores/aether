@@ -38,6 +38,28 @@ pub const DECISION_UNPROFITABLE: &str = "unprofitable";
 pub const DECISION_REVERTED: &str = "reverted";
 pub const DECISION_NO_PATH: &str = "no_path";
 
+/// Prometheus-only sub-label on `aether_mempool_profit_scored_total` that
+/// distinguishes WHICH code path produced the decision. NOT persisted to
+/// the `mempool_profitability` table (the migration's CHECK constraint
+/// only covers `decision`). Cardinality is bounded; every reason here is
+/// a `&'static str` so adding a new one requires touching this file.
+pub const REASON_NA: &str = "n/a";
+/// V2-only path: the exact-U256 walker (`verify_cycle_u256`, PR #136)
+/// reached a verdict. Profitable / unprofitable / reverted variants all
+/// share this reason.
+pub const REASON_U256_WALKER: &str = "u256_walker";
+/// f64 fallback path: the f64 net exceeded `MAX_PLAUSIBLE_F64_NET_WEI`
+/// and was downgraded to `reverted` (PR #136 precision-bias guard).
+/// Only ever pairs with `DECISION_REVERTED`.
+pub const REASON_ABSURDITY_FLOOR: &str = "absurdity_floor";
+/// V3-touching path: revm sim explicitly reverted/halted (PR #144). Only
+/// ever pairs with `DECISION_REVERTED`. Distinct from `revm_verdict`
+/// because the cycle ran through revm to completion rather than declining.
+pub const REASON_REVM_REVERT: &str = "revm_revert";
+/// V3-touching path: revm sim ran to completion with a non-reverting
+/// verdict. Pairs with `DECISION_PROFITABLE` / `DECISION_UNPROFITABLE`.
+pub const REASON_REVM_VERDICT: &str = "revm_verdict";
+
 /// Insert payload for the `mempool_profitability` table.
 ///
 /// `realized_profit_eth` is derived from `realized_profit_wei` at write
@@ -59,7 +81,16 @@ pub struct NewProfitabilityScore {
     /// `is_loss` flag set.
     pub net_profit_wei: i128,
     pub decision: &'static str,
+    /// Prometheus-only sub-label: which code path emitted this decision.
+    /// One of the `REASON_*` constants. Skipped during DB insert (the
+    /// `mempool_profitability` table has no `reason` column).
+    #[serde(default = "default_reason")]
+    pub reason: &'static str,
     pub scoring_engine_git_sha: Option<String>,
+}
+
+fn default_reason() -> &'static str {
+    REASON_NA
 }
 
 /// Sink trait. Object-safe so a single `Arc<dyn ProfitabilitySink>` can
@@ -86,9 +117,9 @@ impl ProfitabilityWriterMetrics {
         let scored_total = IntCounterVec::new(
             Opts::new(
                 "aether_mempool_profit_scored_total",
-                "Confirmed predictions scored by the profitability scorer, by decision",
+                "Confirmed predictions scored by the profitability scorer, by decision and reason (which code path produced the decision: u256_walker / absurdity_floor / revm_verdict / revm_revert / n/a).",
             ),
-            &["decision"],
+            &["decision", "reason"],
         )
         .expect("aether_mempool_profit_scored_total counter vec");
         let drops_total = IntCounter::new(
@@ -231,12 +262,13 @@ impl PgProfitabilityWriter {
 impl ProfitabilitySink for PgProfitabilityWriter {
     fn insert_score(&self, score: NewProfitabilityScore) {
         let decision = score.decision;
+        let reason = score.reason;
         match self.tx.try_send(score) {
             Ok(()) => {
                 self.metrics.queue_depth.inc();
                 self.metrics
                     .scored_total
-                    .with_label_values(&[decision])
+                    .with_label_values(&[decision, reason])
                     .inc();
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -439,11 +471,33 @@ mod tests {
     }
 
     #[test]
+    fn reason_constants_are_stable_wire_labels() {
+        // Pinned because dashboards (Grafana mempool.json from PR #146)
+        // hard-code these strings in PromQL queries that sum by
+        // `reason`. Renames break the panels silently.
+        assert_eq!(REASON_NA, "n/a");
+        assert_eq!(REASON_U256_WALKER, "u256_walker");
+        assert_eq!(REASON_ABSURDITY_FLOOR, "absurdity_floor");
+        assert_eq!(REASON_REVM_REVERT, "revm_revert");
+        assert_eq!(REASON_REVM_VERDICT, "revm_verdict");
+    }
+
+    #[test]
     fn metrics_register_round_trips() {
         let registry = Registry::new();
         let m = ProfitabilityWriterMetrics::register(&registry);
-        m.scored_total.with_label_values(&[DECISION_PROFITABLE]).inc();
-        m.scored_total.with_label_values(&[DECISION_NO_PATH]).inc();
+        m.scored_total
+            .with_label_values(&[DECISION_PROFITABLE, REASON_U256_WALKER])
+            .inc();
+        m.scored_total
+            .with_label_values(&[DECISION_NO_PATH, REASON_NA])
+            .inc();
+        m.scored_total
+            .with_label_values(&[DECISION_REVERTED, REASON_ABSURDITY_FLOOR])
+            .inc();
+        m.scored_total
+            .with_label_values(&[DECISION_REVERTED, REASON_REVM_REVERT])
+            .inc();
         m.drops_total.inc();
         m.queue_depth.set(2);
         m.write_latency_ms.with_label_values(&["ok"]).observe(1.0);
@@ -477,6 +531,7 @@ mod tests {
             gas_estimate_wei: U256::from(50_000_000_000_000u64),
             net_profit_wei: 950_000_000_000_000,
             decision: DECISION_PROFITABLE,
+            reason: REASON_U256_WALKER,
             scoring_engine_git_sha: Some("deadbeef".to_string()),
         }
     }
