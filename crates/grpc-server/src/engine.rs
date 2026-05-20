@@ -991,6 +991,24 @@ impl AetherEngine {
                                 (1.0 / price) * fee, meta.pool_id, pool_addr,
                                 meta.protocol, liq,
                             );
+                            // Seed the synthetic `(1.0, spot_price)` reserve
+                            // pair on the edge. `add_edge` only sets weight;
+                            // without this follow-up the edge stays at
+                            // `reserve_in = reserve_out = 0.0` and the
+                            // `reserves_zero` guard in
+                            // `mempool_pipeline::try_post_state_scan` drops
+                            // every V3 swap before it reaches the post-state
+                            // predictor. The convention `(1.0, spot_price)`
+                            // matches the scorer's `state_to_graph_reserves`
+                            // V3 branch so the two sides stay in lockstep.
+                            graph.update_edge_from_reserves(
+                                meta.token0_idx, meta.token1_idx,
+                                meta.pool_id, 1.0, price, fee,
+                            );
+                            graph.update_edge_from_reserves(
+                                meta.token1_idx, meta.token0_idx,
+                                meta.pool_id, 1.0, 1.0 / price, fee,
+                            );
                             // Seed the V3 pool-state cache. Liquidity is set
                             // to zero here because slot0 does not expose it —
                             // a separate `liquidity()` RPC would be required
@@ -1239,6 +1257,28 @@ impl AetherEngine {
                             pool,
                             meta.protocol,
                             liq,
+                        );
+                        // Refresh the synthetic `(1.0, spot_price)` reserve
+                        // pair on the edge so live V3 sqrtPrice updates flow
+                        // through to `mempool_pipeline::try_post_state_scan`'s
+                        // `reserves_zero` guard. Same convention used by the
+                        // bootstrap branch and the scorer's
+                        // `state_to_graph_reserves`.
+                        graph.update_edge_from_reserves(
+                            meta.token0_idx,
+                            meta.token1_idx,
+                            meta.pool_id,
+                            1.0,
+                            price,
+                            fee,
+                        );
+                        graph.update_edge_from_reserves(
+                            meta.token1_idx,
+                            meta.token0_idx,
+                            meta.pool_id,
+                            1.0,
+                            1.0 / price,
+                            fee,
                         );
                         // Snapshot is published once per detection cycle, not per event.
                         // Refresh the V3 pool-state cache entry. The event
@@ -2568,6 +2608,60 @@ mod tests {
         // Dirty flags must be present on working_graph (not yet snapshotted).
         let graph = engine.working_graph.lock().await;
         assert!(graph.has_dirty_edges());
+    }
+
+    /// V3 graph edges must carry the synthetic `(1.0, spot_price)` reserve
+    /// pair after a V3Update event. Regression guard for the bug where
+    /// `add_edge` set the weight but left `reserve_in == reserve_out == 0.0`,
+    /// causing `mempool_pipeline::try_post_state_scan`'s `reserves_zero`
+    /// guard to drop every V3 swap before reaching the post-state predictor.
+    #[tokio::test]
+    async fn test_v3_update_seeds_synthetic_reserves() {
+        let (tx, _rx) = broadcast::channel(100);
+        let engine = AetherEngine::new(EngineConfig::default(), tx);
+
+        let pool = Address::repeat_byte(0xCD);
+        let token0 = Address::repeat_byte(0x31);
+        let token1 = Address::repeat_byte(0x41);
+
+        engine
+            .register_pool(pool, token0, token1, ProtocolType::UniswapV3, 5)
+            .await;
+
+        // sqrt_price_x96 = 2 * 2^96 → price = 4.0. Asymmetric value catches
+        // any direction-swap bug between forward and reverse edges.
+        let sqrt_x96 = U256::from(2u128) * (U256::from(1u128) << 96);
+        let event = PoolEvent::V3Update {
+            pool,
+            sqrt_price_x96: sqrt_x96,
+            liquidity: 1_000_000,
+            tick: 0,
+        };
+        engine.handle_pool_update(event).await;
+
+        let reg = engine.pool_registry.load();
+        let meta = reg.get(&pool).expect("V3 pool registered");
+        let t0 = meta.token0_idx;
+        let t1 = meta.token1_idx;
+        let pool_id = meta.pool_id;
+
+        let graph = engine.working_graph.lock().await;
+        let fwd = graph
+            .edges_from(t0)
+            .iter()
+            .find(|e| e.to == t1 && e.pool_id == pool_id)
+            .expect("V3 forward edge present");
+        let rev = graph
+            .edges_from(t1)
+            .iter()
+            .find(|e| e.to == t0 && e.pool_id == pool_id)
+            .expect("V3 reverse edge present");
+
+        // price = (sqrt/2^96)^2 = 2^2 = 4.0
+        assert!((fwd.reserve_in - 1.0).abs() < 1e-9, "fwd reserve_in {}", fwd.reserve_in);
+        assert!((fwd.reserve_out - 4.0).abs() < 1e-6, "fwd reserve_out {}", fwd.reserve_out);
+        assert!((rev.reserve_in - 1.0).abs() < 1e-9, "rev reserve_in {}", rev.reserve_in);
+        assert!((rev.reserve_out - 0.25).abs() < 1e-9, "rev reserve_out {}", rev.reserve_out);
     }
 
     #[tokio::test]
