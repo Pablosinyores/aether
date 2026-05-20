@@ -195,6 +195,466 @@
         "w": 9,
         "h": 9
       }
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Reconciler (PR #134)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Block accuracy (1h) — Δ ≤ 0",
+      "description": "Fraction of confirmed predictions whose actual_target_block landed at or before the predicted block. Computed from the aether_mempool_block_delta histogram's le=0 bucket over a 1h window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(aether_mempool_block_delta_bucket{job=\"aether-host-reconciler\",le=\"0\"}[1h])) / clamp_min(sum(rate(aether_mempool_block_delta_count{job=\"aether-host-reconciler\"}[1h])), 1e-9)",
+          "legendFormat": "Δ≤0"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 60},
+              {"color": "green", "value": 85}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Pool-path accuracy (1h)",
+      "description": "Fraction of reconciled predictions whose pool address appeared in the confirmed tx's receipt logs. Source: aether_mempool_pool_path_total{correct=true/false}.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(rate(aether_mempool_pool_path_total{job=\"aether-host-reconciler\",correct=\"true\"}[1h])) / clamp_min(sum(rate(aether_mempool_pool_path_total{job=\"aether-host-reconciler\"}[1h])), 1e-9)",
+          "legendFormat": "correct"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 70},
+              {"color": "green", "value": 90}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 34,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Reconciler queue depth",
+      "description": "Pending reconciliation writes sitting in the writer-goroutine channel. Saturation → drops increment.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aether_mempool_reconciler_queue_depth{job=\"aether-host-reconciler\"}",
+          "legendFormat": "queue"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Reconciler drops (5m rate)",
+      "description": "Reconciliation writes dropped because the bounded channel was full. Sustained non-zero = writer is slower than confirm rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aether_mempool_reconciler_drops_total{job=\"aether-host-reconciler\"}[5m]))",
+          "legendFormat": "drops/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.01}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 34,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Block-delta quantiles",
+      "description": "p50 / p90 of the predicted-vs-actual target-block delta over a 5m window. Negative = engine predicted too far in the future; positive = engine was too eager.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aether_mempool_block_delta_bucket{job=\"aether-host-reconciler\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(aether_mempool_block_delta_bucket{job=\"aether-host-reconciler\"}[5m])))",
+          "legendFormat": "p90"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 16,
+      "type": "piechart",
+      "title": "Reconciliation outcomes",
+      "description": "Cumulative confirmed-vs-dropped split for predictions that have been resolved.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (aether_mempool_reconciled_total{job=\"aether-host-reconciler\"})",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "right", "values": ["value", "percent"]}
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Reconciler error rates",
+      "description": "Per-source RPC failure rates inside the reconciler. Header-fetch fails drop the whole header batch; lookup and receipt-fetch fails are per-tx and merely degrade pool_path_correct fidelity.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aether_mempool_reconciler_header_fetch_errors_total{job=\"aether-host-reconciler\"}[5m]))",
+          "legendFormat": "header_fetch"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(aether_mempool_reconciler_lookup_errors_total{job=\"aether-host-reconciler\"}[5m]))",
+          "legendFormat": "lookup"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(aether_mempool_reconciler_receipt_fetch_errors_total{job=\"aether-host-reconciler\"}[5m]))",
+          "legendFormat": "receipt_fetch"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Reconciler write latency (p50 / p95)",
+      "description": "Per-write latency of reconciliation inserts from dequeue to query completion.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aether_mempool_reconciler_write_latency_ms_bucket{job=\"aether-host-reconciler\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_mempool_reconciler_write_latency_ms_bucket{job=\"aether-host-reconciler\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "ms"}
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "Profitability scorer (PR #135–#137)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 19,
+      "type": "piechart",
+      "title": "Decision breakdown",
+      "description": "Cumulative scored-prediction split across profitable / unprofitable / reverted / no_path. PR #136's absurdity floor and PR #144's revm V3 verifier both feed the `reverted` bucket today; splitting them needs a sub-label on the counter (follow-up PR).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (decision) (aether_mempool_profit_scored_total{job=\"aether-host-scorer\"})",
+          "legendFormat": "{{decision}}"
+        }
+      ],
+      "options": {
+        "legend": {"displayMode": "list", "placement": "right", "values": ["value", "percent"]}
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Scored rate by decision",
+      "description": "Per-decision scoring throughput. Stable non-zero `profitable` or `unprofitable` after the PR #145 engine restart is the V3-verifier end-to-end signal.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (decision) (rate(aether_mempool_profit_scored_total{job=\"aether-host-scorer\"}[5m]))",
+          "legendFormat": "{{decision}}"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      }
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Scorer queue depth",
+      "description": "Pending profitability writes sitting in the writer-task channel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aether_mempool_profit_writer_queue_depth{job=\"aether-host-scorer\"}",
+          "legendFormat": "queue"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Scorer drops (5m rate)",
+      "description": "Profitability writes dropped because the bounded channel was full.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aether_mempool_profit_writer_drops_total{job=\"aether-host-scorer\"}[5m]))",
+          "legendFormat": "drops/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.01}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 65,
+        "w": 6,
+        "h": 6
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Scorer write latency (p50 / p95)",
+      "description": "Per-write latency of profitability inserts from dequeue to query completion, split by result label.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, result) (rate(aether_mempool_profit_writer_write_latency_ms_bucket{job=\"aether-host-scorer\"}[5m])))",
+          "legendFormat": "p50 {{result}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, result) (rate(aether_mempool_profit_writer_write_latency_ms_bucket{job=\"aether-host-scorer\"}[5m])))",
+          "legendFormat": "p95 {{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "ms"}
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 65,
+        "w": 12,
+        "h": 6
+      }
     }
   ]
 }

@@ -35,3 +35,18 @@ scrape_configs:
   - job_name: "aether-host-monitor"
     static_configs:
       - targets: ["host.docker.internal:9090"]
+  # Mempool reconciler (Go) — confirmed/dropped outcomes per prediction +
+  # block-delta + pool-path accuracy histograms (PR #134). Defaults to
+  # :9094 per `cmd/reconciler/main.go`; override with `METRICS_ADDR`.
+  - job_name: "aether-host-reconciler"
+    static_configs:
+      - targets: ["host.docker.internal:9094"]
+  # Profitability scorer (Rust) — per-decision counter + writer health
+  # gauges (PR #135). Defaults to :9095; soak ops override to :9097 via
+  # `PROFIT_SCORER_METRICS_ADDR` so the scrape lists both targets and
+  # tolerates whichever is in use.
+  - job_name: "aether-host-scorer"
+    static_configs:
+      - targets:
+          - "host.docker.internal:9095"
+          - "host.docker.internal:9097"
