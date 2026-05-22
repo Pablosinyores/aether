@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::consensus::Transaction as TransactionTrait;
-use alloy::primitives::Address;
+use alloy::eips::eip2718::Encodable2718;
+use alloy::primitives::{keccak256, Address};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Transaction;
 use futures::StreamExt;
@@ -34,6 +35,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
+use crate::metrics::MempoolIngestMetrics;
 use crate::subscription::{EventChannels, PendingTxEvent};
 
 /// Default reconnect backoff after a transport error.
@@ -108,12 +110,31 @@ pub trait MempoolSource: Send + Sync {
 /// Alchemy `alchemy_pendingTransactions` WebSocket subscription.
 pub struct AlchemyMempool {
     config: AlchemyMempoolConfig,
+    /// Ingestion metrics. `None` keeps the source usable in tests / dev
+    /// without standing up a Prometheus registry; the re-encode mismatch
+    /// gate then surfaces only through the `warn!` log.
+    metrics: Option<Arc<MempoolIngestMetrics>>,
 }
 
 impl AlchemyMempool {
+    /// Construct without metrics. The re-encode mismatch gate still drops
+    /// bad events and logs a `warn!`, but no counter is incremented.
     pub fn new(config: AlchemyMempoolConfig) -> Self {
         warn_if_non_alchemy_endpoint(&config.ws_url);
-        Self { config }
+        Self {
+            config,
+            metrics: None,
+        }
+    }
+
+    /// Construct with an ingestion metrics handle so the re-encode mismatch
+    /// gate increments `aether_mempool_raw_reencode_mismatch_total`.
+    pub fn with_metrics(config: AlchemyMempoolConfig, metrics: Arc<MempoolIngestMetrics>) -> Self {
+        warn_if_non_alchemy_endpoint(&config.ws_url);
+        Self {
+            config,
+            metrics: Some(metrics),
+        }
     }
 
     /// One subscription attempt: connect, subscribe, drain, return on error.
@@ -169,11 +190,20 @@ impl AlchemyMempool {
     }
 
     /// Map an alloy [`Transaction`] into the workspace [`PendingTxEvent`] and
-    /// dispatch it. Lossy by design — any field we don't surface today (gas
-    /// limit, type, access list) is recoverable via the tx hash later.
+    /// dispatch it. Lossy for the scalar fields by design — anything we don't
+    /// surface today (gas limit, access list) is recoverable via the tx hash
+    /// later — but the canonical EIP-2718 signed bytes are captured verbatim
+    /// in `raw_tx` for the backrun bundle path.
+    ///
+    /// The raw bytes are re-encoded from the recovered envelope and gated by a
+    /// keccak256 round-trip: if `keccak256(raw_tx)` does not equal the
+    /// subscription-reported tx hash, the bytes are untrustworthy (we would
+    /// place the wrong tx as `txs[0]` in the bundle) so the event is dropped
+    /// and `aether_mempool_raw_reencode_mismatch_total` is incremented.
     fn forward(&self, channels: &EventChannels, tx: Transaction) {
         let from = tx.inner.signer();
         let envelope = tx.as_ref();
+        let tx_hash = *envelope.tx_hash();
         let to: Option<Address> = envelope.kind().to().copied();
         // Stamp first-seen at the moment we hand the event off so the
         // downstream tracker can compute inclusion latency against
@@ -184,24 +214,57 @@ impl AlchemyMempool {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let value = envelope.value();
+        let input = envelope.input().to_vec();
+        let gas_price = envelope.max_fee_per_gas();
+
+        // Canonical EIP-2718 signed bytes, re-encoded from the recovered
+        // envelope, then verified against the reported hash.
+        let raw_tx = tx.inner.inner().encoded_2718();
+        if !raw_tx_matches_hash(&raw_tx, tx_hash) {
+            if let Some(metrics) = &self.metrics {
+                metrics.inc_raw_reencode_mismatch();
+            }
+            warn!(
+                target: "aether::mempool",
+                tx_hash = %tx_hash,
+                raw_len = raw_tx.len(),
+                "pending tx dropped: EIP-2718 re-encode did not hash back to reported tx hash"
+            );
+            return;
+        }
+
         let event = PendingTxEvent {
-            tx_hash: *envelope.tx_hash(),
+            tx_hash,
             from,
             to,
-            value: envelope.value(),
-            input: envelope.input().to_vec(),
-            gas_price: envelope.max_fee_per_gas(),
+            value,
+            input,
+            gas_price,
             first_seen_unix_nanos,
+            raw_tx,
         };
         debug!(
             target: "aether::mempool",
             tx_hash = %event.tx_hash,
             to = ?event.to,
             input_len = event.input.len(),
+            raw_len = event.raw_tx.len(),
             "pending tx forwarded"
         );
         channels.dispatch_pending_tx(event);
     }
+}
+
+/// Verify that canonical EIP-2718 signed bytes hash back to the expected tx
+/// hash. The tx hash of any typed/legacy Ethereum transaction is precisely
+/// `keccak256` of its canonical 2718 encoding, so this is a bit-exact gate on
+/// whether `raw_tx` is the genuine signed payload for `expected_hash`.
+///
+/// Extracted as a free function so it can be unit-tested against known
+/// signed-tx vectors without a live WebSocket source.
+fn raw_tx_matches_hash(raw_tx: &[u8], expected_hash: alloy::primitives::B256) -> bool {
+    keccak256(raw_tx) == expected_hash
 }
 
 #[async_trait::async_trait]
@@ -352,5 +415,87 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), v.len(), "duplicate addresses in default set");
+    }
+
+    /// Build a real signed EIP-1559 transaction and return its canonical
+    /// EIP-2718 bytes alongside the envelope's own tx hash. This is the same
+    /// signing path a wallet uses, so the bytes and hash form a genuine vector
+    /// for exercising the re-encode gate.
+    fn signed_tx_vector() -> (Vec<u8>, alloy::primitives::B256) {
+        use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy::primitives::{address, TxKind, U256 as AlloyU256};
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+
+        // Deterministic key so the vector is stable across runs.
+        let signer: PrivateKeySigner = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f2e3e8a5d4b8e3e3e3"
+            .parse()
+            .expect("valid private key hex");
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 30_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")),
+            value: AlloyU256::from(1_000_000_000_000_000_000u64),
+            access_list: Default::default(),
+            input: vec![0xde, 0xad, 0xbe, 0xef].into(),
+        };
+
+        let sig = signer
+            .sign_hash_sync(&tx.signature_hash())
+            .expect("sign tx");
+        let envelope: TxEnvelope = tx.into_signed(sig).into();
+        let raw = envelope.encoded_2718();
+        let hash = *envelope.tx_hash();
+        (raw, hash)
+    }
+
+    #[test]
+    fn raw_tx_matches_hash_accepts_genuine_signed_bytes() {
+        let (raw, hash) = signed_tx_vector();
+        // The reported tx hash is keccak256 of the canonical 2718 encoding.
+        assert_eq!(keccak256(&raw), hash);
+        assert!(
+            raw_tx_matches_hash(&raw, hash),
+            "genuine signed bytes must pass the re-encode gate"
+        );
+    }
+
+    #[test]
+    fn raw_tx_matches_hash_rejects_tampered_payload() {
+        let (mut raw, hash) = signed_tx_vector();
+        // Flip a byte in the signed payload: the hash no longer matches.
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        assert!(
+            !raw_tx_matches_hash(&raw, hash),
+            "tampered payload must fail the re-encode gate"
+        );
+    }
+
+    #[test]
+    fn mismatch_gate_bumps_counter_and_drops() {
+        // Simulate exactly what `forward` does on a mismatch: a tampered
+        // payload fails the gate, so the metrics counter is incremented and
+        // the event is dropped (never dispatched). We assert the counter
+        // accounting here because `forward` requires a live `Transaction`.
+        let registry = prometheus::Registry::new();
+        let metrics = MempoolIngestMetrics::register(&registry);
+
+        let (mut raw, hash) = signed_tx_vector();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+
+        assert_eq!(metrics.raw_reencode_mismatch_count(), 0);
+        if !raw_tx_matches_hash(&raw, hash) {
+            metrics.inc_raw_reencode_mismatch();
+        }
+        assert_eq!(
+            metrics.raw_reencode_mismatch_count(),
+            1,
+            "mismatch must bump aether_mempool_raw_reencode_mismatch_total"
+        );
     }
 }

@@ -1133,6 +1133,7 @@ fn run_backrun_validation(
         source: aether_proto::ArbSource::MempoolBackrun as i32,
         victim_tx_hash: event.tx_hash.0.to_vec().into(),
         target_block: block_number.saturating_add(1),
+        victim_raw_tx: event.raw_tx.clone().into(),
     };
 
     if let Err(e) = publisher.send(proto) {
@@ -1436,6 +1437,7 @@ mod tests {
             input,
             gas_price: 0,
             first_seen_unix_nanos: 0,
+            raw_tx: vec![],
         }
     }
 

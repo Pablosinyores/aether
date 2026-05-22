@@ -46,6 +46,12 @@ pub struct PendingTxEvent {
     pub input: Vec<u8>,
     pub gas_price: u128,
     pub first_seen_unix_nanos: u64,
+    /// Canonical EIP-2718 signed bytes of the pending tx, captured at the
+    /// subscription boundary. Used by the mempool-backrun path to place the
+    /// victim as `txs[0]` in the Flashbots bundle. Empty only when the source
+    /// could not produce verified raw bytes (such events are dropped before
+    /// dispatch on the backrun path).
+    pub raw_tx: Vec<u8>,
 }
 
 impl EventChannels {
@@ -209,6 +215,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u64),
             input: vec![0xaa, 0xbb],
             gas_price: 50_000_000_000,
+            raw_tx: vec![0x02, 0xcc],
             ..Default::default()
         };
 
@@ -381,12 +388,14 @@ mod tests {
             value: U256::from(1u64),
             input: vec![0x01, 0x02],
             gas_price: 100,
+            raw_tx: vec![0x02, 0x03, 0x04],
             ..Default::default()
         };
         let cloned = event.clone();
         assert_eq!(cloned.tx_hash, event.tx_hash);
         assert_eq!(cloned.input, event.input);
         assert_eq!(cloned.gas_price, event.gas_price);
+        assert_eq!(cloned.raw_tx, event.raw_tx);
     }
 
     #[test]
