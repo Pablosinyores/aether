@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"math/big"
 	"testing"
@@ -182,6 +183,12 @@ func intETHToWei(t *testing.T, eth int64) *big.Int {
 
 const victimHashHex = "0xdeadbeef00000000000000000000000000000000000000000000000000000001"
 
+// victimRawTxBytes stands in for the canonical EIP-2718 raw signed bytes of
+// the pending victim tx that the Rust engine captures from the mempool and
+// ships over gRPC. The contents are opaque to the executor; only ordering
+// and presence matter here.
+var victimRawTxBytes = []byte{0x02, 0xF8, 0x6B, 0x01, 0x02, 0x03, 0x04}
+
 func newBundleConstructorForTest(t *testing.T) *BundleConstructor {
 	t.Helper()
 	nm := NewNonceManager(0)
@@ -203,6 +210,7 @@ func TestBuildMempoolBackrunBundle_HappyPath(t *testing.T) {
 		500000,
 		18_000_001,
 		victimHashHex,
+		victimRawTxBytes,
 	)
 	if err != nil {
 		t.Fatalf("BuildMempoolBackrunBundle: %v", err)
@@ -214,8 +222,21 @@ func TestBuildMempoolBackrunBundle_HappyPath(t *testing.T) {
 	if bundle.VictimTxHashHex != victimHashHex {
 		t.Errorf("VictimTxHashHex: want %s, got %s", victimHashHex, bundle.VictimTxHashHex)
 	}
-	if len(bundle.RawTxs) != 1 {
-		t.Fatalf("RawTxs: want 1 (just our arb), got %d", len(bundle.RawTxs))
+	// Envelope must be [victim_raw, our_arb_signed]: the victim's raw signed
+	// tx first, our signed arb second.
+	if len(bundle.RawTxs) != 2 {
+		t.Fatalf("RawTxs: want 2 ([victim_raw, our_arb]), got %d", len(bundle.RawTxs))
+	}
+	if !bytes.Equal(bundle.RawTxs[0], victimRawTxBytes) {
+		t.Fatalf("RawTxs[0] must be the supplied victim raw tx; want %x, got %x",
+			victimRawTxBytes, bundle.RawTxs[0])
+	}
+	arbRaw, err := bundle.Transactions[0].MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal arb tx: %v", err)
+	}
+	if !bytes.Equal(bundle.RawTxs[1], arbRaw) {
+		t.Fatalf("RawTxs[1] must be our signed arb tx raw bytes")
 	}
 	if len(bundle.RevertingTxHashes) != 1 {
 		t.Fatalf("RevertingTxHashes len: want 1, got %d", len(bundle.RevertingTxHashes))
@@ -229,6 +250,23 @@ func TestBuildMempoolBackrunBundle_HappyPath(t *testing.T) {
 	}
 	if bundle.BlockNumber != 18_000_001 {
 		t.Errorf("BlockNumber: want 18_000_001, got %d", bundle.BlockNumber)
+	}
+}
+
+func TestBuildMempoolBackrunBundle_RejectsEmptyVictimRawTx(t *testing.T) {
+	t.Parallel()
+
+	bc := newBundleConstructorForTest(t)
+	_, err := bc.BuildMempoolBackrunBundle(
+		[]byte{0xAB, 0xCD},
+		"0x1234567890abcdef1234567890abcdef12345678",
+		500000,
+		18_000_001,
+		victimHashHex,
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error for empty victim_raw_tx, got nil")
 	}
 }
 
@@ -248,7 +286,7 @@ func TestBuildMempoolBackrunBundle_RejectsBadVictimHash(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := bc.BuildMempoolBackrunBundle([]byte{0x01}, "0x1234567890abcdef1234567890abcdef12345678", 100000, 1, c.hash)
+			_, err := bc.BuildMempoolBackrunBundle([]byte{0x01}, "0x1234567890abcdef1234567890abcdef12345678", 100000, 1, c.hash, []byte{0x02})
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", c.name)
 			}
@@ -263,18 +301,25 @@ func TestBuildMempoolBackrunBundle_UnsignedFallback(t *testing.T) {
 	go_ := NewGasOracle(300.0)
 	bc := NewBundleConstructor(nm, go_, nil, 1)
 
+	victimRaw := []byte{0x02, 0xCA, 0xFE}
 	bundle, err := bc.BuildMempoolBackrunBundle(
 		[]byte{0xAB},
 		"0x1234567890abcdef1234567890abcdef12345678",
 		200000,
 		18_000_001,
 		victimHashHex,
+		victimRaw,
 	)
 	if err != nil {
 		t.Fatalf("unsigned BuildMempoolBackrunBundle: %v", err)
 	}
-	if len(bundle.RawTxs) != 0 {
-		t.Errorf("unsigned bundle should have no RawTxs, got %d", len(bundle.RawTxs))
+	// Even on the unsigned (test-only) path the victim raw tx is seated as
+	// RawTxs[0]; only our arb tx is unsigned and therefore has no raw bytes.
+	if len(bundle.RawTxs) != 1 {
+		t.Fatalf("unsigned bundle should carry only the victim raw tx, got %d RawTxs", len(bundle.RawTxs))
+	}
+	if !bytes.Equal(bundle.RawTxs[0], victimRaw) {
+		t.Errorf("RawTxs[0]: want victim raw %x, got %x", victimRaw, bundle.RawTxs[0])
 	}
 	if len(bundle.Transactions) != 1 {
 		t.Errorf("expected 1 unsigned transaction, got %d", len(bundle.Transactions))

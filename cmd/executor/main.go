@@ -466,7 +466,23 @@ func processArb(
 	if sourceLbl == SourceMempoolBackrun {
 		buildStart := time.Now()
 		victimHex := "0x" + hex.EncodeToString(arb.VictimTxHash)
-		bundle, err = bundler.BuildMempoolBackrunBundle(arb.Calldata, executorAddr, arb.TotalGas, targetBlock, victimHex)
+		victimRawTx := arb.GetVictimRawTx()
+		// A mempool-backrun bundle MUST carry the victim's raw signed tx as
+		// txs[0]; without it the bundle would land our arb unconditionally
+		// (no victim coupling), which is the exact bug this path fixes.
+		if len(victimRawTx) == 0 {
+			recordMempoolMissingVictimRawTx()
+			buildSpan.SetStatus(codes.Error, "missing victim_raw_tx")
+			buildSpan.End()
+			slog.ErrorContext(ctx, "mempool arb missing victim_raw_tx, skipping",
+				"arb_id", arb.Id,
+				"victim_tx_hash", victimHex,
+				"target_block", targetBlock,
+			)
+			span.SetAttributes(attribute.String("outcome", "missing_victim_raw_tx"))
+			return false, nil
+		}
+		bundle, err = bundler.BuildMempoolBackrunBundle(arb.Calldata, executorAddr, arb.TotalGas, targetBlock, victimHex, victimRawTx)
 		recordMempoolBundleBuildLatency(time.Since(buildStart))
 		slog.InfoContext(ctx, "mempool_arb_received",
 			"arb_id", arb.Id,
@@ -988,10 +1004,10 @@ func dumpMempoolShadowBundle(
 	gasCostWei := new(big.Int).Mul(new(big.Int).SetUint64(arb.TotalGas), gasFees.MaxFeePerGas)
 	grossProfitWei := new(big.Int).Add(netProfitWei, gasCostWei)
 
-	envelopeTxs := make([]string, 0, 1+len(bundle.RawTxs))
-	if bundle.VictimTxHashHex != "" {
-		envelopeTxs = append(envelopeTxs, bundle.VictimTxHashHex)
-	}
+	// RawTxs[0] is already the victim's raw signed tx for mempool bundles,
+	// so the envelope is simply the hex of every RawTxs entry — no separate
+	// victim-hash prepend.
+	envelopeTxs := make([]string, 0, len(bundle.RawTxs))
 	for _, raw := range bundle.RawTxs {
 		envelopeTxs = append(envelopeTxs, fmt.Sprintf("0x%x", raw))
 	}

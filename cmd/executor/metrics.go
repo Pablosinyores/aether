@@ -66,6 +66,10 @@ var (
 		Name: "aether_executor_risk_rejections_total",
 		Help: "Total arbs rejected by preflight risk checks",
 	})
+	mempoolMissingVictimRawTx = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "aether_executor_mempool_missing_victim_raw_tx_total",
+		Help: "Mempool-backrun arbs skipped because the gRPC message carried an empty victim_raw_tx (cannot build a safe backrun bundle without it).",
+	})
 	endToEndLatencyMs = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "aether_end_to_end_latency_ms",
 		Help:    "End-to-end latency from arb detection to bundle submission in ms",
@@ -130,6 +134,7 @@ func init() {
 		profitTotalWei,
 		gasSpentWei,
 		riskRejections,
+		mempoolMissingVictimRawTx,
 		endToEndLatencyMs,
 		gasPriceGwei,
 		dailyPnlEth,
@@ -216,6 +221,10 @@ func recordMempoolBundleBuildLatency(d time.Duration) {
 
 func recordRiskRejection() {
 	riskRejections.Inc()
+}
+
+func recordMempoolMissingVictimRawTx() {
+	mempoolMissingVictimRawTx.Inc()
 }
 
 func recordBuilderResult(builder string, success bool, latency time.Duration) {

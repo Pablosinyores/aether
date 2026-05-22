@@ -227,19 +227,15 @@ func (s *Submitter) submitToBuilder(ctx context.Context, builder BuilderConfig, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Hex-encode each raw signed transaction. Mempool-backrun bundles
-	// prepend the pending victim tx hash so the builder pulls the victim
-	// from its own mempool view; block-driven bundles ship only the
-	// signed RawTxs.
-	signedHexes := make([]string, len(bundle.RawTxs))
+	// Hex-encode each raw signed transaction. For mempool-backrun bundles,
+	// RawTxs[0] is already the victim's raw signed tx (seated by
+	// BuildMempoolBackrunBundle) followed by our signed arb; block-driven
+	// bundles ship only our signed RawTxs. Every entry is a full EIP-2718
+	// raw transaction — builders reject a bare hash.
+	txHexes := make([]string, len(bundle.RawTxs))
 	for i, raw := range bundle.RawTxs {
-		signedHexes[i] = "0x" + hex.EncodeToString(raw)
+		txHexes[i] = "0x" + hex.EncodeToString(raw)
 	}
-	var txHexes []string
-	if bundle.VictimTxHashHex != "" {
-		txHexes = append(txHexes, bundle.VictimTxHashHex)
-	}
-	txHexes = append(txHexes, signedHexes...)
 
 	params := map[string]interface{}{
 		"txs":         txHexes,

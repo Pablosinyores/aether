@@ -400,7 +400,12 @@ type ValidatedArb struct {
 	// Slot the bundle is targeting. For BLOCK_DRIVEN this matches
 	// block_number+1; for MEMPOOL_BACKRUN it matches the block the
 	// builder is currently constructing.
-	TargetBlock   uint64 `protobuf:"varint,15,opt,name=target_block,json=targetBlock,proto3" json:"target_block,omitempty"`
+	TargetBlock uint64 `protobuf:"varint,15,opt,name=target_block,json=targetBlock,proto3" json:"target_block,omitempty"`
+	// Canonical EIP-2718 raw signed bytes of the pending victim tx, captured
+	// at the mempool subscription boundary. Empty unless source is
+	// MEMPOOL_BACKRUN. The Go executor places this as txs[0] in the bundle so
+	// the builder includes our arb iff the victim is included in the same block.
+	VictimRawTx   []byte `protobuf:"bytes,16,opt,name=victim_raw_tx,json=victimRawTx,proto3" json:"victim_raw_tx,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -538,6 +543,13 @@ func (x *ValidatedArb) GetTargetBlock() uint64 {
 		return x.TargetBlock
 	}
 	return 0
+}
+
+func (x *ValidatedArb) GetVictimRawTx() []byte {
+	if x != nil {
+		return x.VictimRawTx
+	}
+	return nil
 }
 
 type SubmitArbResponse struct {
@@ -984,7 +996,7 @@ const file_proto_aether_proto_rawDesc = "" +
 	"\ttoken_out\x18\x04 \x01(\fR\btokenOut\x12\x1b\n" +
 	"\tamount_in\x18\x05 \x01(\fR\bamountIn\x12!\n" +
 	"\fexpected_out\x18\x06 \x01(\fR\vexpectedOut\x12#\n" +
-	"\restimated_gas\x18\a \x01(\x04R\festimatedGas\"\xa3\x04\n" +
+	"\restimated_gas\x18\a \x01(\x04R\festimatedGas\"\xc7\x04\n" +
 	"\fValidatedArb\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\"\n" +
 	"\x04hops\x18\x02 \x03(\v2\x0e.aether.ArbHopR\x04hops\x12(\n" +
@@ -1002,7 +1014,8 @@ const file_proto_aether_proto_rawDesc = "" +
 	"\bcalldata\x18\f \x01(\fR\bcalldata\x12)\n" +
 	"\x06source\x18\r \x01(\x0e2\x11.aether.ArbSourceR\x06source\x12$\n" +
 	"\x0evictim_tx_hash\x18\x0e \x01(\fR\fvictimTxHash\x12!\n" +
-	"\ftarget_block\x18\x0f \x01(\x04R\vtargetBlock\"f\n" +
+	"\ftarget_block\x18\x0f \x01(\x04R\vtargetBlock\x12\"\n" +
+	"\rvictim_raw_tx\x18\x10 \x01(\fR\vvictimRawTx\"f\n" +
 	"\x11SubmitArbResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12\x1f\n" +
 	"\vbundle_hash\x18\x02 \x01(\tR\n" +

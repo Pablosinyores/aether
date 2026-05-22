@@ -639,10 +639,14 @@ func TestSubmitToBuilder_MempoolBackrunEnvelope(t *testing.T) {
 		t.Fatalf("NewSubmitter: %v", err)
 	}
 
+	// Victim's raw signed tx is seated as RawTxs[0]; our arb is RawTxs[1].
+	// The envelope must ship both as raw hex — never a bare victim hash.
+	victimRaw := []byte{0x02, 0xde, 0xad}
 	bundle := &Bundle{
 		BlockNumber:       0x112A881,
-		RawTxs:            [][]byte{{0xaa, 0xbb}},
+		RawTxs:            [][]byte{victimRaw, {0xaa, 0xbb}},
 		Source:            SourceMempoolBackrun,
+		VictimRawTx:       victimRaw,
 		VictimTxHashHex:   victimHash,
 		RevertingTxHashes: []string{"0x1111111111111111111111111111111111111111111111111111111111111111"},
 	}
@@ -661,13 +665,18 @@ func TestSubmitToBuilder_MempoolBackrunEnvelope(t *testing.T) {
 	params := req.Params[0]
 	txs := params["txs"].([]interface{})
 	if len(txs) != 2 {
-		t.Fatalf("expected [victim_hash, our_arb] (2 entries), got %d", len(txs))
+		t.Fatalf("expected [victim_raw, our_arb] (2 entries), got %d", len(txs))
 	}
-	if txs[0].(string) != victimHash {
-		t.Errorf("txs[0] = %s, want victim hash %s", txs[0], victimHash)
+	if txs[0].(string) != "0x02dead" {
+		t.Errorf("txs[0] = %s, want victim raw 0x02dead", txs[0])
 	}
 	if txs[1].(string) != "0xaabb" {
 		t.Errorf("txs[1] = %s, want our_arb 0xaabb", txs[1])
+	}
+	for i, tx := range txs {
+		if tx.(string) == victimHash {
+			t.Fatalf("victim hash leaked into txs[%d] — builders reject bare hashes in eth_sendBundle", i)
+		}
 	}
 	reverting, ok := params["revertingTxHashes"].([]interface{})
 	if !ok {

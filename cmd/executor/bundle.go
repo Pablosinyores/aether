@@ -16,13 +16,17 @@ import (
 
 // Bundle represents a Flashbots-style bundle with signed transactions.
 //
-// For mempool-backrun source, `VictimTxHashHex` is set to the pending
-// victim's tx hash; the submitter prepends it to the `txs` array so the
-// envelope becomes `[victim_hash, our_arb_signed, our_tip_signed?]`.
-// `RevertingTxHashes` is populated with the hashes that may revert
-// without dropping the whole bundle — for mempool path this is the
-// our-arb tx hash only; never the victim hash (we want the bundle to
-// drop if the victim itself reverts).
+// For mempool-backrun source, the victim's RAW SIGNED transaction is placed
+// as `RawTxs[0]` (and `Transactions[0]` is left nil for it, since we only
+// hold the victim's encoded bytes, not a decoded *types.Transaction). Our
+// signed arb tx follows as `RawTxs[1]`. The `txs` array shipped to every
+// builder is therefore `[victim_raw, our_arb_signed]` — all real EIP-2718
+// raw transactions, never a bare hash. `VictimTxHashHex` is still populated
+// for dedup / metrics / logging but is no longer placed in the envelope.
+// `RevertingTxHashes` is populated with the hashes that may revert without
+// dropping the whole bundle — for the mempool path this is the our-arb tx
+// hash only; never the victim hash (we want the bundle to drop if the victim
+// itself reverts).
 type Bundle struct {
 	Transactions []*types.Transaction // Signed go-ethereum transactions
 	RawTxs       [][]byte             // RLP-encoded signed bytes (for eth_sendBundle)
@@ -35,9 +39,17 @@ type Bundle struct {
 	// pre-date #139.
 	Source string
 
+	// VictimRawTx is the canonical EIP-2718 raw signed bytes of the pending
+	// victim transaction, captured from the mempool by the Rust engine and
+	// carried over gRPC. It is placed as `RawTxs[0]` so the builder includes
+	// our arb iff the victim is mined in the same block. Empty for
+	// non-mempool bundles.
+	VictimRawTx []byte
+
 	// VictimTxHashHex is "0x"-prefixed when the bundle backruns a
-	// pending mempool tx; empty otherwise. Submitter consumes this to
-	// prepend the victim reference in the `txs` envelope.
+	// pending mempool tx; empty otherwise. Retained for dedup, metrics,
+	// and logging only — it is NOT placed in the `txs` envelope (the
+	// victim travels as the raw tx in RawTxs[0] instead).
 	VictimTxHashHex string
 
 	// RevertingTxHashes is the list of `[]string` hashes the bundle
@@ -122,11 +134,13 @@ func (bc *BundleConstructor) BuildBundle(
 // BuildMempoolBackrunBundle constructs a bundle that backruns a pending
 // victim transaction.
 //
-// Envelope: `[victim_tx_hash, our_arb_signed]`. The submitter prepends
-// the victim hash in `submitToBuilder`; this function returns a Bundle
-// whose `RawTxs` contains only our signed arb tx and whose
-// `VictimTxHashHex` carries the hash the builder needs to fetch from
-// its mempool view.
+// Envelope: `[victim_raw, our_arb_signed]`. The victim's RAW SIGNED
+// transaction (EIP-2718 encoded bytes captured from the mempool) is placed
+// as `RawTxs[0]`; our signed arb tx follows as `RawTxs[1]`. Every builder we
+// target (flashbots/titan/eden/rsync) defines `txs` as raw signed RLP
+// transactions and rejects a bare hash, so the victim must travel as a real
+// raw tx — not as its hash. `VictimTxHashHex` is still populated for dedup,
+// metrics, and logging.
 //
 // `revertingTxHashes` includes only the arb tx hash — we tolerate the
 // arb reverting (the bundle still mines without polluting the block)
@@ -140,12 +154,16 @@ func (bc *BundleConstructor) BuildMempoolBackrunBundle(
 	gasEstimate uint64,
 	targetBlock uint64,
 	victimTxHashHex string,
+	victimRawTx []byte,
 ) (*Bundle, error) {
 	if !strings.HasPrefix(victimTxHashHex, "0x") {
 		return nil, fmt.Errorf("victim_tx_hash must be 0x-prefixed, got %q", victimTxHashHex)
 	}
 	if len(victimTxHashHex) != 66 {
 		return nil, fmt.Errorf("victim_tx_hash must be 32 bytes (66 hex chars incl. 0x), got %d chars", len(victimTxHashHex))
+	}
+	if len(victimRawTx) == 0 {
+		return nil, fmt.Errorf("victim_raw_tx must be non-empty for mempool-backrun bundle (cannot submit a backrun without the victim's raw signed tx as txs[0])")
 	}
 
 	gasFees := bc.gasOracle.MempoolFees()
@@ -165,12 +183,16 @@ func (bc *BundleConstructor) BuildMempoolBackrunBundle(
 	})
 
 	if bc.signer == nil {
-		// Unsigned path is test-only; tip flow still requires a signer.
+		// Unsigned path is test-only. We still seat the victim raw tx as
+		// RawTxs[0] so the envelope ordering is exercised; our arb tx is
+		// unsigned so it has no raw bytes to append.
 		return &Bundle{
 			Transactions:      []*types.Transaction{arbTx},
+			RawTxs:            [][]byte{victimRawTx},
 			BlockNumber:       targetBlock,
 			Timestamp:         time.Now(),
 			Source:            SourceMempoolBackrun,
+			VictimRawTx:       victimRawTx,
 			VictimTxHashHex:   victimTxHashHex,
 			RevertingTxHashes: []string{arbTx.Hash().Hex()},
 		}, nil
@@ -185,12 +207,14 @@ func (bc *BundleConstructor) BuildMempoolBackrunBundle(
 		return nil, fmt.Errorf("RLP-encode mempool-backrun arb tx: %w", err)
 	}
 
+	// Envelope ordering: victim raw signed tx first, then our signed arb.
 	return &Bundle{
 		Transactions:      []*types.Transaction{signed},
-		RawTxs:            [][]byte{raw},
+		RawTxs:            [][]byte{victimRawTx, raw},
 		BlockNumber:       targetBlock,
 		Timestamp:         time.Now(),
 		Source:            SourceMempoolBackrun,
+		VictimRawTx:       victimRawTx,
 		VictimTxHashHex:   victimTxHashHex,
 		RevertingTxHashes: []string{signed.Hash().Hex()},
 	}, nil

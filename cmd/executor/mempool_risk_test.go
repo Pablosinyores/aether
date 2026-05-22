@@ -350,9 +350,10 @@ func TestDumpMempoolShadowBundle_Schema(t *testing.T) {
 		TargetBlock:     24_000_001,
 	}
 	bundle := &Bundle{
-		RawTxs:            [][]byte{{0xf8, 0x6b}},
+		RawTxs:            [][]byte{{0x02, 0xbe, 0xef}, {0xf8, 0x6b}},
 		BlockNumber:       24_000_001,
 		Source:            SourceMempoolBackrun,
+		VictimRawTx:       []byte{0x02, 0xbe, 0xef},
 		VictimTxHashHex:   "0xdeadbeef",
 		RevertingTxHashes: []string{"0xarbtx"},
 	}
@@ -426,11 +427,17 @@ func TestDumpMempoolShadowBundle_Schema(t *testing.T) {
 		t.Errorf("first gate = %v", first)
 	}
 
-	// Envelope must lead with the victim hash, followed by our raw arb.
+	// Envelope must lead with the victim's RAW signed tx (never a bare hash —
+	// builders reject hashes in eth_sendBundle), followed by our raw arb.
 	env := payload["envelope"].(map[string]interface{})
 	txs := env["txs"].([]interface{})
-	if len(txs) != 2 || txs[0] != "0xdeadbeef" {
-		t.Errorf("envelope.txs = %v, want [victim_hash, raw_arb]", txs)
+	if len(txs) != 2 || txs[0] != "0x02beef" || txs[1] != "0xf86b" {
+		t.Errorf("envelope.txs = %v, want [victim_raw, raw_arb]", txs)
+	}
+	for _, tx := range txs {
+		if tx == "0xdeadbeef" {
+			t.Fatal("victim hash leaked into envelope.txs — builders reject bare hashes")
+		}
 	}
 	// revertingTxHashes must be the arb hash only — never the victim.
 	rev := env["revertingTxHashes"].([]interface{})

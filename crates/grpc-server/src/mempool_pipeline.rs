@@ -1658,6 +1658,7 @@ mod tests {
             input: vec![],
             gas_price: 0,
             first_seen_unix_nanos: 0,
+            raw_tx: vec![],
         }
     }
 
