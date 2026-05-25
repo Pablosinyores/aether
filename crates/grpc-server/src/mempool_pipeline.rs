@@ -51,7 +51,7 @@ use crate::service::aether_proto;
 use crate::engine::PoolMetadata;
 use crate::mempool_writer::{
     MempoolPredictionSink, NewMempoolPrediction, PredictedPostState, PROTOCOL_BALANCER,
-    PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
+    PROTOCOL_CURVE, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
 };
 use crate::EngineMetrics;
 
@@ -392,6 +392,7 @@ fn decoder_protocol_to_type(p: Protocol) -> Option<ProtocolType> {
         Protocol::SushiSwap => Some(ProtocolType::SushiSwap),
         Protocol::UniswapV3 => Some(ProtocolType::UniswapV3),
         Protocol::BalancerV2 => Some(ProtocolType::BalancerV2),
+        Protocol::Curve => Some(ProtocolType::Curve),
     }
 }
 
@@ -446,11 +447,25 @@ fn try_post_state_scan(
     event_to: Address,
     event: &PendingTxEvent,
 ) {
+    // Curve post-state scan is intentionally deferred to a follow-up PR
+    // (the V3/Balancer branch downstream needs a parallel Curve arm that
+    // routes through `unified_to_post_reserves`'s Curve variant + the
+    // PredictedPostState writer). For now, log the decoded swap via
+    // `emit_decoded` upstream so `pending_dex_tx_total{protocol="curve"}`
+    // climbs, then bail out with a dedicated skip reason. The decoder is
+    // the unblock that matters here; turning that signal into a cycle
+    // candidate is the next increment.
+    if swap.protocol == Protocol::Curve {
+        metrics.inc_pending_arb_sim_skipped("curve_post_state_pending");
+        return;
+    }
+
     let target_protocol = match swap.protocol {
         Protocol::UniswapV2 => ProtocolType::UniswapV2,
         Protocol::SushiSwap => ProtocolType::SushiSwap,
         Protocol::UniswapV3 => ProtocolType::UniswapV3,
         Protocol::BalancerV2 => ProtocolType::BalancerV2,
+        Protocol::Curve => unreachable!("curve early-returned above"),
     };
 
     let token_idx = ctx.token_index.load();
@@ -532,6 +547,7 @@ fn try_post_state_scan(
             }
             (pin, pout)
         }
+        Protocol::Curve => unreachable!("curve early-returned above"),
     };
 
     // Clone the graph and apply the post-state to both directions of the
@@ -565,6 +581,7 @@ fn try_post_state_scan(
             reserve_in: post_in,
             reserve_out: post_out,
         },
+        Protocol::Curve => unreachable!("curve early-returned above"),
     }
     .into_json();
     let prediction = NewMempoolPrediction {
@@ -940,6 +957,7 @@ fn decoder_protocol_label(p: Protocol) -> &'static str {
         Protocol::SushiSwap => PROTOCOL_SUSHI,
         Protocol::UniswapV3 => PROTOCOL_UNI_V3,
         Protocol::BalancerV2 => PROTOCOL_BALANCER,
+        Protocol::Curve => PROTOCOL_CURVE,
     }
 }
 
@@ -1071,6 +1089,7 @@ fn protocol_label(p: Protocol) -> &'static str {
         Protocol::UniswapV3 => "uniswap_v3",
         Protocol::SushiSwap => "sushiswap",
         Protocol::BalancerV2 => "balancer_v2",
+        Protocol::Curve => "curve",
     }
 }
 
@@ -1251,6 +1270,7 @@ mod tests {
             recipient: Address::ZERO,
             fee_bps: 0,
             path_extra: vec![],
+            curve_indices: None,
         }
     }
 

@@ -80,6 +80,13 @@ pub enum Protocol {
     UniswapV3,
     SushiSwap,
     BalancerV2,
+    /// Curve StableSwap pool. Unlike the AMM families above, Curve swaps
+    /// call `exchange()` **directly on the pool address** (no router
+    /// indirection); `DecodedSwap.router` therefore carries the *pool*
+    /// address and the upstream pipeline must resolve token_in / token_out
+    /// from the pool registry using the indices in
+    /// [`DecodedSwap.curve_indices`].
+    Curve,
 }
 
 /// Minimal swap shape produced by the decoder.
@@ -107,6 +114,15 @@ pub struct DecodedSwap {
     /// Remaining path tokens past the first hop, in order. Empty for
     /// single-hop swaps.
     pub path_extra: Vec<Address>,
+    /// Curve-only: the `(i, j)` token indices from `exchange()` calldata.
+    /// `None` for non-Curve protocols. `token_in` / `token_out` are
+    /// emitted as `Address::ZERO` for Curve because the decoder cannot
+    /// resolve indices to addresses without the pool's coin list — the
+    /// pipeline does that via the pool registry. Index width is `u8`
+    /// because mainnet Curve pools are ≤ 8 coins, so `i128` source
+    /// values that overflow `u8` indicate a malformed or non-standard
+    /// pool and the decoder rejects them with `AbiDecode`.
+    pub curve_indices: Option<(u8, u8)>,
 }
 
 /// Reasons a pending tx might fail to decode. Caller maps these to a
@@ -197,6 +213,25 @@ sol! {
         function exactInput02(ExactInputParams02 params) external payable returns (uint256);
     }
 
+    /// Curve StableSwap pool — direct `exchange()` on the pool address.
+    /// The original Curve interface uses `int128` indices; newer
+    /// crypto-pool variants use `uint256`. Two interfaces because the
+    /// `sol!` macro can't generate two `exchange` functions with the same
+    /// Rust name from one interface; splitting also keeps each selector's
+    /// selector dispatch obvious. `exchange_underlying` (lending-pool
+    /// wrappers like Compound cTokens) shares the int128 signature with
+    /// a distinct selector and is decoded identically — we only care
+    /// about the indices + amount.
+    #[allow(missing_docs)]
+    interface ICurvePoolInt128 {
+        function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
+        function exchange_underlying(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    }
+    #[allow(missing_docs)]
+    interface ICurvePoolUint256 {
+        function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    }
+
     /// Balancer V2 Vault `swap` for the SingleSwap shape.
     #[allow(missing_docs)]
     interface IBalancerVault {
@@ -247,6 +282,10 @@ pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, Decod
     }
     // ── Balancer V2 Vault ──
     if let Some(swap) = try_balancer(selector, calldata, to)? {
+        return Ok(swap);
+    }
+    // ── Curve StableSwap pool-direct exchange() ──
+    if let Some(swap) = try_curve(selector, calldata, to)? {
         return Ok(swap);
     }
 
@@ -384,6 +423,7 @@ fn decode_v2_call(
         recipient: to,
         fee_bps: 0,
         path_extra,
+        curve_indices: None,
     })
 }
 
@@ -406,6 +446,7 @@ fn try_uni_v3_family(
             recipient: c.params.recipient,
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
+            curve_indices: None,
         }));
     }
     if selector == exactInputSingle02Call::SELECTOR {
@@ -421,6 +462,7 @@ fn try_uni_v3_family(
             recipient: c.params.recipient,
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
+            curve_indices: None,
         }));
     }
     if selector == exactInputCall::SELECTOR {
@@ -437,6 +479,7 @@ fn try_uni_v3_family(
             recipient: c.params.recipient,
             fee_bps: fee,
             path_extra: extras,
+            curve_indices: None,
         }));
     }
     if selector == exactInput02Call::SELECTOR {
@@ -453,6 +496,7 @@ fn try_uni_v3_family(
             recipient: c.params.recipient,
             fee_bps: fee,
             path_extra: extras,
+            curve_indices: None,
         }));
     }
     Ok(None)
@@ -513,9 +557,103 @@ fn try_balancer(
             recipient: c.funds.recipient,
             fee_bps: 0,
             path_extra: vec![],
+            curve_indices: None,
         }));
     }
     Ok(None)
+}
+
+/// Curve pool-direct `exchange` decoder. Covers the int128 (original) and
+/// uint256 (crypto-pool) shapes plus `exchange_underlying` (lending-pool
+/// wrappers like Compound cToken / Aave aToken Curve pools). All three
+/// share the `(i, j, dx, min_dy)` arg shape so they collapse to a single
+/// `DecodedSwap` body.
+///
+/// `to` is the pool address, not a router — Curve's design is direct
+/// pool calls. Token addresses can't be resolved here without the pool's
+/// coin list; `token_in`/`token_out` are left as `Address::ZERO` and the
+/// upstream pipeline resolves them via `pool_registry[to].token0/1` keyed
+/// off the `curve_indices` we emit.
+fn try_curve(
+    selector: [u8; 4],
+    calldata: &[u8],
+    pool: Address,
+) -> Result<Option<DecodedSwap>, DecodeError> {
+    // int128 variants first — much more common on mainnet (every
+    // stablecoin StableSwap pool).
+    if selector == ICurvePoolInt128::exchangeCall::SELECTOR
+        || selector == ICurvePoolInt128::exchange_underlyingCall::SELECTOR
+    {
+        // Both calls have identical layouts, so decode either.
+        let (i, j, dx) = if selector == ICurvePoolInt128::exchangeCall::SELECTOR {
+            let c = ICurvePoolInt128::exchangeCall::abi_decode(calldata)
+                .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            (c.i, c.j, c.dx)
+        } else {
+            let c = ICurvePoolInt128::exchange_underlyingCall::abi_decode(calldata)
+                .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            (c.i, c.j, c.dx)
+        };
+        let indices = curve_indices_from_int128(i, j)?;
+        return Ok(Some(curve_decoded_swap(pool, indices, dx)));
+    }
+    // uint256 variant (newer crypto pools, e.g. tricrypto).
+    if selector == ICurvePoolUint256::exchangeCall::SELECTOR {
+        let c = ICurvePoolUint256::exchangeCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let indices = curve_indices_from_uint256(c.i, c.j)?;
+        return Ok(Some(curve_decoded_swap(pool, indices, c.dx)));
+    }
+    Ok(None)
+}
+
+/// Narrow Curve `int128` index args to `u8`. Mainnet Curve pools are
+/// ≤ 8 coins so a value that doesn't fit `u8` (negative, > 255) is
+/// either malformed calldata or a non-standard pool we shouldn't be
+/// publishing; reject as `AbiDecode` so the decode-failure metric
+/// surfaces it. The Solidity ABI decoder returns Rust `i128` for
+/// `int128`, not alloy's `I256`.
+fn curve_indices_from_int128(i: i128, j: i128) -> Result<(u8, u8), DecodeError> {
+    let to_u8 = |v: i128| -> Result<u8, DecodeError> {
+        if v < 0 || v > u8::MAX as i128 {
+            return Err(DecodeError::AbiDecode(format!("curve index out of u8 range: {v}")));
+        }
+        Ok(v as u8)
+    };
+    Ok((to_u8(i)?, to_u8(j)?))
+}
+
+/// Narrow Curve `uint256` index args to `u8`. Same rationale as the
+/// `int128` variant — sane mainnet values fit, anything else gets
+/// rejected loudly.
+fn curve_indices_from_uint256(i: U256, j: U256) -> Result<(u8, u8), DecodeError> {
+    let to_u8 = |v: U256| -> Result<u8, DecodeError> {
+        if v > U256::from(u8::MAX) {
+            return Err(DecodeError::AbiDecode(format!("curve index out of u8 range: {v}")));
+        }
+        Ok(v.to::<u64>() as u8)
+    };
+    Ok((to_u8(i)?, to_u8(j)?))
+}
+
+/// Build the `DecodedSwap` shell for a Curve exchange. Token addresses
+/// stay `Address::ZERO`; the pipeline must resolve them via the pool
+/// registry using `curve_indices`. `recipient` is the tx sender (Curve
+/// pays the caller directly), but we don't have `from` in this scope so
+/// leave as ZERO — the field is unused on the Curve path.
+fn curve_decoded_swap(pool: Address, indices: (u8, u8), amount_in: U256) -> DecodedSwap {
+    DecodedSwap {
+        protocol: Protocol::Curve,
+        router: pool,
+        token_in: Address::ZERO,
+        token_out: Address::ZERO,
+        amount_in,
+        amount_out_min: U256::ZERO,
+        recipient: Address::ZERO,
+        fee_bps: 0,
+        path_extra: vec![],
+        curve_indices: Some(indices),
+    }
 }
 
 #[cfg(test)]
@@ -687,5 +825,92 @@ mod tests {
         .abi_encode();
         let err = decode_pending(Address::ZERO, &calldata).unwrap_err();
         assert!(matches!(err, DecodeError::EmptyPath));
+    }
+
+    // ── Curve pool-direct decoder ──
+
+    #[test]
+    fn decode_curve_exchange_int128_happy_path() {
+        // 3pool address; the decoder doesn't validate this is a real
+        // Curve pool, the upstream pool_registry filter does.
+        let pool = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+        let calldata = ICurvePoolInt128::exchangeCall {
+            i: 0,
+            j: 1,
+            dx: U256::from(1_000_000u64),    // 1 USDC
+            min_dy: U256::from(990_000u64),
+        }
+        .abi_encode();
+        let decoded = decode_pending(pool, &calldata).expect("should decode");
+        assert_eq!(decoded.protocol, Protocol::Curve);
+        assert_eq!(decoded.router, pool);
+        assert_eq!(decoded.token_in, Address::ZERO, "Curve must leave token addrs unresolved");
+        assert_eq!(decoded.token_out, Address::ZERO);
+        assert_eq!(decoded.amount_in, U256::from(1_000_000u64));
+        assert_eq!(decoded.curve_indices, Some((0, 1)));
+    }
+
+    #[test]
+    fn decode_curve_exchange_underlying_int128() {
+        let pool = address!("0000000000000000000000000000000000000000");
+        let calldata = ICurvePoolInt128::exchange_underlyingCall {
+            i: 2,
+            j: 0,
+            dx: U256::from(50_000u64),
+            min_dy: U256::from(49_500u64),
+        }
+        .abi_encode();
+        let decoded = decode_pending(pool, &calldata).expect("should decode");
+        assert_eq!(decoded.protocol, Protocol::Curve);
+        assert_eq!(decoded.curve_indices, Some((2, 0)));
+    }
+
+    #[test]
+    fn decode_curve_exchange_uint256() {
+        // Newer crypto-pool variant uses uint256 indices.
+        let pool = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46"); // tricrypto2
+        let calldata = ICurvePoolUint256::exchangeCall {
+            i: U256::from(1u64),
+            j: U256::from(2u64),
+            dx: U256::from(1_000_000_000_000_000_000u128),
+            min_dy: U256::from(900u64),
+        }
+        .abi_encode();
+        let decoded = decode_pending(pool, &calldata).expect("should decode");
+        assert_eq!(decoded.protocol, Protocol::Curve);
+        assert_eq!(decoded.curve_indices, Some((1, 2)));
+    }
+
+    #[test]
+    fn decode_curve_negative_index_rejected() {
+        // A negative `int128` index is either malformed calldata or a
+        // shape the decoder shouldn't be guessing at; reject loudly.
+        let pool = address!("0000000000000000000000000000000000000001");
+        let calldata = ICurvePoolInt128::exchangeCall {
+            i: -1,
+            j: 0,
+            dx: U256::from(1u64),
+            min_dy: U256::from(0u64),
+        }
+        .abi_encode();
+        let err = decode_pending(pool, &calldata).unwrap_err();
+        assert!(matches!(err, DecodeError::AbiDecode(_)),
+            "negative index should reject as AbiDecode, got {err:?}");
+    }
+
+    #[test]
+    fn decode_curve_index_above_u8_rejected() {
+        // uint256 index above 255 wouldn't fit our u8 narrowing.
+        let pool = address!("0000000000000000000000000000000000000002");
+        let calldata = ICurvePoolUint256::exchangeCall {
+            i: U256::from(256u64),
+            j: U256::from(0u64),
+            dx: U256::from(1u64),
+            min_dy: U256::from(0u64),
+        }
+        .abi_encode();
+        let err = decode_pending(pool, &calldata).unwrap_err();
+        assert!(matches!(err, DecodeError::AbiDecode(_)),
+            "index above u8::MAX should reject as AbiDecode, got {err:?}");
     }
 }
