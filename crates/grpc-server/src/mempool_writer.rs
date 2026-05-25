@@ -64,6 +64,11 @@ pub const PROTOCOL_UNI_V3: &str = "uni_v3";
 #[allow(dead_code)]
 pub const PROTOCOL_CURVE: &str = "curve";
 pub const PROTOCOL_BALANCER: &str = "balancer";
+/// Reserved for Bancor V3 decoder path. Like `PROTOCOL_CURVE`, listed
+/// here so the wire label is pinned even before the writer is wired up
+/// downstream.
+#[allow(dead_code)]
+pub const PROTOCOL_BANCOR: &str = "bancor";
 
 /// Insert payload for the `mempool_predictions` table. Field shapes mirror
 /// the SQL schema 1:1 so a sqlx bind is a straight enumeration.

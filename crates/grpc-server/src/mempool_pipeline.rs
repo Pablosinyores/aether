@@ -51,7 +51,7 @@ use crate::service::aether_proto;
 use crate::engine::PoolMetadata;
 use crate::mempool_writer::{
     MempoolPredictionSink, NewMempoolPrediction, PredictedPostState, PROTOCOL_BALANCER,
-    PROTOCOL_CURVE, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
+    PROTOCOL_BANCOR, PROTOCOL_CURVE, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
 };
 use crate::EngineMetrics;
 
@@ -393,6 +393,7 @@ fn decoder_protocol_to_type(p: Protocol) -> Option<ProtocolType> {
         Protocol::UniswapV3 => Some(ProtocolType::UniswapV3),
         Protocol::BalancerV2 => Some(ProtocolType::BalancerV2),
         Protocol::Curve => Some(ProtocolType::Curve),
+        Protocol::BancorV3 => Some(ProtocolType::BancorV3),
     }
 }
 
@@ -459,6 +460,17 @@ fn try_post_state_scan(
         metrics.inc_pending_arb_sim_skipped("curve_post_state_pending");
         return;
     }
+    // Bancor V3 post-state scan is intentionally deferred to a follow-up
+    // PR. The BancorPool predictor lives in `aether-pools` (BNT-
+    // intermediary swap math) but lacks an analytical post-state hook
+    // through `predict_post_state_with_fallback`. Decoded swaps already
+    // surface on `pending_dex_tx_total{protocol="bancor_v3"}` via
+    // `emit_decoded` upstream; the cycle-scan integration is the next
+    // increment. Same scope-cut as the Curve decoder PR.
+    if swap.protocol == Protocol::BancorV3 {
+        metrics.inc_pending_arb_sim_skipped("bancor_post_state_pending");
+        return;
+    }
 
     let target_protocol = match swap.protocol {
         Protocol::UniswapV2 => ProtocolType::UniswapV2,
@@ -466,6 +478,7 @@ fn try_post_state_scan(
         Protocol::UniswapV3 => ProtocolType::UniswapV3,
         Protocol::BalancerV2 => ProtocolType::BalancerV2,
         Protocol::Curve => unreachable!("curve early-returned above"),
+        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     };
 
     let token_idx = ctx.token_index.load();
@@ -548,6 +561,7 @@ fn try_post_state_scan(
             (pin, pout)
         }
         Protocol::Curve => unreachable!("curve early-returned above"),
+        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     };
 
     // Clone the graph and apply the post-state to both directions of the
@@ -582,6 +596,7 @@ fn try_post_state_scan(
             reserve_out: post_out,
         },
         Protocol::Curve => unreachable!("curve early-returned above"),
+        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     }
     .into_json();
     let prediction = NewMempoolPrediction {
@@ -958,6 +973,7 @@ fn decoder_protocol_label(p: Protocol) -> &'static str {
         Protocol::UniswapV3 => PROTOCOL_UNI_V3,
         Protocol::BalancerV2 => PROTOCOL_BALANCER,
         Protocol::Curve => PROTOCOL_CURVE,
+        Protocol::BancorV3 => PROTOCOL_BANCOR,
     }
 }
 
@@ -1090,6 +1106,7 @@ fn protocol_label(p: Protocol) -> &'static str {
         Protocol::SushiSwap => "sushiswap",
         Protocol::BalancerV2 => "balancer_v2",
         Protocol::Curve => "curve",
+        Protocol::BancorV3 => "bancor_v3",
     }
 }
 

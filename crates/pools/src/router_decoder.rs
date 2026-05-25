@@ -87,6 +87,11 @@ pub enum Protocol {
     /// from the pool registry using the indices in
     /// [`DecodedSwap.curve_indices`].
     Curve,
+    /// Bancor V3 `BancorNetwork.tradeBySourceAmount`. Unlike Curve, this
+    /// is router-mediated (not pool-direct), so `DecodedSwap.router` is
+    /// the BancorNetwork address and `token_in`/`token_out` are resolved
+    /// from calldata directly.
+    BancorV3,
 }
 
 /// Minimal swap shape produced by the decoder.
@@ -232,6 +237,18 @@ sol! {
         function exchange(uint256 i, uint256 j, uint256 dx, uint256 min_dy) external returns (uint256);
     }
 
+    /// Bancor V3 `BancorNetwork`. The dominant pending-tx shape is
+    /// `tradeBySourceAmount(source, target, sourceAmount, minReturn,
+    /// deadline, beneficiary)` — the user commits a known source amount
+    /// and accepts ≥ minReturn. The complementary `tradeByTargetAmount`
+    /// shape (commit a target amount, pay ≤ maxSource) is decoded with a
+    /// parallel arm so both flavours land in the same `DecodedSwap` shape.
+    #[allow(missing_docs)]
+    interface IBancorNetwork {
+        function tradeBySourceAmount(address sourceToken, address targetToken, uint256 sourceAmount, uint256 minReturnAmount, uint256 deadline, address beneficiary) external payable returns (uint256);
+        function tradeByTargetAmount(address sourceToken, address targetToken, uint256 targetAmount, uint256 maxSourceAmount, uint256 deadline, address beneficiary) external payable returns (uint256);
+    }
+
     /// Balancer V2 Vault `swap` for the SingleSwap shape.
     #[allow(missing_docs)]
     interface IBalancerVault {
@@ -286,6 +303,10 @@ pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, Decod
     }
     // ── Curve StableSwap pool-direct exchange() ──
     if let Some(swap) = try_curve(selector, calldata, to)? {
+        return Ok(swap);
+    }
+    // ── Bancor V3 BancorNetwork ──
+    if let Some(swap) = try_bancor(selector, calldata, to)? {
         return Ok(swap);
     }
 
@@ -607,6 +628,61 @@ fn try_curve(
     Ok(None)
 }
 
+/// Bancor V3 `BancorNetwork` decoder.
+///
+/// Routes both `tradeBySourceAmount` (commit source, accept min target)
+/// and `tradeByTargetAmount` (commit target, pay max source). The two
+/// shapes carry the same `(source, target)` token pair so collapse to a
+/// single `DecodedSwap` body — the `amount_in` / `amount_out_min`
+/// semantics differ slightly (`tradeByTargetAmount` puts the user-
+/// committed *target* amount in `amount_in` and the *source ceiling* in
+/// `amount_out_min`), but both numbers are still actionable signal for
+/// the upstream post-state simulator.
+fn try_bancor(
+    selector: [u8; 4],
+    calldata: &[u8],
+    router: Address,
+) -> Result<Option<DecodedSwap>, DecodeError> {
+    use IBancorNetwork::*;
+    if selector == tradeBySourceAmountCall::SELECTOR {
+        let c = tradeBySourceAmountCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::BancorV3,
+            router,
+            token_in: c.sourceToken,
+            token_out: c.targetToken,
+            amount_in: c.sourceAmount,
+            amount_out_min: c.minReturnAmount,
+            recipient: c.beneficiary,
+            fee_bps: 0,
+            path_extra: vec![],
+            curve_indices: None,
+        }));
+    }
+    if selector == tradeByTargetAmountCall::SELECTOR {
+        let c = tradeByTargetAmountCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::BancorV3,
+            router,
+            token_in: c.sourceToken,
+            token_out: c.targetToken,
+            // tradeByTargetAmount commits the target amount; surface it
+            // as amount_in so the predictor has a real magnitude rather
+            // than zero. The user-paid source ceiling lives in
+            // amount_out_min for symmetry.
+            amount_in: c.targetAmount,
+            amount_out_min: c.maxSourceAmount,
+            recipient: c.beneficiary,
+            fee_bps: 0,
+            path_extra: vec![],
+            curve_indices: None,
+        }));
+    }
+    Ok(None)
+}
+
 /// Narrow Curve `int128` index args to `u8`. Mainnet Curve pools are
 /// ≤ 8 coins so a value that doesn't fit `u8` (negative, > 255) is
 /// either malformed calldata or a non-standard pool we shouldn't be
@@ -912,5 +988,61 @@ mod tests {
         let err = decode_pending(pool, &calldata).unwrap_err();
         assert!(matches!(err, DecodeError::AbiDecode(_)),
             "index above u8::MAX should reject as AbiDecode, got {err:?}");
+    }
+
+    // ── Bancor V3 BancorNetwork decoder ──
+
+    #[test]
+    fn decode_bancor_trade_by_source_amount() {
+        let bancor = address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB");
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bnt = address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C");
+        let beneficiary = address!("000000000000000000000000000000000000dEaD");
+        let calldata = IBancorNetwork::tradeBySourceAmountCall {
+            sourceToken: weth,
+            targetToken: bnt,
+            sourceAmount: U256::from(1_000_000_000_000_000_000u128), // 1 WETH
+            minReturnAmount: U256::from(2_500u64 * 10u64.pow(18)),    // 2500 BNT
+            deadline: U256::from(99_999_999_999u64),
+            beneficiary,
+        }
+        .abi_encode();
+        let decoded = decode_pending(bancor, &calldata).expect("should decode");
+        assert_eq!(decoded.protocol, Protocol::BancorV3);
+        assert_eq!(decoded.router, bancor);
+        assert_eq!(decoded.token_in, weth);
+        assert_eq!(decoded.token_out, bnt);
+        assert_eq!(decoded.amount_in, U256::from(1_000_000_000_000_000_000u128));
+        assert_eq!(decoded.amount_out_min, U256::from(2_500u64 * 10u64.pow(18)));
+        assert_eq!(decoded.recipient, beneficiary);
+        assert_eq!(decoded.fee_bps, 0);
+        assert!(decoded.path_extra.is_empty());
+    }
+
+    #[test]
+    fn decode_bancor_trade_by_target_amount() {
+        // Target-amount flavour: user commits a target amount, accepts up
+        // to maxSource. Decoder surfaces targetAmount as `amount_in` and
+        // maxSourceAmount as `amount_out_min` for symmetry with the
+        // source-amount path — both numbers are real magnitudes for the
+        // predictor.
+        let bancor = address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB");
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bnt = address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C");
+        let calldata = IBancorNetwork::tradeByTargetAmountCall {
+            sourceToken: weth,
+            targetToken: bnt,
+            targetAmount: U256::from(5_000u64),
+            maxSourceAmount: U256::from(2_000u64),
+            deadline: U256::from(99u64),
+            beneficiary: Address::ZERO,
+        }
+        .abi_encode();
+        let decoded = decode_pending(bancor, &calldata).expect("should decode");
+        assert_eq!(decoded.protocol, Protocol::BancorV3);
+        assert_eq!(decoded.token_in, weth);
+        assert_eq!(decoded.token_out, bnt);
+        assert_eq!(decoded.amount_in, U256::from(5_000u64));
+        assert_eq!(decoded.amount_out_min, U256::from(2_000u64));
     }
 }

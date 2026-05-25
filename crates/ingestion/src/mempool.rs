@@ -282,6 +282,7 @@ pub fn default_router_addresses() -> Vec<Address> {
         address!("d9e1cE17f2641f24aE83637ab66a2cca9C378B9F"), // SushiSwap Router02
         address!("99a58482BD75cbab83b27EC03CA68fF489b5788f"), // Curve Router
         address!("BA12222222228d8Ba445958a75a0704d566BF2C8"), // Balancer V2 Vault
+        address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB"), // Bancor V3 BancorNetwork
     ]
 }
 
