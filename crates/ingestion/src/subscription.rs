@@ -1,4 +1,5 @@
 use crate::event_decoder::PoolEvent;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::warn;
 
@@ -13,16 +14,30 @@ pub struct EventChannels {
 }
 
 /// New block notification
-#[derive(Debug, Clone)]
+///
+/// `tx_hashes` is populated by the polling provider so downstream
+/// observers (e.g. the mempool first-seen tracker) can compute per-tx
+/// inclusion latency without issuing a separate `eth_getBlockByNumber`
+/// RPC. Empty `Arc<Vec<_>>` is the safe default when the hash list isn't
+/// available (e.g. some WS subscriptions, the unit-test stubs).
+#[derive(Debug, Clone, Default)]
 pub struct NewBlockEvent {
     pub block_number: u64,
     pub timestamp: u64,
     pub base_fee: u128,
     pub gas_limit: u64,
+    pub tx_hashes: Arc<Vec<alloy::primitives::B256>>,
 }
 
 /// Pending transaction notification
-#[derive(Debug, Clone)]
+///
+/// `first_seen_unix_nanos` is stamped at the moment the ingestion source
+/// (Alchemy WS, MEV-Share SSE, …) hands the tx to the broadcast layer.
+/// `0` means "not stamped" — downstream observers skip latency reporting
+/// for those events rather than emitting bogus 1970-epoch deltas. This
+/// keeps the field optional in spirit without paying for `Option`'s
+/// branch on the hot path.
+#[derive(Debug, Clone, Default)]
 pub struct PendingTxEvent {
     pub tx_hash: alloy::primitives::B256,
     pub from: alloy::primitives::Address,
@@ -30,6 +45,7 @@ pub struct PendingTxEvent {
     pub value: alloy::primitives::U256,
     pub input: Vec<u8>,
     pub gas_price: u128,
+    pub first_seen_unix_nanos: u64,
 }
 
 impl EventChannels {
@@ -167,6 +183,7 @@ mod tests {
             timestamp: 1_700_000_000,
             base_fee: 30_000_000_000, // 30 gwei
             gas_limit: 30_000_000,
+            ..Default::default()
         };
 
         channels.dispatch_new_block(event);
@@ -192,6 +209,7 @@ mod tests {
             value: U256::from(1_000_000_000_000_000_000u64),
             input: vec![0xaa, 0xbb],
             gas_price: 50_000_000_000,
+            ..Default::default()
         };
 
         channels.dispatch_pending_tx(event);
@@ -249,6 +267,7 @@ mod tests {
             timestamp: 100,
             base_fee: 10,
             gas_limit: 30_000_000,
+            ..Default::default()
         });
 
         let r1 = rx1.recv().await.unwrap();
@@ -315,6 +334,7 @@ mod tests {
             timestamp: 0,
             base_fee: 0,
             gas_limit: 0,
+            ..Default::default()
         });
         // Should not panic
     }
@@ -329,6 +349,7 @@ mod tests {
             value: U256::ZERO,
             input: vec![],
             gas_price: 0,
+            ..Default::default()
         });
         // Should not panic
     }
@@ -342,6 +363,7 @@ mod tests {
             timestamp: 1_700_000_000,
             base_fee: 30_000_000_000,
             gas_limit: 30_000_000,
+            ..Default::default()
         };
         let cloned = event.clone();
         assert_eq!(cloned.block_number, event.block_number);
@@ -359,6 +381,7 @@ mod tests {
             value: U256::from(1u64),
             input: vec![0x01, 0x02],
             gas_price: 100,
+            ..Default::default()
         };
         let cloned = event.clone();
         assert_eq!(cloned.tx_hash, event.tx_hash);
@@ -375,6 +398,7 @@ mod tests {
             value: U256::ZERO,
             input: vec![],
             gas_price: 0,
+            ..Default::default()
         };
         assert!(event.to.is_none());
     }

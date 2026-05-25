@@ -331,7 +331,23 @@ impl RpcProvider {
                             let base_fee = block.inner.base_fee_per_gas.unwrap_or(0) as u128;
                             let gas_limit = block.inner.gas_limit;
                             debug!(block = number, "Block received via subscription");
-                            self.dispatch_block(number, timestamp, base_fee, gas_limit);
+                            // newHeads only carries header fields; fetch the
+                            // block (hashes-only — Full would inflate the
+                            // payload by 100×+) so the mempool first-seen
+                            // tracker has a tx list to diff against. A
+                            // failed fetch dispatches with an empty list —
+                            // the inclusion-latency histogram quietly skips
+                            // that block rather than crashing the loop.
+                            let tx_hashes = match provider
+                                .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(number))
+                                .await
+                            {
+                                Ok(Some(b)) => {
+                                    std::sync::Arc::new(b.transactions.hashes().collect())
+                                }
+                                _ => std::sync::Arc::new(Vec::new()),
+                            };
+                            self.dispatch_block(number, timestamp, base_fee, gas_limit, tx_hashes);
                             node.write().await.record_success(0, number);
                         }
                         None => {
@@ -425,8 +441,14 @@ impl RpcProvider {
                         let timestamp = block.header.timestamp;
                         let base_fee = block.header.base_fee_per_gas.unwrap_or(0) as u128;
                         let gas_limit = block.header.gas_limit;
+                        // Tx hashes already in the polled block payload —
+                        // free for the mempool first-seen tracker.
+                        let tx_hashes =
+                            std::sync::Arc::new(block.transactions.hashes().collect());
 
-                        self.dispatch_block(current_block, timestamp, base_fee, gas_limit);
+                        self.dispatch_block(
+                            current_block, timestamp, base_fee, gas_limit, tx_hashes,
+                        );
                         node.write().await.record_success(0, current_block);
 
                         // Fetch logs for all blocks since last_block to avoid
@@ -506,12 +528,25 @@ impl RpcProvider {
     }
 
     /// Dispatch a new block event to the event channels.
-    pub fn dispatch_block(&self, number: u64, timestamp: u64, base_fee: u128, gas_limit: u64) {
+    ///
+    /// `tx_hashes` should hold the block's confirmed tx hash list when
+    /// available — the mempool first-seen tracker uses it to compute
+    /// inclusion latency. Pass `Arc::new(Vec::new())` when the source
+    /// can't provide the list (e.g. some WS notifications).
+    pub fn dispatch_block(
+        &self,
+        number: u64,
+        timestamp: u64,
+        base_fee: u128,
+        gas_limit: u64,
+        tx_hashes: std::sync::Arc<Vec<B256>>,
+    ) {
         self.event_channels.dispatch_new_block(NewBlockEvent {
             block_number: number,
             timestamp,
             base_fee,
             gas_limit,
+            tx_hashes,
         });
     }
 
@@ -690,7 +725,13 @@ mod tests {
         };
         let provider = RpcProvider::new(config, Arc::clone(&channels), test_metrics());
 
-        provider.dispatch_block(18_000_000, 1_700_000_000, 30_000_000_000, 30_000_000);
+        provider.dispatch_block(
+            18_000_000,
+            1_700_000_000,
+            30_000_000_000,
+            30_000_000,
+            std::sync::Arc::new(Vec::new()),
+        );
 
         let event = rx.try_recv().expect("should receive block event");
         assert_eq!(event.block_number, 18_000_000);

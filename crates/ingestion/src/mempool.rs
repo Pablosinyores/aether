@@ -175,6 +175,15 @@ impl AlchemyMempool {
         let from = tx.inner.signer();
         let envelope = tx.as_ref();
         let to: Option<Address> = envelope.kind().to().copied();
+        // Stamp first-seen at the moment we hand the event off so the
+        // downstream tracker can compute inclusion latency against
+        // wall-clock ingest time. SystemTime is intentional (not
+        // Instant): the tracker compares against block timestamps from
+        // chain, which are UNIX-time, not process-monotonic.
+        let first_seen_unix_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         let event = PendingTxEvent {
             tx_hash: *envelope.tx_hash(),
             from,
@@ -182,6 +191,7 @@ impl AlchemyMempool {
             value: envelope.value(),
             input: envelope.input().to_vec(),
             gas_price: envelope.max_fee_per_gas(),
+            first_seen_unix_nanos,
         };
         debug!(
             target: "aether::mempool",

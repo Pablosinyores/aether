@@ -2406,6 +2406,7 @@ mod tests {
             timestamp: 1_700_500_000,
             base_fee: 25_000_000_000,
             gas_limit: 30_000_000,
+            ..Default::default()
         };
 
         engine.handle_new_block(block_event).await;
@@ -2446,6 +2447,7 @@ mod tests {
             timestamp: 1_710_000_000,
             base_fee: 20_000_000_000,
             gas_limit: 30_000_000,
+            ..Default::default()
         });
 
         // Give the engine time to process.

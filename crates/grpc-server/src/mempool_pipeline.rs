@@ -1099,6 +1099,7 @@ mod tests {
             value: U256::ZERO,
             input,
             gas_price: 0,
+            first_seen_unix_nanos: 0,
         }
     }
 
