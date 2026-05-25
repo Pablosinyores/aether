@@ -119,6 +119,17 @@ impl UnifiedPostState {
     }
 }
 
+/// Protocol family the post-state replayer is being asked to handle.
+/// Passed by [`predict_post_state_with_replay`] into its replay closure
+/// when the analytical predictor's confidence flag is low so the caller
+/// can dispatch to the right EVM-fork reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayProtocol {
+    UniswapV3,
+    Curve,
+    Balancer,
+}
+
 /// Run the analytical post-state predictor for the cached pool and
 /// escalate to an EVM fork-replay fallback when its confidence flag is
 /// low. The caller provides the fallback metric bump as a closure so
@@ -129,11 +140,9 @@ impl UnifiedPostState {
 /// when the predictor itself returned `None` (invalid inputs) OR when
 /// the confidence flag was clear and the EVM fallback would be needed
 /// — for now the fallback path is a stub that bumps the metric and
-/// returns `None`. Real EVM fork-replay implementation (calling
-/// `EvmSimulator` against the pool with the victim's swap pre-applied)
-/// lands once the simulator gains a generic "apply this transaction
-/// and read post-state" entry point; until then the metric tells us
-/// how often the gap matters.
+/// returns `None`. The replay-aware sibling function
+/// [`predict_post_state_with_replay`] does the actual EVM fork-replay
+/// when wired by the caller.
 ///
 /// V2 / Sushi pools are NOT handled here — the V2 analytical predictor
 /// lives in the mempool decode pipeline (a separate branch) and is
@@ -178,6 +187,61 @@ where
             // (mempool decode pipeline). Surface the gap so the caller
             // can route V2 through its own path rather than silently
             // returning None and losing the candidate.
+            on_fallback("unknown_protocol");
+            None
+        }
+    }
+}
+
+/// Replay-aware sibling of [`predict_post_state_with_fallback`]. When
+/// the analytical predictor returns a low-confidence flag, invoke the
+/// `replay` closure with the protocol family so the caller can dispatch
+/// to an EVM fork-replay reader. Returning `None` from the closure
+/// preserves the dormant behaviour (skip the candidate); returning
+/// `Some` lets the post-state graph update proceed with revm-derived
+/// values.
+///
+/// Inputs that the analytical predictor itself rejects (zero amount,
+/// unknown token, uninitialised pool) still short-circuit to `None`
+/// without touching the replay closure — there is no useful post-state
+/// to reconstruct from a swap the pool itself would not honour.
+pub fn predict_post_state_with_replay<F, R>(
+    state: &PoolState,
+    token_in: alloy::primitives::Address,
+    amount_in: U256,
+    on_fallback: F,
+    replay: R,
+) -> Option<UnifiedPostState>
+where
+    F: FnOnce(&str),
+    R: FnOnce(ReplayProtocol) -> Option<UnifiedPostState>,
+{
+    match state {
+        PoolState::UniswapV3(pool) => {
+            let post = pool.predict_post_state(token_in, amount_in)?;
+            if !post.single_tick {
+                on_fallback("v3_tick_crossed");
+                return replay(ReplayProtocol::UniswapV3);
+            }
+            Some(UnifiedPostState::UniswapV3(post))
+        }
+        PoolState::Curve(pool) => {
+            let post = pool.predict_post_state(token_in, amount_in)?;
+            if !post.analytical {
+                on_fallback("curve_unconverged");
+                return replay(ReplayProtocol::Curve);
+            }
+            Some(UnifiedPostState::Curve(post))
+        }
+        PoolState::Balancer(pool) => {
+            let post = pool.predict_post_state(token_in, amount_in)?;
+            if !post.analytical {
+                on_fallback("balancer_unequal_weight");
+                return replay(ReplayProtocol::Balancer);
+            }
+            Some(UnifiedPostState::Balancer(post))
+        }
+        PoolState::UniswapV2(_) | PoolState::SushiSwap(_) => {
             on_fallback("unknown_protocol");
             None
         }
@@ -337,6 +401,113 @@ mod cache_tests {
         );
         assert!(result.is_some());
         assert!(captured.borrow().is_empty());
+    }
+
+    #[test]
+    fn predict_with_replay_v3_invokes_closure_on_tick_cross() {
+        let mut v3 = UniswapV3Pool::new(
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            30,
+            60,
+        );
+        let two_pow_96_f64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+        let sqrt_norm = 1.0001f64.powi(15);
+        let sqrt_x96 = (sqrt_norm * two_pow_96_f64) as u128;
+        v3.update_sqrt_price(U256::from(sqrt_x96), 10_000_000_000_000_000u128, 30);
+
+        let state = PoolState::UniswapV3(v3.clone());
+        let captured_fallback = std::cell::RefCell::new(Vec::<String>::new());
+        let captured_replay = std::cell::RefCell::new(Vec::<ReplayProtocol>::new());
+        let result = predict_post_state_with_replay(
+            &state,
+            v3.token0,
+            U256::from(5_000_000_000_000_000u64),
+            |reason| captured_fallback.borrow_mut().push(reason.to_string()),
+            |proto| {
+                captured_replay.borrow_mut().push(proto);
+                None
+            },
+        );
+        assert!(result.is_none(), "closure returned None — final result is None");
+        assert_eq!(
+            captured_fallback.borrow().as_slice(),
+            &["v3_tick_crossed".to_string()],
+            "fallback metric still bumped"
+        );
+        assert_eq!(
+            captured_replay.borrow().as_slice(),
+            &[ReplayProtocol::UniswapV3],
+            "replay closure invoked with V3 family"
+        );
+    }
+
+    #[test]
+    fn predict_with_replay_uses_closure_result_when_some() {
+        let mut v3 = UniswapV3Pool::new(
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            30,
+            60,
+        );
+        let two_pow_96_f64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+        let sqrt_norm = 1.0001f64.powi(15);
+        let sqrt_x96 = (sqrt_norm * two_pow_96_f64) as u128;
+        v3.update_sqrt_price(U256::from(sqrt_x96), 10_000_000_000_000_000u128, 30);
+
+        let state = PoolState::UniswapV3(v3.clone());
+        let result = predict_post_state_with_replay(
+            &state,
+            v3.token0,
+            U256::from(5_000_000_000_000_000u64),
+            |_reason| {},
+            |_proto| {
+                Some(UnifiedPostState::UniswapV3(
+                    crate::uniswap_v3::V3PostState {
+                        new_sqrt_price_x96: U256::from(42u64),
+                        new_liquidity: 99,
+                        amount_out: U256::ZERO,
+                        single_tick: true,
+                    },
+                ))
+            },
+        );
+        assert!(matches!(
+            result,
+            Some(UnifiedPostState::UniswapV3(ref p)) if p.new_sqrt_price_x96 == U256::from(42u64)
+        ));
+    }
+
+    #[test]
+    fn predict_with_replay_does_not_call_closure_when_analytical_ok() {
+        let mut v3 = UniswapV3Pool::new(
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+            30,
+            60,
+        );
+        let two_pow_96_f64: f64 = 79_228_162_514_264_337_593_543_950_336.0;
+        let sqrt_norm = 1.0001f64.powi(15);
+        let sqrt_x96 = (sqrt_norm * two_pow_96_f64) as u128;
+        v3.update_sqrt_price(U256::from(sqrt_x96), 10_000_000_000_000_000u128, 30);
+
+        let state = PoolState::UniswapV3(v3.clone());
+        let called = std::cell::Cell::new(false);
+        let result = predict_post_state_with_replay(
+            &state,
+            v3.token0,
+            U256::from(100_000_000u64),
+            |_reason| {},
+            |_proto| {
+                called.set(true);
+                None
+            },
+        );
+        assert!(result.is_some(), "analytical predictor succeeded");
+        assert!(!called.get(), "replay closure must not run when analytical succeeds");
     }
 
     #[test]
