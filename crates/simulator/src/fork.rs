@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 /// Injected into each task's `RpcForkedState` cache so that per-task cold
 /// RPC fetches are eliminated — all simulations sharing the same block see
 /// the same contract state without redundant network round-trips.
+#[derive(Default)]
 pub struct PrewarmedState {
     /// Bytecode cache: (code_hash, bytecode) pairs for pre-fetched contracts.
     ///

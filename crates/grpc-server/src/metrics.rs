@@ -164,6 +164,24 @@ pub struct EngineMetrics {
     /// replay that hits an RPC stall on a cold storage slot looks very
     /// different from one served entirely from the warm `CacheDB`.
     mempool_post_state_replay_latency_ms: Histogram,
+    /// Counter for mempool-backrun shadow-sim attempts that received a
+    /// pre-warmed bytecode + storage payload before the revm sim ran.
+    /// `result=hit` when a `PrewarmedState` was loaded and injected,
+    /// `result=miss` when the long-lived `ArcSwap` is still empty (the
+    /// background refresher has not produced its first snapshot yet).
+    mempool_prewarm_inject_total: IntCounterVec,
+    /// Counter for the periodic mempool pre-warm refresh task. `result=ok`
+    /// on a successful registry snapshot + RPC fetch, `result=error` is
+    /// reserved for future refresh-side failures (the current implementation
+    /// only logs warnings inside `prewarm_state`).
+    mempool_prewarm_refresh_total: IntCounterVec,
+    /// Wall-clock latency of one refresh cycle, ms. Buckets mirror
+    /// `mempool_backrun_validation_latency_ms` so the two histograms share a
+    /// dashboard layout.
+    mempool_prewarm_refresh_duration_ms: Histogram,
+    /// Pools whose bytecode + V2 reserve slots were warmed by the most
+    /// recent refresh. Set to the snapshot's pool count on success.
+    mempool_prewarm_warm_pools: IntGauge,
 }
 
 impl EngineMetrics {
@@ -345,6 +363,37 @@ impl EngineMetrics {
             ]),
         )
         .expect("aether_mempool_post_state_replay_latency_ms histogram");
+        let mempool_prewarm_inject_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_prewarm_inject_total",
+                "Mempool-backrun shadow-sim attempts by pre-warm result (hit / miss)",
+            ),
+            &["result"],
+        )
+        .expect("aether_mempool_prewarm_inject_total counter vec");
+        let mempool_prewarm_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_prewarm_refresh_total",
+                "Periodic mempool pre-warm refresh attempts, by result (ok / error)",
+            ),
+            &["result"],
+        )
+        .expect("aether_mempool_prewarm_refresh_total counter vec");
+        let mempool_prewarm_refresh_duration_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_mempool_prewarm_refresh_duration_ms",
+                "Wall-clock latency of one mempool pre-warm refresh cycle, ms",
+            )
+            .buckets(vec![
+                0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 250.0, 500.0,
+            ]),
+        )
+        .expect("aether_mempool_prewarm_refresh_duration_ms histogram");
+        let mempool_prewarm_warm_pools = IntGauge::new(
+            "aether_mempool_prewarm_warm_pools",
+            "Pools whose bytecode + V2 reserve slots were warmed by the most recent refresh",
+        )
+        .expect("aether_mempool_prewarm_warm_pools gauge");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -415,6 +464,18 @@ impl EngineMetrics {
         registry
             .register(Box::new(mempool_post_state_replay_latency_ms.clone()))
             .expect("register aether_mempool_post_state_replay_latency_ms");
+        registry
+            .register(Box::new(mempool_prewarm_inject_total.clone()))
+            .expect("register aether_mempool_prewarm_inject_total");
+        registry
+            .register(Box::new(mempool_prewarm_refresh_total.clone()))
+            .expect("register aether_mempool_prewarm_refresh_total");
+        registry
+            .register(Box::new(mempool_prewarm_refresh_duration_ms.clone()))
+            .expect("register aether_mempool_prewarm_refresh_duration_ms");
+        registry
+            .register(Box::new(mempool_prewarm_warm_pools.clone()))
+            .expect("register aether_mempool_prewarm_warm_pools");
 
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
@@ -470,6 +531,10 @@ impl EngineMetrics {
             mempool_first_seen_events_total,
             mempool_post_state_replay_total,
             mempool_post_state_replay_latency_ms,
+            mempool_prewarm_inject_total,
+            mempool_prewarm_refresh_total,
+            mempool_prewarm_refresh_duration_ms,
+            mempool_prewarm_warm_pools,
         }
     }
 
@@ -688,6 +753,38 @@ impl EngineMetrics {
         self.mempool_backrun_rejected_total
             .with_label_values(&[reason])
             .inc();
+    }
+
+    /// Bump `aether_mempool_prewarm_inject_total{result="hit"}`.
+    pub fn inc_mempool_prewarm_hit(&self) {
+        self.mempool_prewarm_inject_total
+            .with_label_values(&["hit"])
+            .inc();
+    }
+
+    /// Bump `aether_mempool_prewarm_inject_total{result="miss"}`.
+    pub fn inc_mempool_prewarm_miss(&self) {
+        self.mempool_prewarm_inject_total
+            .with_label_values(&["miss"])
+            .inc();
+    }
+
+    /// Bump `aether_mempool_prewarm_refresh_total{result}`.
+    pub fn inc_mempool_prewarm_refresh(&self, result: &str) {
+        self.mempool_prewarm_refresh_total
+            .with_label_values(&[result])
+            .inc();
+    }
+
+    /// Observe wall-clock latency of one mempool pre-warm refresh cycle, ms.
+    pub fn observe_mempool_prewarm_refresh_duration_ms(&self, ms: f64) {
+        self.mempool_prewarm_refresh_duration_ms.observe(ms);
+    }
+
+    /// Set `aether_mempool_prewarm_warm_pools` to the most recent snapshot's
+    /// pool count.
+    pub fn set_mempool_prewarm_warm_pools(&self, n: i64) {
+        self.mempool_prewarm_warm_pools.set(n);
     }
 
     /// Increment the in-flight mempool-backrun sim gauge by one. Returns a

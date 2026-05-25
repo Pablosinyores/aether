@@ -213,9 +213,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
                 Arc::clone(&metrics),
-                Some(sim_ctx),
+                Some(Arc::clone(&sim_ctx)),
                 shutdown_rx.clone(),
             );
+            // Pre-warm refresher: rebuilds the long-lived
+            // PrewarmedState (tracked-pool bytecode + V2 reserve slot
+            // 8) every Nth new block. Without this each per-pending-tx
+            // shadow-sim builds an empty CacheDB and re-fetches the
+            // same bytecode from Alchemy. The refresher only spawns
+            // when an RPC provider is available — without one
+            // `prewarm_state` has nowhere to fetch from.
+            if let Some(provider) = engine.rpc_provider() {
+                let prewarm_interval = std::env::var("AETHER_MEMPOOL_PREWARM_INTERVAL_BLOCKS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(8);
+                let _prewarm_handle = mempool_pipeline::spawn_mempool_prewarm_refresher(
+                    Arc::clone(&sim_ctx),
+                    provider,
+                    Arc::clone(engine.event_channels()),
+                    Arc::clone(&metrics),
+                    prewarm_interval,
+                    shutdown_rx.clone(),
+                );
+            } else {
+                info!(
+                    "Mempool prewarm refresher disabled — no RPC provider configured (set ETH_RPC_URL)"
+                );
+            }
             // First-seen → inclusion latency tracker. Pure observability —
             // listens on the same broadcast channels, never publishes
             // anything outward. Spawned alongside the mempool pipeline so
@@ -383,5 +408,9 @@ fn build_backrun_validator_config(
         input_amount_wei,
         sim_semaphore: Arc::new(tokio::sync::Semaphore::new(sim_concurrency)),
         provider,
+        // Placeholder — `SimContext::with_backrun_validator` overwrites this
+        // with the SimContext's shared handle so the validator and the
+        // background refresher rotate the same `ArcSwap`.
+        mempool_prewarm: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
     })
 }

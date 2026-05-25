@@ -109,6 +109,14 @@ pub struct BackrunValidatorConfig {
     /// `provider_unavailable` reject and the analytical-only behaviour
     /// from `develop` is preserved.
     pub provider: Option<DynProvider<Ethereum>>,
+    /// Shared handle to the long-lived pre-warmed bytecode + storage
+    /// snapshot owned by the parent [`SimContext`]. Populated by
+    /// [`SimContext::with_backrun_validator`]; remains a fresh empty
+    /// `ArcSwap` when the validator is built outside a SimContext (only
+    /// happens in tests and via `build_backrun_validator_config` before
+    /// the SimContext attaches it). Atomic load on every shadow-sim.
+    pub mempool_prewarm:
+        Arc<ArcSwap<Option<Arc<aether_simulator::fork::PrewarmedState>>>>,
 }
 
 /// State the post-state simulator needs to run after a successful decode.
@@ -157,6 +165,13 @@ pub struct SimContext {
     /// hooks land in `aether_simulator::post_state_replay` — until then,
     /// flipping this flag only changes V3 behaviour.
     pub post_state_replay_enabled: bool,
+    /// Long-lived snapshot of pre-fetched contract code + V2 reserve slots
+    /// covering the tracked pool registry. Built and rotated by
+    /// [`spawn_mempool_prewarm_refresher`]; injected into each per-pending-tx
+    /// `RpcForkedState` so the mempool shadow-sim path stops re-fetching cold
+    /// bytecode on every attempt. `None` until the first refresh lands.
+    pub mempool_prewarm:
+        Arc<ArcSwap<Option<Arc<aether_simulator::fork::PrewarmedState>>>>,
 }
 
 impl SimContext {
@@ -182,6 +197,7 @@ impl SimContext {
             engine_git_sha,
             pair_index_cache: Mutex::new(None),
             post_state_replay_enabled: false,
+            mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 
@@ -210,7 +226,11 @@ impl SimContext {
 
     /// Attach the revm validator configuration. The pipeline ignores this
     /// when [`SimContext::arb_publisher`] is also unset.
-    pub fn with_backrun_validator(mut self, cfg: BackrunValidatorConfig) -> Self {
+    ///
+    /// Shares the SimContext's `mempool_prewarm` handle into the cfg so the
+    /// validator and the background refresher rotate the same `ArcSwap`.
+    pub fn with_backrun_validator(mut self, mut cfg: BackrunValidatorConfig) -> Self {
+        cfg.mempool_prewarm = Arc::clone(&self.mempool_prewarm);
         self.backrun = Some(cfg);
         self
     }
@@ -293,6 +313,137 @@ pub fn spawn_mempool_pipeline(
             }
         }
     })
+}
+
+/// Spawn the background task that periodically refreshes
+/// [`SimContext::mempool_prewarm`].
+///
+/// Runs one best-effort refresh on startup, then on every
+/// `interval_blocks`-th `NewBlockEvent`. Each refresh snapshots the live
+/// pool registry, collects code + V2-reserve addresses, fans the RPC
+/// fetches out in parallel via
+/// [`aether_simulator::fork::prewarm_state`], and atomically swaps the
+/// result into the shared `ArcSwap`. Refresh failures are best-effort —
+/// the stale snapshot is preserved so the validator keeps running warm.
+///
+/// Setting `interval_blocks = 0` is treated as `1`: at minimum one
+/// refresh per new block. Tracked-pool bytecode rarely changes so the
+/// default cadence (8 blocks, ~96 s on mainnet) is sufficient to
+/// absorb registry growth without burning ~10 K RPCs/block on refresh.
+pub fn spawn_mempool_prewarm_refresher(
+    sim_ctx: Arc<SimContext>,
+    provider: DynProvider<Ethereum>,
+    channels: Arc<aether_ingestion::subscription::EventChannels>,
+    metrics: Arc<EngineMetrics>,
+    interval_blocks: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut new_blocks = channels.subscribe_new_blocks();
+        let interval = interval_blocks.max(1);
+        // First refresh on startup so the validator is warm before the
+        // first new-block tick lands. block_number = 0 is purely a log
+        // tag here; `prewarm_state` resolves storage via BlockId so
+        // value semantics don't depend on it.
+        run_prewarm_refresh(&sim_ctx, &provider, &metrics, 0).await;
+        let mut last_refresh_block: u64 = 0;
+        info!(
+            target: "aether::mempool",
+            interval_blocks = interval,
+            "mempool prewarm refresher started"
+        );
+
+        loop {
+            tokio::select! {
+                next = new_blocks.recv() => match next {
+                    Ok(block) => {
+                        if block.block_number.saturating_sub(last_refresh_block) >= interval
+                            || last_refresh_block == 0
+                        {
+                            run_prewarm_refresh(&sim_ctx, &provider, &metrics, block.block_number).await;
+                            last_refresh_block = block.block_number;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(
+                            target: "aether::mempool",
+                            lagged = n,
+                            "prewarm refresher lagged on new_blocks; resuming"
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!(target: "aether::mempool", "new_blocks closed; prewarm refresher exiting");
+                        return;
+                    }
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        info!(target: "aether::mempool", "shutdown signalled; prewarm refresher exiting");
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// One refresh cycle: snapshot the registry, fan out RPC fetches, swap
+/// the result into the shared `ArcSwap`. Errors inside `prewarm_state`
+/// are logged at warn level per-address; the cycle as a whole always
+/// produces a snapshot (possibly with fewer entries on partial failure).
+async fn run_prewarm_refresh(
+    sim_ctx: &Arc<SimContext>,
+    provider: &DynProvider<Ethereum>,
+    metrics: &EngineMetrics,
+    block_number: u64,
+) {
+    let started = Instant::now();
+    let registry_guard = sim_ctx.pool_registry.load();
+    let executor_addr = sim_ctx.backrun.as_ref().map(|c| c.executor_address);
+
+    let mut code_addrs: Vec<Address> = Vec::with_capacity(registry_guard.len() + 1);
+    if let Some(addr) = executor_addr {
+        code_addrs.push(addr);
+    }
+    let mut v2_addrs: Vec<Address> = Vec::new();
+
+    for meta in registry_guard.values() {
+        code_addrs.push(meta.pool_id.address);
+        if matches!(
+            meta.protocol,
+            ProtocolType::UniswapV2 | ProtocolType::SushiSwap,
+        ) {
+            v2_addrs.push(meta.pool_id.address);
+        }
+    }
+    code_addrs.sort_unstable();
+    code_addrs.dedup();
+    v2_addrs.sort_unstable();
+    v2_addrs.dedup();
+
+    let pool_count = registry_guard.len();
+    drop(registry_guard);
+
+    let fresh =
+        aether_simulator::fork::prewarm_state(provider, block_number, &code_addrs, &v2_addrs)
+            .await;
+
+    sim_ctx
+        .mempool_prewarm
+        .store(Arc::new(Some(Arc::new(fresh))));
+
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    metrics.inc_mempool_prewarm_refresh("ok");
+    metrics.observe_mempool_prewarm_refresh_duration_ms(elapsed_ms);
+    metrics.set_mempool_prewarm_warm_pools(pool_count as i64);
+    info!(
+        target: "aether::mempool",
+        block = block_number,
+        pools = pool_count,
+        elapsed_ms,
+        "mempool prewarm refreshed"
+    );
 }
 
 /// Decode one pending tx and update metrics + logs.
@@ -874,7 +1025,7 @@ fn run_backrun_validation(
     // Anvil fork; on real mainnet RPC the difference is invisible
     // because `latest` and the snapshot block are typically within one
     // slot of each other.
-    let state = match aether_simulator::fork::RpcForkedState::new_at_latest(
+    let mut state = match aether_simulator::fork::RpcForkedState::new_at_latest(
         provider.clone(),
         block_number,
         now_secs,
@@ -890,6 +1041,20 @@ fn run_backrun_validation(
             return None;
         }
     };
+
+    // Inject the long-lived pre-warmed snapshot built by the refresher
+    // task. Without this each shadow-sim starts with an empty `CacheDB`
+    // → ~10-20 cold upstream-RPC round-trips per V2 swap (bytecode +
+    // slot 8). With it, tracked-pool bytecode + V2 reserve slots are
+    // served from the in-memory cache and only unknown addresses
+    // (router state, ERC20 balances/allowances) hit the network.
+    let warm_guard = cfg.mempool_prewarm.load();
+    if let Some(warm) = warm_guard.as_ref() {
+        warm.inject_into(&mut state);
+        metrics.inc_mempool_prewarm_hit();
+    } else {
+        metrics.inc_mempool_prewarm_miss();
+    }
 
     let victim = VictimTx {
         from: event.from,
@@ -1532,6 +1697,7 @@ mod tests {
             input_amount_wei: U256::ZERO,
             sim_semaphore: Arc::new(Semaphore::new(1)),
             provider: None,
+            mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 
@@ -1583,6 +1749,80 @@ mod tests {
                 "{proto:?} must bump unimplemented_protocol"
             );
         }
+    }
+
+    #[test]
+    fn sim_context_mempool_prewarm_arcswap_round_trips() {
+        use aether_simulator::fork::PrewarmedState;
+
+        let ctx = empty_sim_ctx();
+        // Starts empty until the background refresher lands its first
+        // snapshot — validator path counts a `prewarm_miss` in this state.
+        assert!(ctx.mempool_prewarm.load().is_none());
+
+        let warm = Arc::new(PrewarmedState::default());
+        ctx.mempool_prewarm
+            .store(Arc::new(Some(Arc::clone(&warm))));
+        let loaded = ctx.mempool_prewarm.load();
+        assert!(loaded.is_some());
+        // Round-trip pointer-equality: same Arc instance came back out.
+        assert!(Arc::ptr_eq(loaded.as_ref().as_ref().unwrap(), &warm));
+    }
+
+    #[test]
+    fn with_backrun_validator_shares_prewarm_handle() {
+        use aether_simulator::fork::PrewarmedState;
+        use std::str::FromStr;
+
+        let ctx_inner = {
+            use crate::mempool_writer::NoopMempoolSink;
+            use aether_pools::new_pool_state_cache;
+            use aether_state::price_graph::PriceGraph;
+            SimContext::new(
+                Arc::new(ArcSwap::from_pointee(HashMap::<Address, PoolMetadata>::new())),
+                Arc::new(ArcSwap::from_pointee(TokenIndex::default())),
+                Arc::new(SnapshotManager::new(PriceGraph::new(0))),
+                BellmanFord::new(3, 1_000),
+                new_pool_state_cache(),
+                Arc::new(NoopMempoolSink::new()),
+                None,
+            )
+        };
+
+        // `cfg` arrives with a fresh independent ArcSwap (as if built by
+        // `build_backrun_validator_config_from_env`); `with_backrun_validator`
+        // must overwrite it with the SimContext's shared handle so the
+        // refresher and the validator rotate the same snapshot.
+        let cfg = BackrunValidatorConfig {
+            executor_address: Address::from_str("0x00000000000000000000000000000000000000aa").unwrap(),
+            searcher_caller: Address::ZERO,
+            profit_token: Address::ZERO,
+            balance_slot: U256::ZERO,
+            chain_id: 1,
+            min_profit_wei: U256::ZERO,
+            input_amount_wei: U256::ZERO,
+            sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            provider: None,
+            mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
+        };
+
+        let shared_handle = Arc::clone(&ctx_inner.mempool_prewarm);
+        let ctx_inner = ctx_inner.with_backrun_validator(cfg);
+
+        let cfg_handle = Arc::clone(
+            &ctx_inner
+                .backrun
+                .as_ref()
+                .expect("backrun cfg installed")
+                .mempool_prewarm,
+        );
+        assert!(Arc::ptr_eq(&cfg_handle, &shared_handle));
+
+        // Refresher stores → validator-side load sees it.
+        ctx_inner
+            .mempool_prewarm
+            .store(Arc::new(Some(Arc::new(PrewarmedState::default()))));
+        assert!(cfg_handle.load().is_some());
     }
 
     #[test]
