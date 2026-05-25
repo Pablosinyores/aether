@@ -196,6 +196,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "AETHER_EXECUTOR_ADDRESS not set — mempool-backrun revm validator disabled"
                 );
             }
+            // Post-state replay fallback for V3 swaps the analytical
+            // predictor cannot settle. Opt-in via env so the dormant
+            // behaviour from develop is preserved until an operator
+            // enables it deliberately.
+            let replay_enabled = std::env::var("MEMPOOL_POST_STATE_REPLAY")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            sim_ctx_inner = sim_ctx_inner.with_post_state_replay(replay_enabled);
+            if replay_enabled {
+                info!(
+                    "MEMPOOL_POST_STATE_REPLAY enabled — V3 tick-crossing swaps will escalate to revm fork-replay"
+                );
+            }
             let sim_ctx = Arc::new(sim_ctx_inner);
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),

@@ -29,11 +29,14 @@ use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::opportunity::DetectedCycle;
 use aether_ingestion::subscription::{EventChannels, PendingTxEvent};
 use aether_pools::router_decoder::{decode_pending, DecodeError, DecodedSwap, Protocol};
-use aether_pools::{predict_post_state_with_fallback, PoolStateCache, UnifiedPostState};
+use aether_pools::{
+    predict_post_state_with_replay, PoolStateCache, ReplayProtocol, UnifiedPostState,
+};
 use aether_simulator::calldata::build_execute_arb_calldata;
 use aether_simulator::mempool_backrun::{
     validate_backrun_rpc, ArbTx, RejectReason, ValidatorParams, VictimTx,
 };
+use aether_simulator::post_state_replay::{replay_v3_post_state_rpc, ReplayParams};
 use aether_state::price_graph::PriceGraph;
 use aether_state::snapshot::SnapshotManager;
 use aether_state::token_index::TokenIndex;
@@ -144,6 +147,16 @@ pub struct SimContext {
     /// swaps under the same registry generation lookup in O(1). The Mutex
     /// guards rebuild only — the steady-state path is `lock + ptr_eq + read`.
     pair_index_cache: Mutex<Option<(usize, Arc<PairIndex>)>>,
+    /// Enable the revm-backed post-state replay fallback for V3 swaps
+    /// the analytical predictor cannot settle (tick-crossing). When
+    /// `false` (the default and the develop-branch behaviour) escalations
+    /// keep bumping `aether_sim_evm_fallback_total` and skipping the
+    /// candidate, preserving the current production semantics.
+    ///
+    /// Curve and Balancer escalations always skip until their reader
+    /// hooks land in `aether_simulator::post_state_replay` — until then,
+    /// flipping this flag only changes V3 behaviour.
+    pub post_state_replay_enabled: bool,
 }
 
 impl SimContext {
@@ -168,7 +181,18 @@ impl SimContext {
             prediction_sink,
             engine_git_sha,
             pair_index_cache: Mutex::new(None),
+            post_state_replay_enabled: false,
         }
+    }
+
+    /// Flip the revm post-state replay fallback on. Callers should also
+    /// have a [`BackrunValidatorConfig`] attached with a populated
+    /// `provider` — without one the V3 replay path stays dormant and
+    /// every escalation counts as `unimplemented_protocol` because the
+    /// provider check short-circuits before the EVM fork is built.
+    pub fn with_post_state_replay(mut self, enabled: bool) -> Self {
+        self.post_state_replay_enabled = enabled;
+        self
     }
 
     /// Attach the validated-arb broadcast sender so the revm validator can
@@ -543,11 +567,12 @@ fn try_post_state_scan(
                 metrics.inc_pending_arb_sim_skipped("pool_state_missing");
                 return;
             };
-            let post = predict_post_state_with_fallback(
+            let post = predict_post_state_with_replay(
                 &state_arc,
                 swap.token_in,
                 swap.amount_in,
                 |reason| metrics.inc_sim_evm_fallback(reason),
+                |proto| try_post_state_replay(metrics, ctx, proto, pool_addr, event, snapshot.block_number),
             );
             let Some(unified) = post else {
                 metrics.inc_pending_arb_sim_skipped("predictor_low_confidence");
@@ -661,6 +686,116 @@ fn try_post_state_scan(
         best_profit_bps = (profitable[0].profit_factor() * 10_000.0) as i64,
         "MEMPOOL ARB CANDIDATE"
     );
+}
+
+/// Try the revm-backed post-state replay fallback for a pending swap
+/// whose analytical predictor returned a low-confidence flag.
+///
+/// Returns `Some(UnifiedPostState)` when the replay produced a usable
+/// post-state, `None` otherwise (replay dormant, provider unavailable,
+/// victim reverted, unimplemented protocol, etc.). All outcomes bump
+/// `aether_mempool_post_state_replay_total{outcome}` and observe the
+/// per-attempt latency on
+/// `aether_mempool_post_state_replay_latency_ms` so dashboards can
+/// decompose the analytical-vs-revm path mix without re-parsing logs.
+///
+/// Concurrency is bounded by the same semaphore the backrun validator
+/// uses — saturating it bumps `unimplemented_protocol` so the caller
+/// path stays consistent with other no-op exits. Curve and Balancer
+/// always short-circuit to `unimplemented_protocol` until the reader
+/// hooks in `aether_simulator::post_state_replay` land.
+fn try_post_state_replay(
+    metrics: &EngineMetrics,
+    ctx: &SimContext,
+    protocol: ReplayProtocol,
+    pool_addr: Address,
+    event: &PendingTxEvent,
+    block_number: u64,
+) -> Option<UnifiedPostState> {
+    if !ctx.post_state_replay_enabled {
+        metrics.inc_mempool_post_state_replay("unimplemented_protocol");
+        return None;
+    }
+    // Protocol check runs before provider availability so Curve and
+    // Balancer always count as `unimplemented_protocol` regardless of
+    // whether the RPC provider was wired this build. Their replay path
+    // does not exist yet — provider state is irrelevant.
+    if !matches!(protocol, ReplayProtocol::UniswapV3) {
+        metrics.inc_mempool_post_state_replay("unimplemented_protocol");
+        return None;
+    }
+    let cfg = ctx.backrun.as_ref()?;
+    let provider = cfg.provider.as_ref()?;
+    let _permit = match cfg.sim_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            metrics.inc_mempool_post_state_replay("sim_error");
+            return None;
+        }
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let state = match aether_simulator::fork::RpcForkedState::new_at_latest(
+        provider.clone(),
+        block_number,
+        now_secs,
+        1_000_000_000,
+    ) {
+        Some(s) => s,
+        None => {
+            metrics.inc_mempool_post_state_replay("sim_error");
+            return None;
+        }
+    };
+    let victim = VictimTx {
+        from: event.from,
+        to: event.to?,
+        value: event.value,
+        data: event.input.clone(),
+        gas_price: event.gas_price,
+        gas_limit: 1_000_000,
+    };
+    let params = ReplayParams {
+        block_number,
+        block_timestamp: now_secs,
+        base_fee: 1_000_000_000,
+        chain_id: cfg.chain_id,
+    };
+    let started = Instant::now();
+    let outcome = replay_v3_post_state_rpc(state, &victim, pool_addr, &params);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    metrics.observe_mempool_post_state_replay_latency_ms(elapsed_ms);
+    match outcome {
+        Ok(post) => {
+            metrics.inc_mempool_post_state_replay("success");
+            debug!(
+                target: "aether::mempool",
+                tx_hash = %event.tx_hash,
+                pool = %pool_addr,
+                elapsed_ms,
+                "POST-STATE REPLAY succeeded"
+            );
+            Some(UnifiedPostState::UniswapV3(post))
+        }
+        Err(err) => {
+            metrics.inc_mempool_post_state_replay(err.as_str());
+            debug!(
+                target: "aether::mempool",
+                tx_hash = %event.tx_hash,
+                pool = %pool_addr,
+                reason = err.as_str(),
+                elapsed_ms,
+                "POST-STATE REPLAY failed"
+            );
+            // Treat any non-success outcome — including ReplayError variants we
+            // already mapped — as no-replay so the caller short-circuits the
+            // candidate the same way it would have before this PR.
+            let _ = err;
+            None
+        }
+    }
 }
 
 /// Orchestrate the revm validator for one profitable cycle and publish a
@@ -1345,6 +1480,109 @@ mod tests {
         assert_eq!(filtered_count(&metrics, "not_in_registry"), 2);
         assert_eq!(filtered_count(&metrics, "same_token"), 0);
         assert_eq!(filtered_count(&metrics, "zero_amount"), 0);
+    }
+
+    fn fake_pending_event(to: Address) -> PendingTxEvent {
+        PendingTxEvent {
+            tx_hash: B256::ZERO,
+            from: Address::ZERO,
+            to: Some(to),
+            value: U256::ZERO,
+            input: vec![],
+            gas_price: 0,
+            first_seen_unix_nanos: 0,
+        }
+    }
+
+    #[test]
+    fn try_post_state_replay_dormant_when_flag_disabled() {
+        let metrics = EngineMetrics::new();
+        let ctx = empty_sim_ctx();
+        assert!(!ctx.post_state_replay_enabled);
+        let result = try_post_state_replay(
+            &metrics,
+            &ctx,
+            ReplayProtocol::UniswapV3,
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            &fake_pending_event(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")),
+            18_000_000,
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            metrics.mempool_post_state_replay_count("unimplemented_protocol"),
+            1
+        );
+        assert_eq!(metrics.mempool_post_state_replay_count("success"), 0);
+    }
+
+    fn unwrap_empty_sim_ctx() -> SimContext {
+        Arc::try_unwrap(empty_sim_ctx())
+            .ok()
+            .expect("single Arc owner")
+    }
+
+    fn dummy_backrun_cfg() -> BackrunValidatorConfig {
+        BackrunValidatorConfig {
+            executor_address: Address::ZERO,
+            searcher_caller: Address::ZERO,
+            profit_token: Address::ZERO,
+            balance_slot: U256::ZERO,
+            chain_id: 1,
+            min_profit_wei: U256::ZERO,
+            input_amount_wei: U256::ZERO,
+            sim_semaphore: Arc::new(Semaphore::new(1)),
+            provider: None,
+        }
+    }
+
+    #[test]
+    fn try_post_state_replay_dormant_when_backrun_unconfigured() {
+        let metrics = EngineMetrics::new();
+        // Flag flipped on, but no BackrunValidatorConfig attached — the
+        // function short-circuits at `cfg = ctx.backrun.as_ref()?`
+        // without bumping success and without panicking.
+        let ctx = Arc::new(unwrap_empty_sim_ctx().with_post_state_replay(true));
+        let before = metrics.mempool_post_state_replay_count("success");
+        let result = try_post_state_replay(
+            &metrics,
+            &ctx,
+            ReplayProtocol::UniswapV3,
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            &fake_pending_event(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")),
+            18_000_000,
+        );
+        assert!(result.is_none());
+        assert_eq!(metrics.mempool_post_state_replay_count("success"), before);
+    }
+
+    #[test]
+    fn try_post_state_replay_curve_balancer_short_circuit_as_unimplemented() {
+        let metrics = EngineMetrics::new();
+        // BackrunValidatorConfig with no provider — passes the
+        // `cfg = ctx.backrun.as_ref()?` line so the protocol dispatch
+        // is reached.
+        let ctx = Arc::new(
+            unwrap_empty_sim_ctx()
+                .with_backrun_validator(dummy_backrun_cfg())
+                .with_post_state_replay(true),
+        );
+        for proto in [ReplayProtocol::Curve, ReplayProtocol::Balancer] {
+            let before = metrics.mempool_post_state_replay_count("unimplemented_protocol");
+            let result = try_post_state_replay(
+                &metrics,
+                &ctx,
+                proto,
+                address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+                &fake_pending_event(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")),
+                18_000_000,
+            );
+            assert!(result.is_none());
+            assert_eq!(
+                metrics.mempool_post_state_replay_count("unimplemented_protocol"),
+                before + 1,
+                "{proto:?} must bump unimplemented_protocol"
+            );
+        }
     }
 
     #[test]
