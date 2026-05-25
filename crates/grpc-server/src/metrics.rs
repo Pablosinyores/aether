@@ -139,6 +139,31 @@ pub struct EngineMetrics {
     ///   - `unstamped` — pending tx arrived with `first_seen_unix_nanos
     ///     == 0` (test fixture or upstream regression) and was skipped
     mempool_first_seen_events_total: IntCounterVec,
+    /// Outcome counter for the post-state revm replay fallback. Bumped
+    /// once per replay attempt. Sits one layer below
+    /// `sim_evm_fallback_total`: the fallback metric records *why* the
+    /// analytical predictor escalated, while this one records what the
+    /// EVM fork-replay was able to do with the escalation.
+    ///
+    /// Stable label set:
+    ///   - `success` — replay produced a usable `V3PostState`
+    ///   - `victim_reverted` — victim tx reverted on the fork
+    ///   - `victim_halted` — victim hit revm `Halt` (OOG, invalid opcode)
+    ///   - `read_call_failed` — `slot0()` / `liquidity()` view call failed
+    ///     post-victim (pool address has no bytecode, or returned a revert)
+    ///   - `decode_failed` — view call succeeded but ABI decode of the
+    ///     return tuple failed (corrupt pool or unexpected ABI shape)
+    ///   - `sim_error` — non-revert / non-halt revm error (likely AlloyDB
+    ///     RPC failure mid-execution)
+    ///   - `unimplemented_protocol` — replayer invoked for Curve or
+    ///     Balancer, which have not yet landed their view-call shapes
+    ///   - `timeout` — replay wall-clock exceeded the configured budget
+    mempool_post_state_replay_total: IntCounterVec,
+    /// Wall-clock latency of post-state replay attempts. Captures both
+    /// success and failure paths so the tail behaviour is visible — a
+    /// replay that hits an RPC stall on a cold storage slot looks very
+    /// different from one served entirely from the warm `CacheDB`.
+    mempool_post_state_replay_latency_ms: Histogram,
 }
 
 impl EngineMetrics {
@@ -302,6 +327,24 @@ impl EngineMetrics {
             &["event"],
         )
         .expect("aether_mempool_first_seen_events_total counter vec");
+        let mempool_post_state_replay_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_post_state_replay_total",
+                "Outcomes of the revm post-state replay fallback, by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("aether_mempool_post_state_replay_total counter vec");
+        let mempool_post_state_replay_latency_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_mempool_post_state_replay_latency_ms",
+                "Wall-clock latency of post-state replay attempts, ms",
+            )
+            .buckets(vec![
+                1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0,
+            ]),
+        )
+        .expect("aether_mempool_post_state_replay_latency_ms histogram");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -366,6 +409,13 @@ impl EngineMetrics {
         registry
             .register(Box::new(mempool_first_seen_events_total.clone()))
             .expect("register aether_mempool_first_seen_events_total");
+        registry
+            .register(Box::new(mempool_post_state_replay_total.clone()))
+            .expect("register aether_mempool_post_state_replay_total");
+        registry
+            .register(Box::new(mempool_post_state_replay_latency_ms.clone()))
+            .expect("register aether_mempool_post_state_replay_latency_ms");
+
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
             "recorded",
@@ -375,6 +425,24 @@ impl EngineMetrics {
             "unstamped",
         ] {
             mempool_first_seen_events_total.with_label_values(&[ev]);
+        }
+
+        // Pre-touch every outcome label so dashboards see a zero series
+        // before the first replay rather than a missing one. Keeps panels
+        // stable across cold starts.
+        for outcome in [
+            "success",
+            "victim_reverted",
+            "victim_halted",
+            "read_call_failed",
+            "decode_failed",
+            "sim_error",
+            "unimplemented_protocol",
+            "timeout",
+        ] {
+            mempool_post_state_replay_total
+                .with_label_values(&[outcome])
+                .reset();
         }
 
         Self {
@@ -400,6 +468,8 @@ impl EngineMetrics {
             mempool_backrun_sim_concurrent,
             mempool_first_seen_to_inclusion_ms,
             mempool_first_seen_events_total,
+            mempool_post_state_replay_total,
+            mempool_post_state_replay_latency_ms,
         }
     }
 
@@ -418,6 +488,31 @@ impl EngineMetrics {
             .with_label_values(&[event])
             .inc();
     }
+
+    /// Bump `aether_mempool_post_state_replay_total{outcome="..."}`. The
+    /// caller picks from the pre-touched label set documented on the
+    /// field — any other string still records but breaks dashboards.
+    pub fn inc_mempool_post_state_replay(&self, outcome: &str) {
+        self.mempool_post_state_replay_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    /// Read the current value of
+    /// `aether_mempool_post_state_replay_total{outcome}`. Public so tests
+    /// can assert replay outcomes without re-implementing Prometheus
+    /// text parsing.
+    pub fn mempool_post_state_replay_count(&self, outcome: &str) -> u64 {
+        self.mempool_post_state_replay_total
+            .with_label_values(&[outcome])
+            .get()
+    }
+
+    /// Observe one replay's wall-clock latency in milliseconds.
+    pub fn observe_mempool_post_state_replay_latency_ms(&self, ms: f64) {
+        self.mempool_post_state_replay_latency_ms.observe(ms);
+    }
+
 
     pub fn observe_detection_latency_us(&self, us: u128) {
         let ms = us as f64 / 1000.0;
