@@ -203,7 +203,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(sim_ctx),
                 shutdown_rx.clone(),
             );
-            Some((source_handle, pipeline_handle))
+            // First-seen → inclusion latency tracker. Pure observability —
+            // listens on the same broadcast channels, never publishes
+            // anything outward. Spawned alongside the mempool pipeline so
+            // its lifecycle matches `MEMPOOL_TRACKING=1`.
+            let first_seen_handle = aether_grpc_server::first_seen_tracker::spawn_first_seen_tracker(
+                Arc::clone(engine.event_channels()),
+                Arc::clone(&metrics),
+                shutdown_rx.clone(),
+            );
+            Some((source_handle, pipeline_handle, first_seen_handle))
         }
     } else {
         None
@@ -288,12 +297,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!(error = %e, "Provider task panicked");
     }
 
-    if let Some((source_handle, pipeline_handle)) = mempool_handles {
+    if let Some((source_handle, pipeline_handle, first_seen_handle)) = mempool_handles {
         if let Err(e) = source_handle.await {
             error!(error = %e, "Mempool source task panicked");
         }
         if let Err(e) = pipeline_handle.await {
             error!(error = %e, "Mempool pipeline task panicked");
+        }
+        if let Err(e) = first_seen_handle.await {
+            error!(error = %e, "First-seen tracker task panicked");
         }
     }
 

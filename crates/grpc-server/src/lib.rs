@@ -6,6 +6,7 @@
 /// crate-private; only the two types the binary and integration tests
 /// actually need are re-exported publicly.
 pub mod cycle_gating;
+pub mod first_seen_tracker;
 pub mod historical;
 pub(crate) mod metrics;
 pub mod profitability_writer;

@@ -117,6 +117,28 @@ pub struct EngineMetrics {
     /// `AETHER_MEMPOOL_SIM_CONCURRENCY` semaphore; exposed so dashboards can
     /// alert on saturation (gauge at ceiling = victims being dropped).
     mempool_backrun_sim_concurrent: IntGauge,
+    /// Wall-clock delta between when this process first saw a pending tx
+    /// (`PendingTxEvent::first_seen_unix_nanos` stamp at the ingestion
+    /// boundary) and when that tx landed on chain (observed via
+    /// `NewBlockEvent::tx_hashes`). Lower is better — measures how far
+    /// behind block-builder mempool visibility we run. Tail latency
+    /// (p95, p99) is the operational signal; sustained p99 > 1s means
+    /// our gossip path is laggy vs. builders.
+    mempool_first_seen_to_inclusion_ms: Histogram,
+    /// Tracker-side bookkeeping so dashboards can sanity-check the
+    /// histogram before reading deltas from it.
+    ///
+    /// Stable label set:
+    ///   - `recorded` — pending tx stamped + inserted into the tracker
+    ///   - `evicted_capacity` — oldest entry dropped to honour the
+    ///     bounded-LRU capacity ceiling
+    ///   - `matched` — block tx hash hit a tracked entry and produced a
+    ///     histogram observation
+    ///   - `unmatched` — block tx hash with no tracker entry (either
+    ///     pre-tracker-start, private flow, or evicted before inclusion)
+    ///   - `unstamped` — pending tx arrived with `first_seen_unix_nanos
+    ///     == 0` (test fixture or upstream regression) and was skipped
+    mempool_first_seen_events_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -258,6 +280,28 @@ impl EngineMetrics {
             "In-flight mempool-backrun validation sims, bounded by the semaphore",
         )
         .expect("aether_mempool_backrun_sim_concurrent gauge");
+        let mempool_first_seen_to_inclusion_ms = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_mempool_first_seen_to_inclusion_ms",
+                "Wall-clock ms from local first-seen of a pending tx to its on-chain inclusion",
+            )
+            // Cover sub-block (<12 s) and "we were way behind" tails. Buckets
+            // hand-picked so the histogram is meaningful with as few as 200
+            // samples — production traffic fills it in seconds.
+            .buckets(vec![
+                50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
+                60_000.0,
+            ]),
+        )
+        .expect("aether_mempool_first_seen_to_inclusion_ms histogram");
+        let mempool_first_seen_events_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_first_seen_events_total",
+                "Tracker events for the mempool first-seen → inclusion histogram, by event kind",
+            ),
+            &["event"],
+        )
+        .expect("aether_mempool_first_seen_events_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -316,6 +360,22 @@ impl EngineMetrics {
         registry
             .register(Box::new(mempool_backrun_sim_concurrent.clone()))
             .expect("register aether_mempool_backrun_sim_concurrent");
+        registry
+            .register(Box::new(mempool_first_seen_to_inclusion_ms.clone()))
+            .expect("register aether_mempool_first_seen_to_inclusion_ms");
+        registry
+            .register(Box::new(mempool_first_seen_events_total.clone()))
+            .expect("register aether_mempool_first_seen_events_total");
+        // Pre-touch every label so dashboards see zero rows from boot.
+        for ev in &[
+            "recorded",
+            "evicted_capacity",
+            "matched",
+            "unmatched",
+            "unstamped",
+        ] {
+            mempool_first_seen_events_total.with_label_values(&[ev]);
+        }
 
         Self {
             registry,
@@ -338,7 +398,25 @@ impl EngineMetrics {
             mempool_backrun_validated_total,
             mempool_backrun_rejected_total,
             mempool_backrun_sim_concurrent,
+            mempool_first_seen_to_inclusion_ms,
+            mempool_first_seen_events_total,
         }
+    }
+
+    /// Observe a successful first-seen → inclusion latency in ms.
+    /// Caller is the [`first_seen_tracker`] block-side hook; do not call
+    /// directly from random sites — the tracker enforces the "stamp was
+    /// real, delta is positive" invariants.
+    pub fn observe_mempool_first_seen_to_inclusion_ms(&self, ms: f64) {
+        self.mempool_first_seen_to_inclusion_ms.observe(ms);
+    }
+
+    /// Bump `aether_mempool_first_seen_events_total{event="..."}`. See the
+    /// struct field doc for the stable label set.
+    pub fn inc_mempool_first_seen_event(&self, event: &str) {
+        self.mempool_first_seen_events_total
+            .with_label_values(&[event])
+            .inc();
     }
 
     pub fn observe_detection_latency_us(&self, us: u128) {
