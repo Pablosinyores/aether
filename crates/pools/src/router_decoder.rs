@@ -23,8 +23,18 @@
 //!   reliable hits in the testing scaffold.
 //! - 1inch v6 AggregationRouter — multi-encoded calldata; deferred so the
 //!   `decode_failure` counter can quantify the gap before we invest.
-//! - `multicall` / `execute` wrappers (UniV3 SwapRouter `multicall`) —
-//!   handled in a follow-up that recursively peels nested calldata.
+//!
+//! ## Multicall (UniV3 SwapRouter / SwapRouter02)
+//!
+//! Both the original `multicall(bytes[])` (selector `0xac9650d8`) and the
+//! deadline-prefixed `multicall(uint256,bytes[])` (selector `0x5ae401dc`)
+//! peel each inner call through [`decode_pending_many`] and emit one
+//! [`DecodedSwap`] per recognised inner selector. Inner non-swap helpers
+//! (`selfPermit*`, `unwrapWETH9`, `refundETH`, `sweepToken*`) are intentionally
+//! ignored — they're legal payload but don't move pool state. Recursion
+//! depth is capped at [`MAX_MULTICALL_DEPTH`] (2) so a hostile nested
+//! `multicall(multicall(...))` cannot blow the stack or quadratically
+//! expand decode work on the hot path.
 //!
 //! Every decoded swap is paired with a [`Protocol`] tag so downstream
 //! simulators can route to the right post-state computation.
@@ -212,10 +222,75 @@ sol! {
             uint256 amountIn;
             uint256 amountOutMinimum;
         }
+        struct ExactOutputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint24 fee;
+            address recipient;
+            uint256 deadline;
+            uint256 amountOut;
+            uint256 amountInMaximum;
+            uint160 sqrtPriceLimitX96;
+        }
+        struct ExactOutputSingleParams02 {
+            address tokenIn;
+            address tokenOut;
+            uint24 fee;
+            address recipient;
+            uint256 amountOut;
+            uint256 amountInMaximum;
+            uint160 sqrtPriceLimitX96;
+        }
+        struct ExactOutputParams {
+            bytes path;
+            address recipient;
+            uint256 deadline;
+            uint256 amountOut;
+            uint256 amountInMaximum;
+        }
+        struct ExactOutputParams02 {
+            bytes path;
+            address recipient;
+            uint256 amountOut;
+            uint256 amountInMaximum;
+        }
         function exactInputSingle(ExactInputSingleParams params) external payable returns (uint256);
         function exactInputSingle02(ExactInputSingleParams02 params) external payable returns (uint256);
         function exactInput(ExactInputParams params) external payable returns (uint256);
         function exactInput02(ExactInputParams02 params) external payable returns (uint256);
+        function exactOutputSingle(ExactOutputSingleParams params) external payable returns (uint256);
+        function exactOutputSingle02(ExactOutputSingleParams02 params) external payable returns (uint256);
+        function exactOutput(ExactOutputParams params) external payable returns (uint256);
+        function exactOutput02(ExactOutputParams02 params) external payable returns (uint256);
+
+        /// Non-swap helpers that legally appear inside `multicall(bytes[])`
+        /// payloads. We only need their selectors so the inner-call
+        /// dispatcher can skip them without bumping `unknown_selector` for
+        /// otherwise well-formed multicalls. Bodies are intentionally
+        /// minimal — we never decode the args.
+        function selfPermit(address token, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external payable;
+        function selfPermitAllowed(address token, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external payable;
+        function selfPermitIfNecessary(address token, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external payable;
+        function selfPermitAllowedIfNecessary(address token, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external payable;
+        function unwrapWETH9(uint256 amountMinimum, address recipient) external payable;
+        function unwrapWETH9WithFee(uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) external payable;
+        function refundETH() external payable;
+        function sweepToken(address token, uint256 amountMinimum, address recipient) external payable;
+        function sweepTokenWithFee(address token, uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) external payable;
+    }
+
+    /// UniV3 SwapRouter / SwapRouter02 multicall flavours. Split into two
+    /// single-method interfaces because both Solidity functions are named
+    /// `multicall` (the selector differs only in the prepended `deadline`
+    /// arg); splitting keeps the generated Rust types unambiguous and lets
+    /// each selector's dispatch line stay one-liner.
+    #[allow(missing_docs)]
+    interface IUniswapV3Multicall {
+        function multicall(bytes[] data) external payable returns (bytes[]);
+    }
+    #[allow(missing_docs)]
+    interface IUniswapV3MulticallDeadline {
+        function multicall(uint256 deadline, bytes[] data) external payable returns (bytes[]);
     }
 
     /// Curve StableSwap pool — direct `exchange()` on the pool address.
@@ -270,12 +345,28 @@ sol! {
     }
 }
 
+/// Maximum recursion depth for `multicall(bytes[])` peeling.
+///
+/// Two is enough to cover every shape seen on mainnet (router-level
+/// multicall around per-hop `exactInput*` calls; occasional `multicall`
+/// nested one level under another). A hostile sender could otherwise
+/// chain `multicall(multicall(multicall(...)))` to amplify decode work
+/// quadratically per pending tx; capping the depth keeps the per-event
+/// budget bounded.
+pub const MAX_MULTICALL_DEPTH: usize = 2;
+
 /// Decode a pending tx's `(to, calldata)` into a [`DecodedSwap`].
 ///
 /// `to` is required: anonymous calls (contract creation) always return
 /// [`DecodeError::TooShort`]. The caller is expected to filter by router
 /// address before calling — this function does not validate that the `to`
 /// matches a known router; it only consumes the selector + payload.
+///
+/// **Single-swap entry point.** Callers that need to peel UniV3
+/// `multicall(bytes[])` bundles should use [`decode_pending_many`]; this
+/// function returns [`DecodeError::UnknownSelector`] for the two multicall
+/// selectors so existing call sites keep their previous semantics. The
+/// multicall dispatch is documented in the [module docs](self).
 pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, DecodeError> {
     if calldata.len() < 4 {
         return Err(DecodeError::TooShort);
@@ -289,28 +380,171 @@ pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, Decod
     }
     let selector: [u8; 4] = calldata[0..4].try_into().expect("4 bytes by check above");
 
-    // ── UniV2 / Sushi family ──
-    if let Some(swap) = try_uni_v2_family(selector, calldata, to)? {
-        return Ok(swap);
-    }
-    // ── UniV3 SwapRouter / SwapRouter02 ──
-    if let Some(swap) = try_uni_v3_family(selector, calldata, to)? {
-        return Ok(swap);
-    }
-    // ── Balancer V2 Vault ──
-    if let Some(swap) = try_balancer(selector, calldata, to)? {
-        return Ok(swap);
-    }
-    // ── Curve StableSwap pool-direct exchange() ──
-    if let Some(swap) = try_curve(selector, calldata, to)? {
-        return Ok(swap);
-    }
-    // ── Bancor V3 BancorNetwork ──
-    if let Some(swap) = try_bancor(selector, calldata, to)? {
+    if let Some(swap) = try_decode_single(selector, calldata, to)? {
         return Ok(swap);
     }
 
     Err(DecodeError::UnknownSelector { selector })
+}
+
+/// Decode a pending tx's `(to, calldata)` into one or more [`DecodedSwap`]
+/// records.
+///
+/// Behaves identically to [`decode_pending`] for single-swap selectors
+/// (`exactInputSingle`, `swapExactTokensForTokens`, etc.) — returns a
+/// one-element vector wrapping the same `DecodedSwap`. For UniV3
+/// `multicall(bytes[])` (selector `0xac9650d8`) and
+/// `multicall(uint256, bytes[])` (selector `0x5ae401dc`), peels each
+/// inner call and emits one record per recognised swap selector. Inner
+/// non-swap helpers (`selfPermit*`, `unwrapWETH9*`, `refundETH`,
+/// `sweepToken*`) are intentionally ignored — they're legal inside
+/// multicall but don't change pool state.
+///
+/// Recursion depth is capped at [`MAX_MULTICALL_DEPTH`]; nested multicalls
+/// past the cap surface as `UnknownSelector` so the metric is bumped and
+/// the engine moves on.
+///
+/// **Error semantics:** an unknown inner selector inside a multicall is
+/// *ignored*, not propagated — the wrapping multicall is a successful
+/// decode even if one inner call was unrecognised. Only outer-level
+/// unknown selectors (no swap at all) produce [`DecodeError::UnknownSelector`].
+/// If the outer call is a multicall but contains zero recognised inner
+/// swaps, returns `Ok(vec![])` so the caller can decide whether to count
+/// it as a decode hit or skip silently.
+pub fn decode_pending_many(
+    to: Address,
+    calldata: &[u8],
+) -> Result<Vec<DecodedSwap>, DecodeError> {
+    if calldata.len() < 4 {
+        return Err(DecodeError::TooShort);
+    }
+    if is_unsupported_curve_router(to) {
+        return Err(DecodeError::CurveUnsupported(to));
+    }
+    decode_at_depth(to, calldata, 0)
+}
+
+/// Recursive worker for [`decode_pending_many`]. The `depth` argument is
+/// incremented every time we step inside a `multicall(bytes[])` payload;
+/// once it reaches [`MAX_MULTICALL_DEPTH`] further nested multicalls are
+/// reported as `UnknownSelector` so they're visible in the metric and the
+/// recursion can't blow the stack.
+fn decode_at_depth(
+    to: Address,
+    calldata: &[u8],
+    depth: usize,
+) -> Result<Vec<DecodedSwap>, DecodeError> {
+    if calldata.len() < 4 {
+        return Err(DecodeError::TooShort);
+    }
+    let selector: [u8; 4] = calldata[0..4].try_into().expect("4 bytes by check above");
+
+    // ── UniV3 multicall(bytes[]) and multicall(uint256, bytes[]) ──
+    if depth < MAX_MULTICALL_DEPTH {
+        if let Some(inner_calls) = try_extract_multicall(selector, calldata)? {
+            let mut out: Vec<DecodedSwap> = Vec::with_capacity(inner_calls.len());
+            for inner in inner_calls {
+                // Inner calls inherit the outer multicall's `to` (the
+                // SwapRouter), which is exactly what the per-hop swap
+                // semantics expect — the recipient/router address stays
+                // the same as if the user had called the inner method
+                // directly.
+                if inner.len() < 4 {
+                    // Empty / truncated inner call — skip without erroring.
+                    // Multicall payloads occasionally include zero-byte
+                    // padding entries; treating those as decode failures
+                    // would distort the unknown_selector metric.
+                    continue;
+                }
+                match decode_at_depth(to, &inner, depth + 1) {
+                    Ok(mut swaps) => out.append(&mut swaps),
+                    // Inner-call decode failures are intentionally swallowed:
+                    // legal multicall payloads include non-swap helpers
+                    // (selfPermit, unwrapWETH9, refundETH, sweepToken) plus
+                    // anything we haven't taught the decoder yet. Surfacing
+                    // those as outer errors would mislabel real-world UniV3
+                    // multicall traffic as broken. The cap depth check
+                    // above prevents an attacker from amplifying decode
+                    // work via nested multicalls.
+                    Err(_) => continue,
+                }
+            }
+            return Ok(out);
+        }
+    }
+
+    if let Some(swap) = try_decode_single(selector, calldata, to)? {
+        return Ok(vec![swap]);
+    }
+    if try_is_known_non_swap_helper(selector) {
+        // Legal inside multicall, no swap to emit.
+        return Ok(vec![]);
+    }
+    Err(DecodeError::UnknownSelector { selector })
+}
+
+/// Try every single-call decoder family. Returns `None` when no family
+/// claims the selector; returns `Ok(Some(_))` on success and propagates
+/// ABI-level errors via `Err(...)`.
+fn try_decode_single(
+    selector: [u8; 4],
+    calldata: &[u8],
+    to: Address,
+) -> Result<Option<DecodedSwap>, DecodeError> {
+    if let Some(swap) = try_uni_v2_family(selector, calldata, to)? {
+        return Ok(Some(swap));
+    }
+    if let Some(swap) = try_uni_v3_family(selector, calldata, to)? {
+        return Ok(Some(swap));
+    }
+    if let Some(swap) = try_balancer(selector, calldata, to)? {
+        return Ok(Some(swap));
+    }
+    if let Some(swap) = try_curve(selector, calldata, to)? {
+        return Ok(Some(swap));
+    }
+    if let Some(swap) = try_bancor(selector, calldata, to)? {
+        return Ok(Some(swap));
+    }
+    Ok(None)
+}
+
+/// Detect a UniV3 multicall selector and return the inner `bytes[]` array.
+/// Returns `Ok(None)` when the selector isn't a multicall — caller falls
+/// through to single-swap decoding.
+fn try_extract_multicall(
+    selector: [u8; 4],
+    calldata: &[u8],
+) -> Result<Option<Vec<Vec<u8>>>, DecodeError> {
+    if selector == IUniswapV3Multicall::multicallCall::SELECTOR {
+        let c = IUniswapV3Multicall::multicallCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(c.data.into_iter().map(|b| b.to_vec()).collect()));
+    }
+    if selector == IUniswapV3MulticallDeadline::multicallCall::SELECTOR {
+        let c = IUniswapV3MulticallDeadline::multicallCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(c.data.into_iter().map(|b| b.to_vec()).collect()));
+    }
+    Ok(None)
+}
+
+/// Recognise an inner-call selector that's legal inside a UniV3 multicall
+/// but doesn't move pool state (`selfPermit*`, `unwrapWETH9*`, `refundETH`,
+/// `sweepToken*`). Returning `true` here lets the multicall dispatcher
+/// silently skip the helper instead of bumping `unknown_selector` for a
+/// well-formed payload.
+fn try_is_known_non_swap_helper(selector: [u8; 4]) -> bool {
+    use IUniswapV3Router::*;
+    selector == selfPermitCall::SELECTOR
+        || selector == selfPermitAllowedCall::SELECTOR
+        || selector == selfPermitIfNecessaryCall::SELECTOR
+        || selector == selfPermitAllowedIfNecessaryCall::SELECTOR
+        || selector == unwrapWETH9Call::SELECTOR
+        || selector == unwrapWETH9WithFeeCall::SELECTOR
+        || selector == refundETHCall::SELECTOR
+        || selector == sweepTokenCall::SELECTOR
+        || selector == sweepTokenWithFeeCall::SELECTOR
 }
 
 fn try_uni_v2_family(
@@ -520,7 +754,111 @@ fn try_uni_v3_family(
             curve_indices: None,
         }));
     }
+    // ── exact-output flavours ──
+    //
+    // For predictor purposes the amount the user *commits* is the output
+    // amount (`amountOut`), and the per-hop max spend (`amountInMaximum`)
+    // is surfaced as `amount_out_min`. The pre-state simulator can still
+    // reason about the affected pool because `(token_in, token_out)` are
+    // unambiguous; downstream maths that needs `amount_in` directly should
+    // recompute via the V3 quoter (single-call exactOutput is rare on
+    // mainnet — most flow goes through exactInput).
+    if selector == exactOutputSingleCall::SELECTOR {
+        let c = exactOutputSingleCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::UniswapV3,
+            router,
+            token_in: c.params.tokenIn,
+            token_out: c.params.tokenOut,
+            amount_in: c.params.amountOut,
+            amount_out_min: c.params.amountInMaximum,
+            recipient: c.params.recipient,
+            fee_bps: c.params.fee.to::<u32>(),
+            path_extra: vec![],
+            curve_indices: None,
+        }));
+    }
+    if selector == exactOutputSingle02Call::SELECTOR {
+        let c = exactOutputSingle02Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::UniswapV3,
+            router,
+            token_in: c.params.tokenIn,
+            token_out: c.params.tokenOut,
+            amount_in: c.params.amountOut,
+            amount_out_min: c.params.amountInMaximum,
+            recipient: c.params.recipient,
+            fee_bps: c.params.fee.to::<u32>(),
+            path_extra: vec![],
+            curve_indices: None,
+        }));
+    }
+    if selector == exactOutputCall::SELECTOR {
+        let c = exactOutputCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        // exactOutput paths are encoded in reverse: token_out first, then
+        // intermediate tokens, with token_in last. `parse_v3_path` returns
+        // them in encoding order, so for the predictor's `(token_in,
+        // token_out)` semantics we flip the first two.
+        let (path_first, path_second, fee, extras) = parse_v3_path(&c.params.path)?;
+        let (token_in, token_out) = swap_path_first_hop_for_exact_output(path_first, path_second, &extras);
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::UniswapV3,
+            router,
+            token_in,
+            token_out,
+            amount_in: c.params.amountOut,
+            amount_out_min: c.params.amountInMaximum,
+            recipient: c.params.recipient,
+            fee_bps: fee,
+            path_extra: extras,
+            curve_indices: None,
+        }));
+    }
+    if selector == exactOutput02Call::SELECTOR {
+        let c = exactOutput02Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let (path_first, path_second, fee, extras) = parse_v3_path(&c.params.path)?;
+        let (token_in, token_out) = swap_path_first_hop_for_exact_output(path_first, path_second, &extras);
+        return Ok(Some(DecodedSwap {
+            protocol: Protocol::UniswapV3,
+            router,
+            token_in,
+            token_out,
+            amount_in: c.params.amountOut,
+            amount_out_min: c.params.amountInMaximum,
+            recipient: c.params.recipient,
+            fee_bps: fee,
+            path_extra: extras,
+            curve_indices: None,
+        }));
+    }
     Ok(None)
+}
+
+/// Flip the first-hop `(token_in, token_out)` reported by
+/// [`parse_v3_path`] for `exactOutput*` calldata. The V3 path encoding is
+/// the same byte layout (`addr | fee | addr | ...`) but semantically
+/// reversed for exact-output: the first 20 bytes are `tokenOut`. We let
+/// `parse_v3_path` do the byte-walk (so the fee + extras logic stays in
+/// one place) and rebind the labels here.
+///
+/// For single-hop exact-output (no `extras`), the first two parsed
+/// addresses are `(tokenOut, tokenIn)`. For multi-hop, the parsed `extras`
+/// still reads in path order — callers that need the full path can
+/// reconstruct it; the predictor only consumes the affected first hop
+/// from the user's perspective so the swap-token logic is sufficient.
+fn swap_path_first_hop_for_exact_output(
+    path_first: Address,
+    path_second: Address,
+    _extras: &[Address],
+) -> (Address, Address) {
+    // path_first = tokenOut (in encoding order), path_second = next token.
+    // For the affected-pool semantics we want (token_in, token_out) so the
+    // pool registry lookup hits the same canonical pair.
+    (path_second, path_first)
 }
 
 /// Decode a UniV3 packed path: `address(20) | fee(3) | address(20) | fee(3) | ... | address(20)`.
@@ -1017,6 +1355,200 @@ mod tests {
         assert_eq!(decoded.recipient, beneficiary);
         assert_eq!(decoded.fee_bps, 0);
         assert!(decoded.path_extra.is_empty());
+    }
+
+    // ── UniV3 multicall(bytes[]) decoder ──
+
+    /// Helper: build an `exactInputSingle` (deadline flavour) inner call so
+    /// the multicall tests don't need to inline the `sol!` boilerplate at
+    /// every call site.
+    fn build_exact_input_single(
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        recipient: Address,
+    ) -> Vec<u8> {
+        use IUniswapV3Router::{exactInputSingleCall, ExactInputSingleParams};
+        let params = ExactInputSingleParams {
+            tokenIn: token_in,
+            tokenOut: token_out,
+            fee: alloy::primitives::aliases::U24::from(3000),
+            recipient,
+            deadline: U256::from(1u64),
+            amountIn: amount_in,
+            amountOutMinimum: U256::from(1u64),
+            sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
+        };
+        exactInputSingleCall { params }.abi_encode()
+    }
+
+    fn univ3_router() -> Address {
+        address!("E592427A0AEce92De3Edee1F18E0157C05861564")
+    }
+
+    #[test]
+    fn decode_multicall_two_exact_input_single_emits_two_swaps() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+        let recip = address!("000000000000000000000000000000000000dEaD");
+        let inner_a = build_exact_input_single(weth, usdc, U256::from(1_000u64), recip);
+        let inner_b = build_exact_input_single(usdc, dai, U256::from(2_000u64), recip);
+        let calldata = IUniswapV3Multicall::multicallCall {
+            data: vec![inner_a.into(), inner_b.into()],
+        }
+        .abi_encode();
+
+        let swaps = decode_pending_many(univ3_router(), &calldata).expect("multicall decodes");
+        assert_eq!(swaps.len(), 2, "two exactInputSingle calls = two DecodedSwap records");
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV3);
+        assert_eq!(swaps[0].token_in, weth);
+        assert_eq!(swaps[0].token_out, usdc);
+        assert_eq!(swaps[0].amount_in, U256::from(1_000u64));
+        assert_eq!(swaps[1].token_in, usdc);
+        assert_eq!(swaps[1].token_out, dai);
+        assert_eq!(swaps[1].amount_in, U256::from(2_000u64));
+    }
+
+    #[test]
+    fn decode_multicall_with_deadline_variant_also_peels() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let inner = build_exact_input_single(weth, usdc, U256::from(42u64), Address::ZERO);
+        let calldata = IUniswapV3MulticallDeadline::multicallCall {
+            deadline: U256::from(99u64),
+            data: vec![inner.into()],
+        }
+        .abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].amount_in, U256::from(42u64));
+    }
+
+    #[test]
+    fn decode_multicall_one_swap_one_non_swap_helper_emits_one_swap() {
+        use IUniswapV3Router::unwrapWETH9Call;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let inner_swap = build_exact_input_single(weth, usdc, U256::from(1u64), Address::ZERO);
+        let inner_unwrap = unwrapWETH9Call {
+            amountMinimum: U256::ZERO,
+            recipient: Address::ZERO,
+        }
+        .abi_encode();
+        let calldata = IUniswapV3Multicall::multicallCall {
+            data: vec![inner_swap.into(), inner_unwrap.into()],
+        }
+        .abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1, "unwrapWETH9 is ignored, only the swap remains");
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV3);
+    }
+
+    #[test]
+    fn decode_empty_multicall_returns_empty_vec() {
+        let calldata = IUniswapV3Multicall::multicallCall { data: vec![] }.abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &calldata).expect("decode");
+        assert!(swaps.is_empty());
+    }
+
+    #[test]
+    fn decode_multicall_with_unknown_inner_selector_skips_silently() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let good = build_exact_input_single(weth, usdc, U256::from(1u64), Address::ZERO);
+        // Garbage inner: 4-byte selector + 32 bytes payload.
+        let mut bad = vec![0xde, 0xad, 0xbe, 0xef];
+        bad.extend(std::iter::repeat_n(0u8, 32));
+        let calldata = IUniswapV3Multicall::multicallCall {
+            data: vec![good.into(), bad.into()],
+        }
+        .abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &calldata).expect("decode");
+        // Outer decode succeeds, garbage inner is silently dropped — the
+        // good swap still surfaces.
+        assert_eq!(swaps.len(), 1);
+    }
+
+    #[test]
+    fn decode_nested_multicall_depth_two_still_peels() {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let inner = build_exact_input_single(weth, usdc, U256::from(7u64), Address::ZERO);
+        // Outer is multicall, inner is *also* a multicall containing one swap.
+        let mid = IUniswapV3Multicall::multicallCall {
+            data: vec![inner.into()],
+        }
+        .abi_encode();
+        let outer = IUniswapV3Multicall::multicallCall {
+            data: vec![mid.into()],
+        }
+        .abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &outer).expect("decode");
+        // Depth cap is 2 (outer = depth 0, mid = depth 1, inner-call selectors
+        // decoded at depth 2 — still allowed, the cap blocks recursion *into*
+        // a multicall at depth 2).
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].amount_in, U256::from(7u64));
+    }
+
+    #[test]
+    fn decode_triple_nested_multicall_blocked_at_depth_cap() {
+        // Build: multicall(multicall(multicall(exactInputSingle))) — three
+        // wrapping layers. With MAX_MULTICALL_DEPTH = 2, the innermost
+        // multicall is reached at depth 2 and refused to recurse, so the
+        // exactInputSingle inside is *not* peeled.
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let leaf = build_exact_input_single(weth, usdc, U256::from(1u64), Address::ZERO);
+        let l1 = IUniswapV3Multicall::multicallCall { data: vec![leaf.into()] }.abi_encode();
+        let l2 = IUniswapV3Multicall::multicallCall { data: vec![l1.into()] }.abi_encode();
+        let l3 = IUniswapV3Multicall::multicallCall { data: vec![l2.into()] }.abi_encode();
+        let swaps = decode_pending_many(univ3_router(), &l3).expect("decode");
+        assert!(
+            swaps.is_empty(),
+            "swap nested past MAX_MULTICALL_DEPTH must not be peeled"
+        );
+    }
+
+    #[test]
+    fn decode_pending_many_single_swap_returns_one_record() {
+        // Behavioural parity: callers that pass a plain exactInputSingle
+        // calldata get a one-element vec equivalent to `decode_pending`'s
+        // success path.
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let calldata = build_exact_input_single(weth, usdc, U256::from(42u64), Address::ZERO);
+        let many = decode_pending_many(univ3_router(), &calldata).expect("decode");
+        let single = decode_pending(univ3_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1);
+        assert_eq!(many[0].amount_in, single.amount_in);
+        assert_eq!(many[0].token_in, single.token_in);
+        assert_eq!(many[0].token_out, single.token_out);
+    }
+
+    #[test]
+    fn decode_exact_output_single_surfaces_amount_out_as_amount_in() {
+        use IUniswapV3Router::{exactOutputSingleCall, ExactOutputSingleParams};
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let params = ExactOutputSingleParams {
+            tokenIn: weth,
+            tokenOut: usdc,
+            fee: alloy::primitives::aliases::U24::from(500),
+            recipient: Address::ZERO,
+            deadline: U256::from(99u64),
+            amountOut: U256::from(2_500u64),
+            amountInMaximum: U256::from(2u64) * U256::from(10u64).pow(U256::from(18u64)),
+            sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
+        };
+        let calldata = exactOutputSingleCall { params }.abi_encode();
+        let swap = decode_pending(univ3_router(), &calldata).expect("decode");
+        assert_eq!(swap.protocol, Protocol::UniswapV3);
+        assert_eq!(swap.token_in, weth);
+        assert_eq!(swap.token_out, usdc);
+        assert_eq!(swap.amount_in, U256::from(2_500u64));
+        assert_eq!(swap.fee_bps, 500);
     }
 
     #[test]
