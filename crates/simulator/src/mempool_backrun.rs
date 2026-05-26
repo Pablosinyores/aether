@@ -12,14 +12,14 @@
 //! tokio integration. This module is a synchronous pure function so it can
 //! run on `spawn_blocking` workers without leaking async dependencies.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
 use revm::database::{CacheDB, EmptyDB};
 use revm::database_interface::{Database, DatabaseRef};
 use revm::handler::{ExecuteCommitEvm, ExecuteEvm, MainBuilder};
 use revm::primitives::hardfork::SpecId;
-use revm::state::EvmState;
+use revm::state::{AccountInfo, Bytecode, EvmState};
 use revm::Context;
 use tracing::debug;
 
@@ -129,6 +129,14 @@ pub struct ValidatorParams {
     /// (WETH = 3, USDC = 9, USDT/DAI = 2). The caller resolves this from
     /// the static `aether_common` token table.
     pub balance_slot: U256,
+    /// Optional runtime bytecode to inject at `arb.to` before running the
+    /// arb tx. Used by demo / shadow-mode runs against a forked mainnet
+    /// where `AetherExecutor` has not been deployed: the pipeline loads
+    /// the compiled runtime bytecode from `contracts/out/AetherExecutor.sol`
+    /// and threads it through here so the revm sim's `executeArb` call
+    /// hits real bytecode instead of empty-account revert. `None` for
+    /// production runs where the contract is on-chain.
+    pub executor_bytecode: Option<Bytes>,
 }
 
 /// Run the two-tx sim against an RPC-backed fork. Production entry point.
@@ -168,7 +176,7 @@ pub fn validate_backrun_cache(
 /// `RpcForkedState` (CacheDB<SyncAlloyDb>) and `ForkedState`
 /// (CacheDB<EmptyDB>) flow through here.
 fn validate_backrun_inner<DB>(
-    db: CacheDB<DB>,
+    mut db: CacheDB<DB>,
     victim: &VictimTx,
     arb: &ArbTx,
     params: &ValidatorParams,
@@ -178,6 +186,27 @@ where
     CacheDB<DB>: Database<Error = <DB as DatabaseRef>::Error>,
     <DB as DatabaseRef>::Error: std::fmt::Debug,
 {
+    // Demo / shadow runs against a forked mainnet may target an
+    // AetherExecutor address that is not yet deployed on-chain. The
+    // pipeline threads the compiled runtime bytecode through
+    // `params.executor_bytecode` so we can inject it into the CacheDB at
+    // `arb.to`, making the subsequent `executeArb` call hit real bytecode
+    // instead of empty-account revert. Production runs pass `None` and
+    // the cache resolves the address via the forked DB.
+    if let Some(code) = params.executor_bytecode.as_ref() {
+        let bytecode = Bytecode::new_raw(code.clone());
+        db.insert_account_info(
+            arb.to,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash: bytecode.hash_slow(),
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+    }
+
     // Compute the storage key for balanceOf(profit_recipient):
     //   slot = keccak256(pad32(recipient) ++ pad32(balance_slot))
     let mut key_input = [0u8; 64];
@@ -372,6 +401,7 @@ mod tests {
             profit_token: WETH,
             profit_recipient: RECIPIENT,
             balance_slot: U256::from(3u64), // WETH balances slot
+            executor_bytecode: None,
         }
     }
 
@@ -463,5 +493,52 @@ mod tests {
         // Sanity: the doc-hidden helper actually returns something the
         // generic core accepts. Used by downstream pipeline tests.
         let _: CacheDB<EmptyDB> = empty_cache_db();
+    }
+
+    #[test]
+    fn executor_bytecode_injection_makes_arb_to_execute_real_code() {
+        // Demo-mode override: no contract at ARB_TO on the forked DB.
+        // Without injection the arb call hits empty bytecode → succeeds
+        // with zero profit → NegativeAfterGas (covered by the
+        // `victim_with_no_code_succeeds...` test above).
+        //
+        // With `executor_bytecode = Some(REVERT)`, the same call now hits
+        // the injected REVERT opcode and the validator must propagate
+        // ArbReverted instead of NegativeAfterGas — proving the bytecode
+        // was actually installed at ARB_TO and the EVM dispatched to it.
+        let state = ForkedState::new_empty(18_000_000, 1_700_000_000, 0);
+        let mut params = default_params();
+        // PUSH1 0x00 PUSH1 0x00 REVERT — minimal explicit-revert program.
+        params.executor_bytecode = Some(Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]));
+        let result = validate_backrun_cache(state, &default_victim(), &default_arb(), &params);
+        assert!(!result.accepted);
+        assert_eq!(
+            result.reject,
+            Some(RejectReason::ArbReverted),
+            "injected REVERT must propagate as ArbReverted, not NegativeAfterGas"
+        );
+        assert!(
+            result.arb_gas_used > 0,
+            "arb leg must have actually executed the injected bytecode"
+        );
+    }
+
+    #[test]
+    fn executor_bytecode_none_preserves_pre_existing_arb_to_state() {
+        // When `executor_bytecode = None`, the injection branch is skipped
+        // and any bytecode already at ARB_TO on the forked DB is left
+        // untouched. This is the production path: the cache's on-chain
+        // bytecode is the source of truth.
+        let mut state = ForkedState::new_empty(18_000_000, 1_700_000_000, 0);
+        // Pre-populate ARB_TO with INVALID opcode → ArbHalted on call.
+        state.insert_account(ARB_TO, U256::ZERO, vec![0xfe].into());
+        let params = default_params(); // executor_bytecode = None
+        let result = validate_backrun_cache(state, &default_victim(), &default_arb(), &params);
+        assert!(!result.accepted);
+        assert_eq!(
+            result.reject,
+            Some(RejectReason::ArbHalted),
+            "pre-existing INVALID at ARB_TO must drive the reject reason"
+        );
     }
 }
