@@ -699,6 +699,17 @@ impl EngineMetrics {
             .inc();
     }
 
+    /// Read the current value of `aether_pending_arb_sim_skipped_total{reason}`.
+    /// Used by the mempool-pipeline tests to assert that new skip reasons
+    /// (e.g. `bancor_second_pool_not_found`, `bancor_multihop_low_confidence`)
+    /// fire on the expected paths without re-implementing Prometheus text
+    /// parsing.
+    pub fn pending_arb_sim_skipped_count(&self, reason: &str) -> u64 {
+        self.pending_arb_sim_skipped_total
+            .with_label_values(&[reason])
+            .get()
+    }
+
     /// Add `n` to `aether_pending_pipeline_lagged_total`. Pass the count
     /// returned by `broadcast::error::RecvError::Lagged(n)` so the metric
     /// reflects events dropped, not lag events fired.
