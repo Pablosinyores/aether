@@ -29,7 +29,7 @@ use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::opportunity::DetectedCycle;
 use aether_ingestion::subscription::{EventChannels, PendingTxEvent};
 use aether_pools::bancor::BNT_ADDRESS;
-use aether_pools::router_decoder::{decode_pending, DecodeError, DecodedSwap, Protocol};
+use aether_pools::router_decoder::{decode_pending_many, DecodeError, DecodedSwap, Protocol};
 use aether_pools::{
     predict_post_state_with_replay, PoolState, PoolStateCache, ReplayProtocol, UnifiedPostState,
 };
@@ -470,21 +470,33 @@ fn handle_event(
     };
     let router_label = format!("{:#x}", to);
 
-    match decode_pending(to, &event.input) {
-        Ok(swap) => {
-            emit_decoded(metrics, &router_label, &swap, &event);
-            if let Some(ctx) = sim_ctx {
+    match decode_pending_many(to, &event.input) {
+        Ok(swaps) => {
+            if swaps.is_empty() {
+                metrics.inc_pending_decode_errors("multicall_no_swaps");
+                return;
+            }
+            for swap in swaps {
+                emit_decoded(metrics, &router_label, &swap, &event);
+                let Some(ctx) = sim_ctx else { continue };
                 if !pre_sim_filter(metrics, ctx, &swap) {
-                    return;
+                    continue;
                 }
-                let metrics = Arc::clone(metrics);
-                let ctx = Arc::clone(ctx);
-                let swap = swap.clone();
-                let router_label = router_label.clone();
-                let event = event.clone();
+                let metrics_c = Arc::clone(metrics);
+                let ctx_c = Arc::clone(ctx);
+                let router_label_c = router_label.clone();
+                let event_c = event.clone();
                 let tx_hash = event.tx_hash;
                 tokio::task::spawn_blocking(move || {
-                    try_post_state_scan(&metrics, &ctx, &router_label, &swap, tx_hash, to, &event);
+                    try_post_state_scan(
+                        &metrics_c,
+                        &ctx_c,
+                        &router_label_c,
+                        &swap,
+                        tx_hash,
+                        to,
+                        &event_c,
+                    );
                 });
             }
         }
@@ -1340,6 +1352,10 @@ fn try_post_state_replay(
                 Ok(post) => Ok(UnifiedPostState::Balancer(post)),
                 Err(e) => Err(e.as_str()),
             }
+        }
+        ReplayProtocol::Bancor => {
+            metrics.inc_mempool_post_state_replay("unimplemented_protocol");
+            return None;
         }
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
