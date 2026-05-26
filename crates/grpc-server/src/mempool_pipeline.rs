@@ -58,7 +58,7 @@ use crate::service::aether_proto;
 use crate::engine::PoolMetadata;
 use crate::mempool_writer::{
     MempoolPredictionSink, NewMempoolPrediction, PredictedPostState, PROTOCOL_BALANCER,
-    PROTOCOL_BANCOR, PROTOCOL_CURVE, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
+    PROTOCOL_BANCOR, PROTOCOL_CURVE, PROTOCOL_ONE_INCH_V6, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
 };
 use crate::EngineMetrics;
 
@@ -622,6 +622,7 @@ fn decoder_protocol_to_type(p: Protocol) -> Option<ProtocolType> {
         Protocol::BalancerV2 => Some(ProtocolType::BalancerV2),
         Protocol::Curve => Some(ProtocolType::Curve),
         Protocol::BancorV3 => Some(ProtocolType::BancorV3),
+        Protocol::OneInchV6 => None,
     }
 }
 
@@ -666,6 +667,47 @@ fn emit_failure(metrics: &EngineMetrics, router_label: &str, err: &DecodeError) 
 /// every profitable cycle increments
 /// `aether_pending_arb_candidates_total{router, profit_bucket}` and is
 /// logged at `info` so a tail of the log is enough to verify the path.
+fn resolve_swap_pool(
+    metrics: &EngineMetrics,
+    ctx: &SimContext,
+    swap: &DecodedSwap,
+) -> Option<(PoolMetadata, Address, Address, ProtocolType)> {
+    if swap.protocol == Protocol::OneInchV6 {
+        let Some(pool_addr) = swap.pool_address else {
+            metrics.inc_pending_arb_sim_skipped("unresolved_executor");
+            return None;
+        };
+        let registry = ctx.pool_registry.load();
+        let Some(meta) = registry.get(&pool_addr).cloned() else {
+            metrics.inc_pending_arb_sim_skipped("pool_not_registered");
+            return None;
+        };
+        let zero_for_one = swap.one_inch_zero_for_one.unwrap_or(true);
+        let (token_in, token_out) = if zero_for_one {
+            (meta.token0, meta.token1)
+        } else {
+            (meta.token1, meta.token0)
+        };
+        let protocol = meta.pool_id.protocol;
+        return Some((meta, token_in, token_out, protocol));
+    }
+    let target_protocol = match swap.protocol {
+        Protocol::UniswapV2 => ProtocolType::UniswapV2,
+        Protocol::SushiSwap => ProtocolType::SushiSwap,
+        Protocol::UniswapV3 => ProtocolType::UniswapV3,
+        Protocol::BalancerV2 => ProtocolType::BalancerV2,
+        Protocol::Curve => ProtocolType::Curve,
+        Protocol::BancorV3 => ProtocolType::BancorV3,
+        Protocol::OneInchV6 => unreachable!("OneInchV6 handled above"),
+    };
+    let meta = ctx.lookup_pool(swap.token_in, swap.token_out, target_protocol)?;
+    if meta.pool_id.protocol != target_protocol {
+        metrics.inc_pending_arb_sim_skipped("pool_not_registered");
+        return None;
+    }
+    Some((meta, swap.token_in, swap.token_out, target_protocol))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_post_state_scan(
     metrics: &EngineMetrics,
@@ -676,14 +718,16 @@ fn try_post_state_scan(
     event_to: Address,
     event: &PendingTxEvent,
 ) {
-    let target_protocol = match swap.protocol {
-        Protocol::UniswapV2 => ProtocolType::UniswapV2,
-        Protocol::SushiSwap => ProtocolType::SushiSwap,
-        Protocol::UniswapV3 => ProtocolType::UniswapV3,
-        Protocol::BalancerV2 => ProtocolType::BalancerV2,
-        Protocol::Curve => ProtocolType::Curve,
-        Protocol::BancorV3 => ProtocolType::BancorV3,
-    };
+    // 1inch v6 records carry the peeled pool address directly. Resolve
+    // the pool's metadata + protocol up-front so the rest of this function
+    // can run the same V2/V3/Curve dispatch as the native router decoders.
+    // `pool_address = None` is the opaque `swap(executor, …)` arm — tagged
+    // `unresolved_executor` and skipped.
+    let (meta_resolved, swap_token_in, swap_token_out, target_protocol) =
+        match resolve_swap_pool(metrics, ctx, swap) {
+            Some(r) => r,
+            None => return,
+        };
 
     // Bancor multi-hop dispatch: tokenA -> BNT -> tokenB touches two pools
     // and no single (tokenA, tokenB, BancorV3) registry entry exists. The
@@ -708,23 +752,16 @@ fn try_post_state_scan(
     }
 
     let token_idx = ctx.token_index.load();
-    let Some(in_idx) = token_idx.get_index(&swap.token_in) else {
+    let Some(in_idx) = token_idx.get_index(&swap_token_in) else {
         metrics.inc_pending_arb_sim_skipped("token_in_unknown");
         return;
     };
-    let Some(out_idx) = token_idx.get_index(&swap.token_out) else {
+    let Some(out_idx) = token_idx.get_index(&swap_token_out) else {
         metrics.inc_pending_arb_sim_skipped("token_out_unknown");
         return;
     };
 
-    // O(1) pair lookup via the cached PairIndex. The cache rebuilds only
-    // when the underlying pool_registry Arc has been swapped, so steady-state
-    // cost is one Mutex acquire + one HashMap probe — independent of the
-    // number of registered pools.
-    let Some(meta) = ctx.lookup_pool(swap.token_in, swap.token_out, target_protocol) else {
-        metrics.inc_pending_arb_sim_skipped("pool_not_registered");
-        return;
-    };
+    let meta = meta_resolved;
     let pool_id = meta.pool_id;
     let fee_factor = meta.fee_factor();
 
@@ -762,7 +799,7 @@ fn try_post_state_scan(
             let dx = u256_to_f64_saturating(swap.amount_in);
             predict_v2_post_state(edge_fwd.reserve_in, edge_fwd.reserve_out, dx, fee_factor)
         }
-        Protocol::UniswapV3 | Protocol::BalancerV2 | Protocol::Curve | Protocol::BancorV3 => {
+        Protocol::UniswapV3 | Protocol::BalancerV2 | Protocol::Curve | Protocol::BancorV3 | Protocol::OneInchV6 => {
             let pool_addr = meta.pool_id.address;
             let Some(state_arc) = ctx.pool_states.get(&pool_addr).map(|r| Arc::clone(r.value()))
             else {
@@ -837,6 +874,10 @@ fn try_post_state_scan(
             reserve_out: post_out,
         },
         Protocol::BancorV3 => PredictedPostState::Bancor {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
+        Protocol::OneInchV6 => PredictedPostState::OneInchV6 {
             reserve_in: post_in,
             reserve_out: post_out,
         },
@@ -1716,6 +1757,7 @@ fn decoder_protocol_label(p: Protocol) -> &'static str {
         Protocol::BalancerV2 => PROTOCOL_BALANCER,
         Protocol::Curve => PROTOCOL_CURVE,
         Protocol::BancorV3 => PROTOCOL_BANCOR,
+        Protocol::OneInchV6 => PROTOCOL_ONE_INCH_V6,
     }
 }
 
@@ -1867,6 +1909,7 @@ fn protocol_label(p: Protocol) -> &'static str {
         Protocol::BalancerV2 => "balancer_v2",
         Protocol::Curve => "curve",
         Protocol::BancorV3 => "bancor_v3",
+        Protocol::OneInchV6 => "one_inch_v6",
     }
 }
 
@@ -2137,6 +2180,8 @@ mod tests {
             fee_bps: 0,
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }
     }
 
@@ -2679,6 +2724,8 @@ mod tests {
             fee_bps: 0,
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }
     }
 

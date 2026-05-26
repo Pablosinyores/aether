@@ -15,14 +15,19 @@
 //!   `exactInput` (multi-hop bytes-encoded path).
 //! - **Balancer V2 Vault**: `swap(SingleSwap, FundManagement, limit, deadline)`
 //!   single-pool variant.
+//! - **1inch v6 AggregationRouter**: `swap` (opaque executor — surfaces
+//!   the `(srcToken, dstToken, amount)` triple with `pool_address = None`
+//!   so the upstream pipeline can tag it `unresolved_executor`),
+//!   `unoswap{,2,3}{,To}` / `ethUnoswap{,2,3}{,To}` (V2-style chain across
+//!   1–3 pools, one [`DecodedSwap`] emitted per pool with the pool address
+//!   peeled from the low 160 bits of each `uint256` and the zeroForOne
+//!   flag from bit 247), and `uniswapV3Swap{,To}` (same encoding, V3-only).
 //!
 //! Out of scope (returns `UnknownSelector`):
 //!
 //! - Curve router — its `exchange` / `exchange_multiple` shape varies per
 //!   pool registry version and would inflate the decoder without yielding
 //!   reliable hits in the testing scaffold.
-//! - 1inch v6 AggregationRouter — multi-encoded calldata; deferred so the
-//!   `decode_failure` counter can quantify the gap before we invest.
 //!
 //! ## Multicall (UniV3 SwapRouter / SwapRouter02)
 //!
@@ -102,6 +107,15 @@ pub enum Protocol {
     /// the BancorNetwork address and `token_in`/`token_out` are resolved
     /// from calldata directly.
     BancorV3,
+    /// 1inch v6 AggregationRouter. The router multiplexes across every
+    /// DEX family, so a single calldata can peel into multiple
+    /// `DecodedSwap` records (one per pool in the `unoswap*` /
+    /// `uniswapV3Swap*` chain). `DecodedSwap.pool_address` carries the
+    /// per-hop pool when the encoding is pool-keyed; for the opaque
+    /// `swap(executor, …)` selector the executor is custom bytecode and
+    /// `pool_address` is `None`, leaving the upstream pipeline to
+    /// classify the record as unresolved.
+    OneInchV6,
 }
 
 /// Minimal swap shape produced by the decoder.
@@ -138,6 +152,25 @@ pub struct DecodedSwap {
     /// values that overflow `u8` indicate a malformed or non-standard
     /// pool and the decoder rejects them with `AbiDecode`.
     pub curve_indices: Option<(u8, u8)>,
+    /// Concrete pool address when the decoder can resolve the swap to
+    /// a single on-chain pool. Populated by aggregator decoders that
+    /// embed the pool address in their calldata (e.g. 1inch v6
+    /// `unoswap*` chains, where each `uint256` in the pool array packs
+    /// the pool address in its low 160 bits). `None` for protocols whose
+    /// pool is implicitly resolved from `(token_in, token_out,
+    /// protocol)` via the pool registry (UniV2/V3, Sushi, Balancer,
+    /// Curve, Bancor — those all leave this `None` and the pipeline
+    /// looks up the pool by pair). Also `None` for opaque-executor
+    /// aggregator paths (1inch v6 `swap(executor, …)`), which the
+    /// pipeline classifies as `unresolved_executor`.
+    pub pool_address: Option<Address>,
+    /// 1inch v6 only: zeroForOne flag peeled from the high bits of a
+    /// pool-encoded `uint256`. `Some(true)` means swap token0 → token1
+    /// on the pool, `Some(false)` means token1 → token0. `None` for
+    /// every non-1inch protocol. Used downstream to map the peeled
+    /// pool's `token0`/`token1` to the swap's `(token_in, token_out)`
+    /// without needing to know either token in calldata.
+    pub one_inch_zero_for_one: Option<bool>,
 }
 
 /// Reasons a pending tx might fail to decode. Caller maps these to a
@@ -343,6 +376,105 @@ sol! {
         }
         function swap(SingleSwap singleSwap, FundManagement funds, uint256 limit, uint256 deadline) external payable returns (uint256);
     }
+
+    /// 1inch v6 `AggregationRouterV6`.
+    ///
+    /// The v6 router multiplexes across every DEX family. Three selector
+    /// families matter for mempool decoding:
+    ///
+    /// 1. `swap(executor, SwapDescription, data)` — opaque executor path.
+    ///    The `executor` is a custom-deployed contract whose bytecode we
+    ///    cannot statically analyse, so the decoder surfaces only the
+    ///    user-visible `(srcToken, dstToken, amount)` triple and leaves
+    ///    `pool_address = None` (pipeline tags it `unresolved_executor`).
+    ///
+    /// 2. `unoswap*` / `ethUnoswap*` — V2-style chain across one to three
+    ///    pools encoded as `uint256` words. Each pool word packs:
+    ///      - bits   0..159: pool address (low 160 bits)
+    ///      - bit    247   : zeroForOne flag for V3 pools (and reverse
+    ///                       direction for V2 pools); see [`pool_zero_for_one`]
+    ///      - other bits   : protocol-family flags the decoder does not
+    ///                       need to resolve (the pipeline disambiguates
+    ///                       V2 vs V3 via the live pool registry's
+    ///                       `protocol` column for that address).
+    ///    `ethUnoswap*` mirrors `unoswap*` minus the `token` arg — `srcToken`
+    ///    is native ETH which we treat as WETH downstream.
+    ///
+    /// 3. `uniswapV3Swap*` — same pool-encoding as `unoswap*` but every
+    ///    pool is implicitly UniswapV3, so the pipeline can skip the
+    ///    V2-vs-V3 disambiguation.
+    ///
+    /// `To` suffixed variants forward to an explicit `recipient`; the
+    /// decoder treats them identically to the base variant for the
+    /// purposes of `(srcToken, dstToken, amount)` extraction. `dex2` /
+    /// `dex3` for the multi-hop variants are the chain continuation pools.
+    #[allow(missing_docs)]
+    interface IOneInchV6Router {
+        struct SwapDescription {
+            address srcToken;
+            address dstToken;
+            address payable srcReceiver;
+            address payable dstReceiver;
+            uint256 amount;
+            uint256 minReturnAmount;
+            uint256 flags;
+        }
+        function swap(address executor, SwapDescription desc, bytes data) external payable returns (uint256, uint256);
+
+        function unoswap(uint256 token, uint256 amount, uint256 minReturn, uint256 dex) external returns (uint256);
+        function unoswapTo(uint256 to, uint256 token, uint256 amount, uint256 minReturn, uint256 dex) external returns (uint256);
+        function unoswap2(uint256 token, uint256 amount, uint256 minReturn, uint256 dex, uint256 dex2) external returns (uint256);
+        function unoswap2To(uint256 to, uint256 token, uint256 amount, uint256 minReturn, uint256 dex, uint256 dex2) external returns (uint256);
+        function unoswap3(uint256 token, uint256 amount, uint256 minReturn, uint256 dex, uint256 dex2, uint256 dex3) external returns (uint256);
+        function unoswap3To(uint256 to, uint256 token, uint256 amount, uint256 minReturn, uint256 dex, uint256 dex2, uint256 dex3) external returns (uint256);
+
+        function ethUnoswap(uint256 minReturn, uint256 dex) external payable returns (uint256);
+        function ethUnoswapTo(uint256 to, uint256 minReturn, uint256 dex) external payable returns (uint256);
+        function ethUnoswap2(uint256 minReturn, uint256 dex, uint256 dex2) external payable returns (uint256);
+        function ethUnoswap2To(uint256 to, uint256 minReturn, uint256 dex, uint256 dex2) external payable returns (uint256);
+        function ethUnoswap3(uint256 minReturn, uint256 dex, uint256 dex2, uint256 dex3) external payable returns (uint256);
+        function ethUnoswap3To(uint256 to, uint256 minReturn, uint256 dex, uint256 dex2, uint256 dex3) external payable returns (uint256);
+
+        function uniswapV3Swap(uint256 amount, uint256 minReturn, uint256[] pools) external payable returns (uint256);
+        function uniswapV3SwapTo(address payable recipient, uint256 amount, uint256 minReturn, uint256[] pools) external payable returns (uint256);
+    }
+}
+
+/// 1inch v6 AggregationRouter address on Ethereum Mainnet. Pinned here so
+/// the decoder and the default filter list agree on a single source of
+/// truth — adding a chain or moving routers means editing one constant.
+pub const ONE_INCH_V6_ROUTER: Address =
+    address!("111111125421cA6dc452d289314280a0f8842A65");
+
+/// 1inch v6 pool-encoding bit constants. The router packs each pool word
+/// as `low 160 bits = pool address`, with flag bits in the high end. The
+/// only flag the decoder reads is the per-hop direction bit; other flags
+/// (source DEX type, fee-on-transfer markers, etc.) the upstream pipeline
+/// resolves via the live pool registry's `protocol` column for that
+/// address.
+mod one_inch_bits {
+    /// Bit position of the `zeroForOne` direction flag inside a pool word.
+    /// Matches the constant the v6 source uses for both V3 swaps (`true`
+    /// = token0 → token1) and the V2 reverse-direction flag.
+    pub const ZERO_FOR_ONE_BIT: u32 = 247;
+}
+
+/// Peel an encoded `uint256` pool word into `(pool_address, zero_for_one)`.
+///
+/// Pool address is the low 160 bits; `zero_for_one` is the bit at
+/// [`one_inch_bits::ZERO_FOR_ONE_BIT`]. Both extractions are cheap
+/// bit-ops with no allocation.
+#[inline]
+fn pool_zero_for_one(encoded: U256) -> (Address, bool) {
+    // Low 160 bits = the pool address. U256::to_be_bytes() yields a
+    // big-endian 32-byte view; the address is the last 20 bytes.
+    let be: [u8; 32] = encoded.to_be_bytes();
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&be[12..32]);
+    let pool = Address::from(addr);
+    let bit = U256::from(1u64) << one_inch_bits::ZERO_FOR_ONE_BIT;
+    let zero_for_one = (encoded & bit) != U256::ZERO;
+    (pool, zero_for_one)
 }
 
 /// Maximum recursion depth for `multicall(bytes[])` peeling.
@@ -362,55 +494,27 @@ pub const MAX_MULTICALL_DEPTH: usize = 2;
 /// address before calling — this function does not validate that the `to`
 /// matches a known router; it only consumes the selector + payload.
 ///
-/// **Single-swap entry point.** Callers that need to peel UniV3
-/// `multicall(bytes[])` bundles should use [`decode_pending_many`]; this
-/// function returns [`DecodeError::UnknownSelector`] for the two multicall
-/// selectors so existing call sites keep their previous semantics. The
-/// multicall dispatch is documented in the [module docs](self).
+/// For routers that can emit more than one swap per calldata (UniV3
+/// `multicall(bytes[])` bundles, 1inch v6 `unoswap*` chains) use
+/// [`decode_pending_many`] instead — this function collapses to the first
+/// hop only.
 pub fn decode_pending(to: Address, calldata: &[u8]) -> Result<DecodedSwap, DecodeError> {
-    if calldata.len() < 4 {
-        return Err(DecodeError::TooShort);
-    }
-    // Short-circuit known Curve routers before selector dispatch so they map
-    // to a dedicated reason instead of inflating `unknown_selector`. They
-    // remain in the address filter because dropping them would skew the
-    // firehose's protocol mix away from real router traffic.
-    if is_unsupported_curve_router(to) {
-        return Err(DecodeError::CurveUnsupported(to));
-    }
-    let selector: [u8; 4] = calldata[0..4].try_into().expect("4 bytes by check above");
-
-    if let Some(swap) = try_decode_single(selector, calldata, to)? {
-        return Ok(swap);
-    }
-
-    Err(DecodeError::UnknownSelector { selector })
+    let mut all = decode_pending_many(to, calldata)?;
+    // `decode_pending_many` never returns an empty Ok vec — every Ok arm
+    // pushes at least one record — so this `remove(0)` is infallible.
+    Ok(all.remove(0))
 }
 
 /// Decode a pending tx's `(to, calldata)` into one or more [`DecodedSwap`]
-/// records.
+/// records. Most router shapes emit exactly one record; 1inch v6
+/// `unoswap2` / `unoswap3` / `uniswapV3Swap` chains emit one record per
+/// pool in the chain (first hop carries the user-committed `amount_in`,
+/// subsequent hops carry `U256::ZERO` because the intermediate amounts
+/// are only resolvable mid-execution — the upstream pipeline rebuilds
+/// them from each pool's post-state).
 ///
-/// Behaves identically to [`decode_pending`] for single-swap selectors
-/// (`exactInputSingle`, `swapExactTokensForTokens`, etc.) — returns a
-/// one-element vector wrapping the same `DecodedSwap`. For UniV3
-/// `multicall(bytes[])` (selector `0xac9650d8`) and
-/// `multicall(uint256, bytes[])` (selector `0x5ae401dc`), peels each
-/// inner call and emits one record per recognised swap selector. Inner
-/// non-swap helpers (`selfPermit*`, `unwrapWETH9*`, `refundETH`,
-/// `sweepToken*`) are intentionally ignored — they're legal inside
-/// multicall but don't change pool state.
-///
-/// Recursion depth is capped at [`MAX_MULTICALL_DEPTH`]; nested multicalls
-/// past the cap surface as `UnknownSelector` so the metric is bumped and
-/// the engine moves on.
-///
-/// **Error semantics:** an unknown inner selector inside a multicall is
-/// *ignored*, not propagated — the wrapping multicall is a successful
-/// decode even if one inner call was unrecognised. Only outer-level
-/// unknown selectors (no swap at all) produce [`DecodeError::UnknownSelector`].
-/// If the outer call is a multicall but contains zero recognised inner
-/// swaps, returns `Ok(vec![])` so the caller can decide whether to count
-/// it as a decode hit or skip silently.
+/// Returns a non-empty `Vec` on `Ok`. Empty vec is never produced; callers
+/// can safely index `[0]` without bounds checks.
 pub fn decode_pending_many(
     to: Address,
     calldata: &[u8],
@@ -418,6 +522,10 @@ pub fn decode_pending_many(
     if calldata.len() < 4 {
         return Err(DecodeError::TooShort);
     }
+    // Short-circuit known Curve routers before selector dispatch so they map
+    // to a dedicated reason instead of inflating `unknown_selector`. They
+    // remain in the address filter because dropping them would skew the
+    // firehose's protocol mix away from real router traffic.
     if is_unsupported_curve_router(to) {
         return Err(DecodeError::CurveUnsupported(to));
     }
@@ -473,6 +581,11 @@ fn decode_at_depth(
         }
     }
 
+    // 1inch v6 AggregationRouter — multi-record producer; peeled before
+    // try_decode_single so the per-hop pool addresses propagate.
+    if let Some(swaps) = try_one_inch_v6(selector, calldata, to)? {
+        return Ok(swaps);
+    }
     if let Some(swap) = try_decode_single(selector, calldata, to)? {
         return Ok(vec![swap]);
     }
@@ -679,6 +792,8 @@ fn decode_v2_call(
         fee_bps: 0,
         path_extra,
         curve_indices: None,
+        pool_address: None,
+        one_inch_zero_for_one: None,
     })
 }
 
@@ -702,6 +817,8 @@ fn try_uni_v3_family(
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactInputSingle02Call::SELECTOR {
@@ -718,6 +835,8 @@ fn try_uni_v3_family(
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactInputCall::SELECTOR {
@@ -735,6 +854,8 @@ fn try_uni_v3_family(
             fee_bps: fee,
             path_extra: extras,
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactInput02Call::SELECTOR {
@@ -752,6 +873,8 @@ fn try_uni_v3_family(
             fee_bps: fee,
             path_extra: extras,
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     // ── exact-output flavours ──
@@ -777,6 +900,8 @@ fn try_uni_v3_family(
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactOutputSingle02Call::SELECTOR {
@@ -793,6 +918,8 @@ fn try_uni_v3_family(
             fee_bps: c.params.fee.to::<u32>(),
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactOutputCall::SELECTOR {
@@ -815,6 +942,8 @@ fn try_uni_v3_family(
             fee_bps: fee,
             path_extra: extras,
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == exactOutput02Call::SELECTOR {
@@ -833,6 +962,8 @@ fn try_uni_v3_family(
             fee_bps: fee,
             path_extra: extras,
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     Ok(None)
@@ -917,6 +1048,8 @@ fn try_balancer(
             fee_bps: 0,
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     Ok(None)
@@ -996,6 +1129,8 @@ fn try_bancor(
             fee_bps: 0,
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     if selector == tradeByTargetAmountCall::SELECTOR {
@@ -1016,6 +1151,8 @@ fn try_bancor(
             fee_bps: 0,
             path_extra: vec![],
             curve_indices: None,
+            pool_address: None,
+            one_inch_zero_for_one: None,
         }));
     }
     Ok(None)
@@ -1067,7 +1204,297 @@ fn curve_decoded_swap(pool: Address, indices: (u8, u8), amount_in: U256) -> Deco
         fee_bps: 0,
         path_extra: vec![],
         curve_indices: Some(indices),
+        pool_address: None,
+        one_inch_zero_for_one: None,
     }
+}
+
+/// 1inch v6 AggregationRouter decoder. Dispatches by selector and emits
+/// one or more [`DecodedSwap`] records depending on the shape:
+///
+/// - `swap(executor, desc, data)` → one record with `pool_address = None`
+///   (pipeline tags it `unresolved_executor`). `token_in` / `token_out`
+///   come from `desc.srcToken` / `desc.dstToken`; `amount_in` from
+///   `desc.amount`. Useful even without a concrete pool — at minimum the
+///   token pair lets the pipeline gauge where 1inch volume is flowing.
+///
+/// - `unoswap{,2,3}{,To}` and `ethUnoswap{,2,3}{,To}` → one record per
+///   pool in the chain. `token_in` on the first hop is the user's `token`
+///   arg (or WETH for the `ethUnoswap*` family — ETH is always swapped
+///   to WETH inside the router). `token_in` on hops 2 and 3 is `ZERO`
+///   because the intermediate token is only known after looking the pool
+///   up in the registry — the upstream pipeline does that. `amount_in`
+///   on the first hop is the user's `amount` (or `0` for `ethUnoswap*`
+///   because the amount is `msg.value` and not in calldata); subsequent
+///   hops carry `ZERO`.
+///
+/// - `uniswapV3Swap{,To}` → one record per pool, every pool is V3.
+///   `token_in` on the first hop is the pool's token0/token1 picked by
+///   the `zeroForOne` bit; the pipeline resolves that lookup against
+///   the live registry — we only know the pool address and direction
+///   from calldata alone.
+fn try_one_inch_v6(
+    selector: [u8; 4],
+    calldata: &[u8],
+    router: Address,
+) -> Result<Option<Vec<DecodedSwap>>, DecodeError> {
+    use IOneInchV6Router::*;
+
+    // ── swap(executor, SwapDescription, data) — opaque executor ──
+    if selector == swapCall::SELECTOR {
+        let c = swapCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(vec![one_inch_unresolved_swap(
+            router,
+            c.desc.srcToken,
+            c.desc.dstToken,
+            c.desc.amount,
+            c.desc.minReturnAmount,
+            c.desc.dstReceiver,
+        )]));
+    }
+
+    // ── unoswap family (token committed in calldata) ──
+    if selector == unoswapCall::SELECTOR {
+        let c = unoswapCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex], Address::ZERO,
+        )));
+    }
+    if selector == unoswapToCall::SELECTOR {
+        let c = unoswapToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex], recipient,
+        )));
+    }
+    if selector == unoswap2Call::SELECTOR {
+        let c = unoswap2Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex, c.dex2], Address::ZERO,
+        )));
+    }
+    if selector == unoswap2ToCall::SELECTOR {
+        let c = unoswap2ToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex, c.dex2], recipient,
+        )));
+    }
+    if selector == unoswap3Call::SELECTOR {
+        let c = unoswap3Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex, c.dex2, c.dex3], Address::ZERO,
+        )));
+    }
+    if selector == unoswap3ToCall::SELECTOR {
+        let c = unoswap3ToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let token_in = u256_low_address(c.token);
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, token_in, c.amount, c.minReturn, &[c.dex, c.dex2, c.dex3], recipient,
+        )));
+    }
+
+    // ── ethUnoswap family — src is native ETH; treat as WETH ──
+    if selector == ethUnoswapCall::SELECTOR {
+        let c = ethUnoswapCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex], Address::ZERO,
+        )));
+    }
+    if selector == ethUnoswapToCall::SELECTOR {
+        let c = ethUnoswapToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex], recipient,
+        )));
+    }
+    if selector == ethUnoswap2Call::SELECTOR {
+        let c = ethUnoswap2Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex, c.dex2], Address::ZERO,
+        )));
+    }
+    if selector == ethUnoswap2ToCall::SELECTOR {
+        let c = ethUnoswap2ToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex, c.dex2], recipient,
+        )));
+    }
+    if selector == ethUnoswap3Call::SELECTOR {
+        let c = ethUnoswap3Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex, c.dex2, c.dex3], Address::ZERO,
+        )));
+    }
+    if selector == ethUnoswap3ToCall::SELECTOR {
+        let c = ethUnoswap3ToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        let recipient = u256_low_address(c.to);
+        return Ok(Some(one_inch_chain(
+            router, WETH_ADDRESS, U256::ZERO, c.minReturn, &[c.dex, c.dex2, c.dex3], recipient,
+        )));
+    }
+
+    // ── uniswapV3Swap family — every pool is V3 ──
+    if selector == uniswapV3SwapCall::SELECTOR {
+        let c = uniswapV3SwapCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        if c.pools.is_empty() {
+            return Err(DecodeError::EmptyPath);
+        }
+        return Ok(Some(one_inch_chain(
+            router, Address::ZERO, c.amount, c.minReturn, &c.pools, Address::ZERO,
+        )));
+    }
+    if selector == uniswapV3SwapToCall::SELECTOR {
+        let c = uniswapV3SwapToCall::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        if c.pools.is_empty() {
+            return Err(DecodeError::EmptyPath);
+        }
+        return Ok(Some(one_inch_chain(
+            router, Address::ZERO, c.amount, c.minReturn, &c.pools, c.recipient,
+        )));
+    }
+
+    Ok(None)
+}
+
+/// WETH on Ethereum mainnet. The `ethUnoswap*` family swaps native ETH
+/// into a token; the router wraps to WETH on the way in, so downstream
+/// pool lookups should key off WETH rather than `Address::ZERO`.
+const WETH_ADDRESS: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+
+/// Build a [`DecodedSwap`] for the opaque 1inch v6 `swap(executor, …)`
+/// path. `pool_address` is `None` because the executor's pool choice is
+/// in custom bytecode — the upstream pipeline tags this record
+/// `unresolved_executor` and skips post-state prediction.
+fn one_inch_unresolved_swap(
+    router: Address,
+    src: Address,
+    dst: Address,
+    amount: U256,
+    min_return: U256,
+    recipient: Address,
+) -> DecodedSwap {
+    DecodedSwap {
+        protocol: Protocol::OneInchV6,
+        router,
+        token_in: src,
+        token_out: dst,
+        amount_in: amount,
+        amount_out_min: min_return,
+        recipient,
+        fee_bps: 0,
+        path_extra: vec![],
+        curve_indices: None,
+        pool_address: None,
+        one_inch_zero_for_one: None,
+    }
+}
+
+/// Build a Vec of [`DecodedSwap`] records for a 1inch `unoswap*` /
+/// `uniswapV3Swap*` chain. `pools` lists the encoded pool words in
+/// execution order. First hop carries the user-committed `amount_in`;
+/// subsequent hops carry `U256::ZERO` (the intermediate amounts are
+/// resolved by the executor at runtime and the upstream pipeline
+/// reconstructs them from each pool's analytical post-state).
+///
+/// `token_in_first` is the user's source token (or WETH for the
+/// `ethUnoswap*` family, or `Address::ZERO` for `uniswapV3Swap*` where
+/// the source token is implied by the first pool's `zeroForOne` bit and
+/// must be resolved upstream against the live registry). For hops past
+/// the first, `token_in` / `token_out` are both `Address::ZERO` — the
+/// pipeline resolves them via `pool_address` lookup.
+fn one_inch_chain(
+    router: Address,
+    token_in_first: Address,
+    amount_in: U256,
+    min_return: U256,
+    pools: &[U256],
+    recipient: Address,
+) -> Vec<DecodedSwap> {
+    pools
+        .iter()
+        .enumerate()
+        .map(|(idx, encoded)| {
+            let (pool, zero_for_one) = pool_zero_for_one(*encoded);
+            let is_first = idx == 0;
+            let is_last = idx + 1 == pools.len();
+            DecodedSwap {
+                protocol: Protocol::OneInchV6,
+                router,
+                // Source token is known only for the first hop (and only
+                // when the calldata names it — uniswapV3Swap leaves
+                // `token_in_first` ZERO and the pipeline resolves from
+                // the pool's tokens + zeroForOne).
+                token_in: if is_first { token_in_first } else { Address::ZERO },
+                token_out: Address::ZERO,
+                // Only the first hop carries the user-committed amount;
+                // intermediate amounts depend on each pool's runtime
+                // post-state and are not statically derivable.
+                amount_in: if is_first { amount_in } else { U256::ZERO },
+                // Only the final hop carries the user's slippage bound;
+                // intermediate hops have no min-return semantics in the
+                // 1inch chain encoding.
+                amount_out_min: if is_last { min_return } else { U256::ZERO },
+                recipient,
+                fee_bps: 0,
+                path_extra: vec![],
+                curve_indices: None,
+                pool_address: Some(pool),
+                one_inch_zero_for_one: Some(zero_for_one),
+            }
+        })
+        .collect()
+}
+
+/// Coerce a `uint256` argument carrying an address-shaped value into a
+/// 20-byte [`Address`]. 1inch v6 uses `uint256` instead of `address` for
+/// most token / recipient parameters because the high bits encode flags
+/// (e.g. `unwrap WETH` for the `to` arg). We discard the flag bits and
+/// keep the low 160 bits, matching the router's own treatment of the arg
+/// inside `assembly { let token := and(arg, _ADDRESS_MASK) }`.
+#[inline]
+fn u256_low_address(v: U256) -> Address {
+    let be: [u8; 32] = v.to_be_bytes();
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&be[12..32]);
+    Address::from(addr)
+}
+
+/// Pack a `(pool_address, zero_for_one)` pair into a `uint256` matching
+/// 1inch v6's pool-word encoding. Used by downstream crates to build
+/// hand-rolled `unoswap*` calldata against the same encoding the decoder
+/// consumes.
+#[doc(hidden)]
+pub fn pool_word_for_test(pool: Address, zero_for_one: bool) -> U256 {
+    let mut be = [0u8; 32];
+    be[12..32].copy_from_slice(pool.as_slice());
+    let mut v = U256::from_be_bytes(be);
+    if zero_for_one {
+        v |= U256::from(1u64) << one_inch_bits::ZERO_FOR_ONE_BIT;
+    }
+    v
 }
 
 #[cfg(test)]
@@ -1576,5 +2003,267 @@ mod tests {
         assert_eq!(decoded.token_out, bnt);
         assert_eq!(decoded.amount_in, U256::from(5_000u64));
         assert_eq!(decoded.amount_out_min, U256::from(2_000u64));
+    }
+
+    // ── 1inch v6 AggregationRouter decoder ──
+
+    /// Pack a `(pool_address, zero_for_one)` pair into a `uint256` matching
+    /// 1inch v6's expected pool-word layout. Used to build hand-rolled
+    /// calldata for the `unoswap*` / `uniswapV3Swap*` tests without
+    /// pulling in a full Solidity helper.
+    fn encode_pool(pool: Address, zero_for_one: bool) -> U256 {
+        let mut be = [0u8; 32];
+        be[12..32].copy_from_slice(pool.as_slice());
+        let mut v = U256::from_be_bytes(be);
+        if zero_for_one {
+            v |= U256::from(1u64) << one_inch_bits::ZERO_FOR_ONE_BIT;
+        }
+        v
+    }
+
+    fn one_inch_router() -> Address {
+        ONE_INCH_V6_ROUTER
+    }
+
+    #[test]
+    fn pool_zero_for_one_round_trips_pool_address_and_flag() {
+        let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let encoded = encode_pool(pool, true);
+        let (got_pool, got_flag) = pool_zero_for_one(encoded);
+        assert_eq!(got_pool, pool);
+        assert!(got_flag);
+
+        let encoded_off = encode_pool(pool, false);
+        let (got_pool2, got_flag2) = pool_zero_for_one(encoded_off);
+        assert_eq!(got_pool2, pool);
+        assert!(!got_flag2);
+    }
+
+    #[test]
+    fn decode_one_inch_v6_swap_emits_unresolved_executor_record() {
+        // The opaque-executor path can't be mapped to a concrete pool.
+        // Decoder must still emit a record (token pair + amount) and
+        // leave `pool_address = None` so the pipeline tags it
+        // `unresolved_executor` rather than dropping it silently.
+        use IOneInchV6Router::{swapCall, SwapDescription};
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let executor = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let receiver = address!("000000000000000000000000000000000000dEaD");
+        let desc = SwapDescription {
+            srcToken: weth,
+            dstToken: usdc,
+            srcReceiver: executor,
+            dstReceiver: receiver,
+            amount: U256::from(1_000_000_000_000_000_000u128),
+            minReturnAmount: U256::from(2_500_000_000u128),
+            flags: U256::ZERO,
+        };
+        let calldata = swapCall {
+            executor,
+            desc,
+            data: alloy::primitives::Bytes::new(),
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1, "swap() emits exactly one record");
+        let r = &many[0];
+        assert_eq!(r.protocol, Protocol::OneInchV6);
+        assert_eq!(r.router, one_inch_router());
+        assert_eq!(r.token_in, weth);
+        assert_eq!(r.token_out, usdc);
+        assert_eq!(r.amount_in, U256::from(1_000_000_000_000_000_000u128));
+        assert_eq!(r.amount_out_min, U256::from(2_500_000_000u128));
+        assert_eq!(r.recipient, receiver);
+        assert!(
+            r.pool_address.is_none(),
+            "opaque executor must leave pool_address None for unresolved_executor tagging"
+        );
+        assert!(r.one_inch_zero_for_one.is_none());
+    }
+
+    #[test]
+    fn decode_one_inch_v6_unoswap_single_pool() {
+        use IOneInchV6Router::unoswapCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let amount = U256::from(1_000_000_000_000_000_000u128);
+        let min_return = U256::from(2_500_000_000u128);
+        let mut token_be = [0u8; 32];
+        token_be[12..32].copy_from_slice(weth.as_slice());
+        let calldata = unoswapCall {
+            token: U256::from_be_bytes(token_be),
+            amount,
+            minReturn: min_return,
+            dex: encode_pool(pool, true),
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1);
+        let r = &many[0];
+        assert_eq!(r.protocol, Protocol::OneInchV6);
+        assert_eq!(r.token_in, weth, "first hop carries the user's src token");
+        assert_eq!(r.pool_address, Some(pool));
+        assert_eq!(r.one_inch_zero_for_one, Some(true));
+        assert_eq!(r.amount_in, amount);
+        assert_eq!(r.amount_out_min, min_return);
+    }
+
+    #[test]
+    fn decode_one_inch_v6_unoswap3_three_pools_amount_only_on_first() {
+        use IOneInchV6Router::unoswap3Call;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let p1 = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1");
+        let p2 = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2");
+        let p3 = address!("ccccccccccccccccccccccccccccccccccccccc3");
+        let amount = U256::from(123_456_789u64);
+        let min_return = U256::from(99_999u64);
+        let mut token_be = [0u8; 32];
+        token_be[12..32].copy_from_slice(weth.as_slice());
+        let calldata = unoswap3Call {
+            token: U256::from_be_bytes(token_be),
+            amount,
+            minReturn: min_return,
+            dex: encode_pool(p1, false),
+            dex2: encode_pool(p2, true),
+            dex3: encode_pool(p3, false),
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 3, "one record per pool in the chain");
+
+        assert_eq!(many[0].pool_address, Some(p1));
+        assert_eq!(many[0].one_inch_zero_for_one, Some(false));
+        assert_eq!(many[0].token_in, weth, "src token only on first hop");
+        assert_eq!(many[0].amount_in, amount, "amount only on first hop");
+        assert_eq!(many[0].amount_out_min, U256::ZERO);
+
+        assert_eq!(many[1].pool_address, Some(p2));
+        assert_eq!(many[1].one_inch_zero_for_one, Some(true));
+        assert_eq!(many[1].token_in, Address::ZERO);
+        assert_eq!(many[1].amount_in, U256::ZERO);
+        assert_eq!(many[1].amount_out_min, U256::ZERO);
+
+        assert_eq!(many[2].pool_address, Some(p3));
+        assert_eq!(many[2].one_inch_zero_for_one, Some(false));
+        assert_eq!(many[2].amount_in, U256::ZERO);
+        assert_eq!(
+            many[2].amount_out_min, min_return,
+            "final hop carries the user's slippage bound"
+        );
+    }
+
+    #[test]
+    fn decode_one_inch_v6_uniswap_v3_swap_with_direction_flag() {
+        use IOneInchV6Router::uniswapV3SwapCall;
+        let p = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let amount = U256::from(7_000u64);
+        let min_return = U256::from(6_900u64);
+        let calldata = uniswapV3SwapCall {
+            amount,
+            minReturn: min_return,
+            pools: vec![encode_pool(p, true)],
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1);
+        let r = &many[0];
+        assert_eq!(r.protocol, Protocol::OneInchV6);
+        assert_eq!(r.pool_address, Some(p));
+        assert_eq!(r.one_inch_zero_for_one, Some(true));
+        assert_eq!(
+            r.token_in, Address::ZERO,
+            "uniswapV3Swap has no calldata src token — pipeline resolves from pool + zeroForOne"
+        );
+        assert_eq!(r.amount_in, amount);
+        assert_eq!(r.amount_out_min, min_return);
+    }
+
+    #[test]
+    fn decode_one_inch_v6_uniswap_v3_swap_empty_pools_rejected() {
+        use IOneInchV6Router::uniswapV3SwapCall;
+        let calldata = uniswapV3SwapCall {
+            amount: U256::from(1u64),
+            minReturn: U256::ZERO,
+            pools: vec![],
+        }
+        .abi_encode();
+        let err = decode_pending_many(one_inch_router(), &calldata).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::EmptyPath),
+            "empty pool list should reject as EmptyPath, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_one_inch_v6_eth_unoswap_treats_src_as_weth() {
+        // ethUnoswap omits the token arg — src is native ETH which the
+        // router wraps to WETH. Decoder surfaces WETH as token_in so
+        // downstream pool lookups key off the wrapped token.
+        use IOneInchV6Router::ethUnoswapCall;
+        let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let calldata = ethUnoswapCall {
+            minReturn: U256::from(42u64),
+            dex: encode_pool(pool, false),
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1);
+        let r = &many[0];
+        assert_eq!(r.token_in, WETH_ADDRESS);
+        assert_eq!(r.pool_address, Some(pool));
+        // amount comes from msg.value, not calldata — surfaced as zero
+        // because the pending-tx layer carries value separately.
+        assert_eq!(r.amount_in, U256::ZERO);
+        assert_eq!(r.amount_out_min, U256::from(42u64));
+    }
+
+    #[test]
+    fn decode_one_inch_v6_unoswap_to_carries_recipient() {
+        use IOneInchV6Router::unoswapToCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let recipient = address!("000000000000000000000000000000000000dEaD");
+        let mut token_be = [0u8; 32];
+        token_be[12..32].copy_from_slice(weth.as_slice());
+        let mut to_be = [0u8; 32];
+        to_be[12..32].copy_from_slice(recipient.as_slice());
+        let calldata = unoswapToCall {
+            to: U256::from_be_bytes(to_be),
+            token: U256::from_be_bytes(token_be),
+            amount: U256::from(1_000u64),
+            minReturn: U256::from(900u64),
+            dex: encode_pool(pool, true),
+        }
+        .abi_encode();
+        let many = decode_pending_many(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(many.len(), 1);
+        assert_eq!(many[0].recipient, recipient);
+        assert_eq!(many[0].pool_address, Some(pool));
+    }
+
+    #[test]
+    fn decode_pending_single_helper_returns_first_record_for_chain() {
+        // The single-record `decode_pending` collapses a multi-pool 1inch
+        // chain to the first hop. Helpful for call sites that haven't yet
+        // migrated to `decode_pending_many` but still want decode_failure
+        // numbers to drop on real traffic.
+        use IOneInchV6Router::unoswap2Call;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let p1 = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let p2 = address!("11b815efB8f581194ae79006d24E0d814B7697F6");
+        let mut token_be = [0u8; 32];
+        token_be[12..32].copy_from_slice(weth.as_slice());
+        let calldata = unoswap2Call {
+            token: U256::from_be_bytes(token_be),
+            amount: U256::from(1_000u64),
+            minReturn: U256::from(900u64),
+            dex: encode_pool(p1, true),
+            dex2: encode_pool(p2, false),
+        }
+        .abi_encode();
+        let single = decode_pending(one_inch_router(), &calldata).expect("decode");
+        assert_eq!(single.pool_address, Some(p1));
+        assert_eq!(single.token_in, weth);
     }
 }

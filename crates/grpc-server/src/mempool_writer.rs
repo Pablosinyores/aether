@@ -69,6 +69,8 @@ pub const PROTOCOL_BALANCER: &str = "balancer";
 /// downstream.
 #[allow(dead_code)]
 pub const PROTOCOL_BANCOR: &str = "bancor";
+#[allow(dead_code)]
+pub const PROTOCOL_ONE_INCH_V6: &str = "one_inch_v6";
 
 /// Insert payload for the `mempool_predictions` table. Field shapes mirror
 /// the SQL schema 1:1 so a sqlx bind is a straight enumeration.
@@ -154,6 +156,17 @@ pub enum PredictedPostState {
     /// (neither token is BNT) bail upstream — only single-pool
     /// Bancor swaps reach the writer.
     Bancor {
+        reserve_in: f64,
+        reserve_out: f64,
+    },
+    /// 1inch v6 peeled-pool record: the per-hop pool is resolved via
+    /// `pool_address`, its protocol family looked up in the registry.
+    /// `reserve_in`/`reserve_out` are the post-swap reserves on the
+    /// peeled pool's affected pair, same shape as the underlying
+    /// protocol's variant — the kind discriminator records that the
+    /// upstream calldata was a 1inch chain so the reconciler can split
+    /// metrics by router.
+    OneInchV6 {
         reserve_in: f64,
         reserve_out: f64,
     },
