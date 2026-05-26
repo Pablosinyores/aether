@@ -398,6 +398,15 @@ fn build_backrun_validator_config(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8);
+    // Optional AetherExecutor runtime bytecode for demo / shadow runs
+    // against a forked chain where the contract is not deployed. Path
+    // points at forge's `out/AetherExecutor.sol/AetherExecutor.json` —
+    // the hex string under `.deployedBytecode.object` is loaded and
+    // injected into the revm CacheDB on every sim. Unset in production.
+    let executor_bytecode = std::env::var("AETHER_EXECUTOR_BYTECODE_PATH")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p.trim()).ok())
+        .and_then(|s| load_executor_runtime_bytecode(&s).ok());
     Some(mempool_pipeline::BackrunValidatorConfig {
         executor_address,
         searcher_caller,
@@ -412,5 +421,24 @@ fn build_backrun_validator_config(
         // with the SimContext's shared handle so the validator and the
         // background refresher rotate the same `ArcSwap`.
         mempool_prewarm: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+        executor_bytecode,
     })
+}
+
+/// Pull the `deployedBytecode.object` hex string out of a forge artifact
+/// JSON and decode it. Returns `Err` for missing field, malformed JSON,
+/// or non-hex bytes — callers treat the error as "no bytecode override"
+/// and the sim falls back to the on-chain fetch path.
+fn load_executor_runtime_bytecode(
+    artifact_json: &str,
+) -> Result<alloy::primitives::Bytes, Box<dyn std::error::Error>> {
+    let v: serde_json::Value = serde_json::from_str(artifact_json)?;
+    let hex_str = v
+        .get("deployedBytecode")
+        .and_then(|d| d.get("object"))
+        .and_then(|o| o.as_str())
+        .ok_or("artifact missing deployedBytecode.object")?;
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = alloy::hex::decode(hex_str)?;
+    Ok(alloy::primitives::Bytes::from(bytes))
 }
