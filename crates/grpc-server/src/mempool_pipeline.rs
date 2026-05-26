@@ -623,25 +623,13 @@ fn try_post_state_scan(
     event_to: Address,
     event: &PendingTxEvent,
 ) {
-    // Bancor V3 post-state scan is intentionally deferred to a follow-up
-    // PR. `BancorPool` is not in the `PoolState` enum and has no
-    // `predict_post_state` analytical hook yet — adding both is its own
-    // ~500 LOC change (BNT bonding-curve math + PoolState/UnifiedPostState
-    // extension). Decoded swaps already surface on
-    // `pending_dex_tx_total{protocol="bancor_v3"}` via `emit_decoded`
-    // upstream; the cycle-scan integration is the next increment.
-    if swap.protocol == Protocol::BancorV3 {
-        metrics.inc_pending_arb_sim_skipped("bancor_post_state_pending");
-        return;
-    }
-
     let target_protocol = match swap.protocol {
         Protocol::UniswapV2 => ProtocolType::UniswapV2,
         Protocol::SushiSwap => ProtocolType::SushiSwap,
         Protocol::UniswapV3 => ProtocolType::UniswapV3,
         Protocol::BalancerV2 => ProtocolType::BalancerV2,
         Protocol::Curve => ProtocolType::Curve,
-        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
+        Protocol::BancorV3 => ProtocolType::BancorV3,
     };
 
     let token_idx = ctx.token_index.load();
@@ -699,7 +687,7 @@ fn try_post_state_scan(
             let dx = u256_to_f64_saturating(swap.amount_in);
             predict_v2_post_state(edge_fwd.reserve_in, edge_fwd.reserve_out, dx, fee_factor)
         }
-        Protocol::UniswapV3 | Protocol::BalancerV2 | Protocol::Curve => {
+        Protocol::UniswapV3 | Protocol::BalancerV2 | Protocol::Curve | Protocol::BancorV3 => {
             let pool_addr = meta.pool_id.address;
             let Some(state_arc) = ctx.pool_states.get(&pool_addr).map(|r| Arc::clone(r.value()))
             else {
@@ -724,7 +712,6 @@ fn try_post_state_scan(
             }
             (pin, pout)
         }
-        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     };
 
     // Clone the graph and apply the post-state to both directions of the
@@ -762,7 +749,10 @@ fn try_post_state_scan(
             reserve_in: post_in,
             reserve_out: post_out,
         },
-        Protocol::BancorV3 => unreachable!("bancor early-returned above"),
+        Protocol::BancorV3 => PredictedPostState::Bancor {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
     }
     .into_json();
     let prediction = NewMempoolPrediction {
@@ -1327,6 +1317,15 @@ fn unified_to_post_reserves(
             let post_out = u256_to_f64_saturating(c.new_balance_out);
             (post_in, post_out)
         }
+        UnifiedPostState::Bancor(b) => {
+            // Same shape as Curve: `BancorPostState.new_balance_in`/`new_balance_out`
+            // are already aligned with the swap direction (the predictor checks
+            // `token_in == self.token` vs `== self.bnt` upstream). Trust them
+            // directly without re-deriving the direction from meta.token0/token1.
+            let post_in = u256_to_f64_saturating(b.new_balance_in);
+            let post_out = u256_to_f64_saturating(b.new_balance_out);
+            (post_in, post_out)
+        }
     }
 }
 
@@ -1553,6 +1552,41 @@ mod tests {
         let (pin_r, pout_r) = unified_to_post_reserves(usdt, &meta, &post_reverse);
         assert!((pin_r - 11_000_000.0).abs() < 1e-6);
         assert!((pout_r - 9_900_000.0).abs() < 1e-6);
+    }
+
+    // ----- unified_to_post_reserves Bancor arm -----
+
+    #[test]
+    fn unified_to_post_reserves_bancor_uses_predictor_balances_directly() {
+        use aether_common::types::PoolId;
+        use aether_pools::bancor::BancorPostState;
+        use aether_pools::UnifiedPostState;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bnt = address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C");
+        let meta = PoolMetadata {
+            token0_idx: 0,
+            token1_idx: 1,
+            token0: weth,
+            token1: bnt,
+            pool_id: PoolId {
+                address: Address::ZERO,
+                protocol: ProtocolType::BancorV3,
+            },
+            protocol: ProtocolType::BancorV3,
+            fee_bps: 30,
+            tick_spacing: None,
+        };
+        // Predictor aligns new_balance_in/out to swap direction — helper
+        // trusts them directly regardless of swap_token_in vs meta.token0/1.
+        let post = UnifiedPostState::Bancor(BancorPostState {
+            new_balance_in: U256::from(1_010_000_000_000_000_000_000u128),
+            new_balance_out: U256::from(1_980_198_019_801_980_198_018u128),
+            amount_out: U256::from(19_801_980_198_019_801_982u128),
+            analytical: true,
+        });
+        let (pin, pout) = unified_to_post_reserves(weth, &meta, &post);
+        assert!((pin - 1_010_000_000_000_000_000_000.0).abs() < 1e6);
+        assert!((pout - 1_980_198_019_801_980_198_018.0).abs() < 1e6);
     }
 
     // ----- predict_v2_post_state -----
