@@ -148,6 +148,15 @@ pub enum PredictedPostState {
         reserve_in: f64,
         reserve_out: f64,
     },
+    /// Bancor V3 bonding-curve pool: post-swap balances on the
+    /// (token, BNT) sides, aligned with the swap direction by the
+    /// `BancorPool::predict_post_state` predictor. Multi-hop trades
+    /// (neither token is BNT) bail upstream — only single-pool
+    /// Bancor swaps reach the writer.
+    Bancor {
+        reserve_in: f64,
+        reserve_out: f64,
+    },
 }
 
 impl PredictedPostState {
@@ -522,13 +531,17 @@ mod tests {
                 reserve_in: 1_000_000.0,
                 reserve_out: 999_500.0,
             },
+            PredictedPostState::Bancor {
+                reserve_in: 1_000_000.0,
+                reserve_out: 2_000_000.0,
+            },
         ] {
             let json = serde_json::to_value(&original).expect("serialize");
             let kind = json.get("kind").and_then(|v| v.as_str()).expect("kind present");
             // `kind` lives under `#[serde(rename_all = "snake_case")]` so a
             // future refactor that drops the rename surfaces here.
             assert!(
-                ["v2", "v3", "balancer", "curve"].contains(&kind),
+                ["v2", "v3", "balancer", "curve", "bancor"].contains(&kind),
                 "unexpected kind {kind}"
             );
             let parsed: PredictedPostState = serde_json::from_value(json).expect("deserialize");
