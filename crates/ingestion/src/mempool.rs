@@ -332,10 +332,14 @@ fn warn_if_non_alchemy_endpoint(ws_url: &str) {
 ///
 /// Curated for the testing scaffold: UniswapV2 Router02, UniswapV3
 /// SwapRouter, UniswapV3 SwapRouter02, SushiSwap Router02, Curve Router,
-/// Balancer Vault. 1inch v6 AggregationRouter is intentionally absent — its
-/// multi-step calldata does not decode against a simple `sol!` ABI and would
-/// inflate the decode-failure counter without yielding usable hits in the
-/// scaffold; revisit once the decoder has the multi-encode path.
+/// Balancer Vault, Bancor V3 BancorNetwork, plus the highest-volume Curve
+/// pool addresses (the pool-direct `exchange()` path skips the router so
+/// the router address alone misses Curve traffic — see
+/// `aether-pools::router_decoder::try_curve`). 1inch v6 AggregationRouter
+/// is intentionally absent — its multi-step calldata does not decode
+/// against a simple `sol!` ABI and would inflate the decode-failure
+/// counter without yielding usable hits in the scaffold; revisit once
+/// the decoder has the multi-encode path.
 pub fn default_router_addresses() -> Vec<Address> {
     use alloy::primitives::address;
     vec![
@@ -346,6 +350,19 @@ pub fn default_router_addresses() -> Vec<Address> {
         address!("99a58482BD75cbab83b27EC03CA68fF489b5788f"), // Curve Router
         address!("BA12222222228d8Ba445958a75a0704d566BF2C8"), // Balancer V2 Vault
         address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB"), // Bancor V3 BancorNetwork
+        // ── Curve pools (pool-direct `exchange()` traffic) ──
+        // Curve calls hit pool addresses directly when the user / aggregator
+        // skips the Curve Router. Without these in the `toAddress` filter
+        // Alchemy never forwards them and the decoder we just landed
+        // (PR #156) stays unreachable for the majority of Curve volume.
+        // List is the top-by-volume mainnet pools as of 2026-05; keep
+        // synced with `config/pools.toml` Curve entries.
+        address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"), // Curve 3pool (DAI/USDC/USDT)
+        address!("DC24316b9AE028F1497c275EB9192a3Ea0f67022"), // Curve stETH/ETH
+        address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46"), // Curve tricrypto2 (USDT/WBTC/WETH)
+        address!("a1F8A6807c402E4A15ef4EBa36528A3FED24E577"), // Curve frxETH/ETH
+        address!("4eBdF703948ddCEA3B11f675B4D1Fba9d2414A14"), // Curve tricryptoUSDC
+        address!("f5f5B97624542D72A9E06f04804Bf81baA15e2B4"), // Curve tricryptoUSDT
     ]
 }
 
