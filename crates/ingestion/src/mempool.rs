@@ -332,14 +332,10 @@ fn warn_if_non_alchemy_endpoint(ws_url: &str) {
 ///
 /// Curated for the testing scaffold: UniswapV2 Router02, UniswapV3
 /// SwapRouter, UniswapV3 SwapRouter02, SushiSwap Router02, Curve Router,
-/// Balancer Vault, Bancor V3 BancorNetwork, plus the highest-volume Curve
-/// pool addresses (the pool-direct `exchange()` path skips the router so
-/// the router address alone misses Curve traffic — see
-/// `aether-pools::router_decoder::try_curve`). 1inch v6 AggregationRouter
-/// is intentionally absent — its multi-step calldata does not decode
-/// against a simple `sol!` ABI and would inflate the decode-failure
-/// counter without yielding usable hits in the scaffold; revisit once
-/// the decoder has the multi-encode path.
+/// Balancer Vault, Bancor V3 BancorNetwork, 1inch v6 AggregationRouter,
+/// plus the highest-volume Curve pool addresses (the pool-direct
+/// `exchange()` path skips the router so the router address alone
+/// misses Curve traffic — see `aether-pools::router_decoder::try_curve`).
 pub fn default_router_addresses() -> Vec<Address> {
     use alloy::primitives::address;
     vec![
@@ -350,6 +346,7 @@ pub fn default_router_addresses() -> Vec<Address> {
         address!("99a58482BD75cbab83b27EC03CA68fF489b5788f"), // Curve Router
         address!("BA12222222228d8Ba445958a75a0704d566BF2C8"), // Balancer V2 Vault
         address!("eEF417e1D5CC832e619ae18D2F140De2999dD4fB"), // Bancor V3 BancorNetwork
+        address!("111111125421cA6dc452d289314280a0f8842A65"), // 1inch v6 AggregationRouter
         // ── Curve pools (pool-direct `exchange()` traffic) ──
         // Curve calls hit pool addresses directly when the user / aggregator
         // skips the Curve Router. Without these in the `toAddress` filter
