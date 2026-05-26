@@ -28,9 +28,10 @@ use aether_common::types::ProtocolType;
 use aether_detector::bellman_ford::BellmanFord;
 use aether_detector::opportunity::DetectedCycle;
 use aether_ingestion::subscription::{EventChannels, PendingTxEvent};
+use aether_pools::bancor::BNT_ADDRESS;
 use aether_pools::router_decoder::{decode_pending, DecodeError, DecodedSwap, Protocol};
 use aether_pools::{
-    predict_post_state_with_replay, PoolStateCache, ReplayProtocol, UnifiedPostState,
+    predict_post_state_with_replay, PoolState, PoolStateCache, ReplayProtocol, UnifiedPostState,
 };
 use aether_simulator::calldata::build_execute_arb_calldata;
 use aether_simulator::mempool_backrun::{
@@ -530,6 +531,43 @@ fn pre_sim_filter(metrics: &EngineMetrics, ctx: &SimContext, swap: &DecodedSwap)
         // without double-counting under `mempool_filtered_total`.
         None => return true,
     };
+    // Bancor multi-hop special case: a victim swap of tokenA -> BNT -> tokenB
+    // hits TWO pools (tokenA/BNT and tokenB/BNT) and the registry has no
+    // direct (tokenA, tokenB, BancorV3) entry. The downstream
+    // `try_post_state_scan` resolves both pools and emits two graph-edge
+    // updates; here we just verify the two BNT-pair pools exist before
+    // scheduling the spawn_blocking, mirroring the `not_in_registry` guard
+    // for direct pairs.
+    if target_protocol == ProtocolType::BancorV3
+        && swap.token_in != BNT_ADDRESS
+        && swap.token_out != BNT_ADDRESS
+    {
+        let leg_a = ctx.lookup_pool(swap.token_in, BNT_ADDRESS, ProtocolType::BancorV3);
+        let leg_b = ctx.lookup_pool(swap.token_out, BNT_ADDRESS, ProtocolType::BancorV3);
+        if leg_a.is_none() || leg_b.is_none() {
+            metrics.inc_mempool_filtered("not_in_registry");
+            info!(
+                target: "aether::mempool",
+                reason = "not_in_registry",
+                protocol = ?swap.protocol,
+                token_in = %swap.token_in,
+                token_out = %swap.token_out,
+                multihop = true,
+                "FILTER DROP"
+            );
+            return false;
+        }
+        info!(
+            target: "aether::mempool",
+            protocol = ?swap.protocol,
+            token_in = %swap.token_in,
+            token_out = %swap.token_out,
+            amount_in = %swap.amount_in,
+            multihop = true,
+            "FILTER PASS"
+        );
+        return true;
+    }
     if ctx
         .lookup_pool(swap.token_in, swap.token_out, target_protocol)
         .is_none()
@@ -631,6 +669,28 @@ fn try_post_state_scan(
         Protocol::Curve => ProtocolType::Curve,
         Protocol::BancorV3 => ProtocolType::BancorV3,
     };
+
+    // Bancor multi-hop dispatch: tokenA -> BNT -> tokenB touches two pools
+    // and no single (tokenA, tokenB, BancorV3) registry entry exists. The
+    // multi-hop helper looks up both BNT pairs, runs the analytical
+    // predictor on each leg, and emits two graph-edge updates + two
+    // prediction rows. The single-leg path below intentionally keeps the
+    // direct-pair predictor for the tokenA <-> BNT case.
+    if target_protocol == ProtocolType::BancorV3
+        && swap.token_in != BNT_ADDRESS
+        && swap.token_out != BNT_ADDRESS
+    {
+        try_post_state_scan_bancor_multihop(
+            metrics,
+            ctx,
+            router_label,
+            swap,
+            event_tx_hash,
+            event_to,
+            event,
+        );
+        return;
+    }
 
     let token_idx = ctx.token_index.load();
     let Some(in_idx) = token_idx.get_index(&swap.token_in) else {
@@ -815,6 +875,284 @@ fn try_post_state_scan(
         token_out = %swap.token_out,
         candidates = profitable.len(),
         best_profit_bps = (profitable[0].profit_factor() * 10_000.0) as i64,
+        "MEMPOOL ARB CANDIDATE"
+    );
+}
+
+/// Bancor V3 multi-hop post-state scan.
+///
+/// A victim swap `tokenA -> BNT -> tokenB` settles atomically through the
+/// BNT intermediary across TWO pools. The decoder emits a single
+/// `DecodedSwap` keyed on `(tokenA, tokenB)` with no pool address. This
+/// function resolves both BNT-pair pools in the registry, runs the
+/// analytical multi-hop predictor in [`BancorPool::predict_post_state_multihop`],
+/// applies the resulting post-state to BOTH graph edges (tokenA <-> BNT
+/// and tokenB <-> BNT, including their reverse directions), runs one
+/// Bellman-Ford scan over the three affected vertices, and writes TWO
+/// `mempool_predictions` rows — one per pool — sharing the victim's tx
+/// hash. The writer table is keyed on a `prediction_id` UUID so multiple
+/// rows per tx are first-class.
+///
+/// Skip reasons:
+///   * `bancor_second_pool_not_found` — exactly one of the two BNT pairs
+///     is missing from the registry. Distinct from `pool_not_registered`
+///     so dashboards can tell missing-multi-hop apart from missing-single.
+///   * `bancor_multihop_low_confidence` — the multi-hop predictor itself
+///     returned `None` (uninitialised reserves, degenerate amounts, etc.).
+///   * Existing reasons (`token_*_unknown`, `pool_state_missing`, etc.)
+///     are reused where the failure shape matches the single-leg path.
+#[allow(clippy::too_many_arguments)]
+fn try_post_state_scan_bancor_multihop(
+    metrics: &EngineMetrics,
+    ctx: &SimContext,
+    router_label: &str,
+    swap: &DecodedSwap,
+    event_tx_hash: alloy::primitives::B256,
+    event_to: Address,
+    event: &PendingTxEvent,
+) {
+    // Resolve token vertices first — the cycle scan needs BNT too because
+    // the multi-hop path passes through it.
+    let token_idx = ctx.token_index.load();
+    let Some(in_idx) = token_idx.get_index(&swap.token_in) else {
+        metrics.inc_pending_arb_sim_skipped("token_in_unknown");
+        return;
+    };
+    let Some(out_idx) = token_idx.get_index(&swap.token_out) else {
+        metrics.inc_pending_arb_sim_skipped("token_out_unknown");
+        return;
+    };
+    let Some(bnt_idx) = token_idx.get_index(&BNT_ADDRESS) else {
+        metrics.inc_pending_arb_sim_skipped("token_in_unknown");
+        return;
+    };
+
+    // Look up both legs. `pre_sim_filter` already verifies both exist for
+    // the steady-state path, but a registry swap between the filter and
+    // the spawn_blocking is possible in principle, so the lookup repeats
+    // here under a fresh `pool_registry` load.
+    let leg_a_meta =
+        match ctx.lookup_pool(swap.token_in, BNT_ADDRESS, ProtocolType::BancorV3) {
+            Some(m) => m,
+            None => {
+                metrics.inc_pending_arb_sim_skipped("bancor_second_pool_not_found");
+                return;
+            }
+        };
+    let leg_b_meta =
+        match ctx.lookup_pool(swap.token_out, BNT_ADDRESS, ProtocolType::BancorV3) {
+            Some(m) => m,
+            None => {
+                metrics.inc_pending_arb_sim_skipped("bancor_second_pool_not_found");
+                return;
+            }
+        };
+
+    // Pull live PoolState for both pools — the analytical predictor needs
+    // the up-to-date reserves the engine refreshes on every TokensTraded
+    // event.
+    let Some(leg_a_state) = ctx
+        .pool_states
+        .get(&leg_a_meta.pool_id.address)
+        .map(|r| Arc::clone(r.value()))
+    else {
+        metrics.inc_pending_arb_sim_skipped("pool_state_missing");
+        return;
+    };
+    let Some(leg_b_state) = ctx
+        .pool_states
+        .get(&leg_b_meta.pool_id.address)
+        .map(|r| Arc::clone(r.value()))
+    else {
+        metrics.inc_pending_arb_sim_skipped("pool_state_missing");
+        return;
+    };
+    let (leg_a_pool, leg_b_pool) = match (&*leg_a_state, &*leg_b_state) {
+        (PoolState::Bancor(a), PoolState::Bancor(b)) => (a, b),
+        _ => {
+            // Registry / cache mismatch: the registry says BancorV3 but the
+            // pool_states cache holds a different variant. Surface as a
+            // low-confidence skip rather than panicking; the engine's
+            // bootstrap normally keeps these in sync.
+            metrics.inc_pending_arb_sim_skipped("bancor_multihop_low_confidence");
+            return;
+        }
+    };
+
+    let (leg_a_post, leg_b_post) = match leg_a_pool.predict_post_state_multihop(
+        swap.token_in,
+        swap.amount_in,
+        swap.token_out,
+        leg_b_pool,
+    ) {
+        Some(pair) => pair,
+        None => {
+            metrics.inc_pending_arb_sim_skipped("bancor_multihop_low_confidence");
+            return;
+        }
+    };
+
+    // Snapshot the live graph once and verify the four affected edges
+    // (tokenA->BNT, BNT->tokenA, tokenB->BNT, BNT->tokenB) exist so the
+    // graph clone can update them all. Missing any edge falls through to
+    // `graph_edge_missing` mirroring the single-leg path.
+    let snapshot = ctx.snapshot_manager.load_full();
+    let leg_a_pool_id = leg_a_meta.pool_id;
+    let leg_b_pool_id = leg_b_meta.pool_id;
+    let leg_a_fee = leg_a_meta.fee_factor();
+    let leg_b_fee = leg_b_meta.fee_factor();
+    let has_edge = |from: usize, to: usize, pid| {
+        snapshot
+            .graph
+            .edges_from(from)
+            .iter()
+            .any(|e| e.to == to && e.pool_id == pid)
+    };
+    if !has_edge(in_idx, bnt_idx, leg_a_pool_id)
+        || !has_edge(bnt_idx, in_idx, leg_a_pool_id)
+        || !has_edge(bnt_idx, out_idx, leg_b_pool_id)
+        || !has_edge(out_idx, bnt_idx, leg_b_pool_id)
+    {
+        metrics.inc_pending_arb_sim_skipped("graph_edge_missing");
+        return;
+    }
+
+    // Convert each leg's `BancorPostState` (aligned to the leg's swap
+    // direction) into graph-edge reserve pairs.
+    let leg_a_post_in = u256_to_f64_saturating(leg_a_post.new_balance_in);
+    let leg_a_post_out = u256_to_f64_saturating(leg_a_post.new_balance_out);
+    let leg_b_post_in = u256_to_f64_saturating(leg_b_post.new_balance_in);
+    let leg_b_post_out = u256_to_f64_saturating(leg_b_post.new_balance_out);
+    if leg_a_post_in <= 0.0
+        || leg_a_post_out <= 0.0
+        || leg_b_post_in <= 0.0
+        || leg_b_post_out <= 0.0
+    {
+        metrics.inc_pending_arb_sim_skipped("post_state_invalid");
+        return;
+    }
+
+    // Clone the graph and apply both legs' post-state. The reverse
+    // directions are seeded so cycle scans across either side observe the
+    // updated reserves in either traversal direction.
+    let mut graph = snapshot.graph.clone();
+    // Leg A: in_idx <-> bnt_idx (tokenA in, BNT out)
+    graph.update_edge_from_reserves(
+        in_idx,
+        bnt_idx,
+        leg_a_pool_id,
+        leg_a_post_in,
+        leg_a_post_out,
+        leg_a_fee,
+    );
+    graph.update_edge_from_reserves(
+        bnt_idx,
+        in_idx,
+        leg_a_pool_id,
+        leg_a_post_out,
+        leg_a_post_in,
+        leg_a_fee,
+    );
+    // Leg B: bnt_idx <-> out_idx (BNT in, tokenB out). The predictor's
+    // `new_balance_in` is on the BNT side (token_in to leg_b_pool's
+    // `predict_post_state` was BNT), `new_balance_out` is on tokenB.
+    graph.update_edge_from_reserves(
+        bnt_idx,
+        out_idx,
+        leg_b_pool_id,
+        leg_b_post_in,
+        leg_b_post_out,
+        leg_b_fee,
+    );
+    graph.update_edge_from_reserves(
+        out_idx,
+        bnt_idx,
+        leg_b_pool_id,
+        leg_b_post_out,
+        leg_b_post_in,
+        leg_b_fee,
+    );
+
+    let cycles = ctx
+        .detector
+        .detect_from_affected(&graph, &[in_idx, bnt_idx, out_idx]);
+    let profitable: Vec<_> = cycles.into_iter().filter(|c| c.is_profitable()).collect();
+
+    // Persist TWO prediction rows — one per affected pool. Both share the
+    // victim's tx hash and predicted_target_block so the reconciler can
+    // join them as siblings. `profit_factor_predicted` is the cycle's
+    // factor (same on both rows when profitable) so dashboards see the
+    // multi-hop trade contributed to the candidate funnel.
+    let best_profit_factor = profitable.first().map(|c| c.profit_factor());
+    let predicted_target_block = snapshot.block_number.saturating_add(1);
+    for (meta, post_in, post_out) in [
+        (&leg_a_meta, leg_a_post_in, leg_a_post_out),
+        (&leg_b_meta, leg_b_post_in, leg_b_post_out),
+    ] {
+        let prediction = NewMempoolPrediction {
+            prediction_id: Uuid::new_v4(),
+            decoded_at: Utc::now(),
+            pending_tx_hash: event_tx_hash,
+            router_address: event_to,
+            protocol: decoder_protocol_label(swap.protocol),
+            token_in: swap.token_in,
+            token_out: swap.token_out,
+            amount_in: swap.amount_in,
+            pool_address: Some(meta.pool_id.address),
+            predicted_target_block,
+            predicted_post_state: PredictedPostState::Bancor {
+                reserve_in: post_in,
+                reserve_out: post_out,
+            }
+            .into_json(),
+            profit_factor_predicted: best_profit_factor,
+            detection_lead_ms: None,
+            engine_git_sha: ctx.engine_git_sha.clone(),
+        };
+        ctx.prediction_sink.insert_prediction(prediction);
+    }
+
+    if profitable.is_empty() {
+        metrics.inc_pending_arb_sim_skipped("no_profitable_cycle");
+        return;
+    }
+
+    // Bump candidate counters once per profitable cycle, same shape as
+    // the single-leg path. A multi-hop swap that surfaces N profitable
+    // cycles contributes N to the metric — symmetrical to the single-leg
+    // case, not doubled.
+    for cycle in &profitable {
+        let bucket = profit_bucket(cycle.profit_factor());
+        metrics.inc_pending_arb_candidates(router_label, bucket);
+    }
+
+    if let (Some(publisher), Some(cfg)) = (ctx.arb_publisher.as_ref(), ctx.backrun.as_ref()) {
+        if let Some(best) = profitable.first() {
+            let _ = run_backrun_validation(
+                metrics,
+                publisher,
+                cfg,
+                &snapshot.graph,
+                ctx.token_index.load().as_ref(),
+                best,
+                event,
+                router_label,
+                snapshot.block_number,
+            );
+        }
+    }
+
+    info!(
+        target: "aether::mempool",
+        router = %router_label,
+        protocol = ?swap.protocol,
+        leg_a_pool = %leg_a_meta.pool_id.address,
+        leg_b_pool = %leg_b_meta.pool_id.address,
+        token_in = %swap.token_in,
+        token_out = %swap.token_out,
+        candidates = profitable.len(),
+        best_profit_bps = (profitable[0].profit_factor() * 10_000.0) as i64,
+        multihop = true,
         "MEMPOOL ARB CANDIDATE"
     );
 }
@@ -1932,5 +2270,363 @@ mod tests {
             decoder_protocol_to_type(Protocol::BalancerV2),
             Some(ProtocolType::BalancerV2)
         );
+    }
+
+    // ----- Bancor multi-hop integration tests -----
+
+    use aether_common::types::PoolId;
+    use aether_pools::bancor::BancorPool;
+    use aether_pools::{Pool, PoolState};
+    use aether_state::price_graph::PriceGraph;
+    use std::sync::Mutex as StdMutex;
+
+    /// Test-only sink that records every prediction without touching
+    /// Postgres. Mirrors the `CapturingSink` in `mempool_writer::tests`
+    /// (which is module-private there) so the multi-hop tests can assert
+    /// on the persisted rows directly.
+    struct LocalCapturingSink {
+        seen: StdMutex<Vec<crate::mempool_writer::NewMempoolPrediction>>,
+    }
+    impl LocalCapturingSink {
+        fn new() -> Self {
+            Self {
+                seen: StdMutex::new(Vec::new()),
+            }
+        }
+        fn snapshot(&self) -> Vec<crate::mempool_writer::NewMempoolPrediction> {
+            self.seen.lock().expect("capturing sink poisoned").clone()
+        }
+    }
+    impl crate::mempool_writer::MempoolPredictionSink for LocalCapturingSink {
+        fn insert_prediction(&self, prediction: crate::mempool_writer::NewMempoolPrediction) {
+            self.seen
+                .lock()
+                .expect("capturing sink poisoned")
+                .push(prediction);
+        }
+    }
+
+    fn bancor_pool_meta(
+        addr: Address,
+        token: Address,
+        bnt: Address,
+        token0_idx: usize,
+        token1_idx: usize,
+    ) -> (Address, PoolMetadata) {
+        let pool_id = PoolId {
+            address: addr,
+            protocol: ProtocolType::BancorV3,
+        };
+        let meta = PoolMetadata {
+            token0_idx,
+            token1_idx,
+            token0: token,
+            token1: bnt,
+            pool_id,
+            protocol: ProtocolType::BancorV3,
+            fee_bps: 30,
+            tick_spacing: None,
+        };
+        (addr, meta)
+    }
+
+    /// Build a SimContext seeded with two Bancor pools (WETH/BNT and
+    /// LINK/BNT) covering the multi-hop dispatch path. Token vertices:
+    /// 0 = WETH, 1 = BNT, 2 = LINK.
+    fn multihop_sim_ctx(
+        prediction_sink: Arc<dyn crate::mempool_writer::MempoolPredictionSink>,
+        leg_b_present: bool,
+    ) -> Arc<SimContext> {
+        use aether_pools::new_pool_state_cache;
+
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let link = address!("514910771AF9Ca656af840dff83E8264EcF986CA");
+
+        let mut token_index = TokenIndex::default();
+        let weth_idx = token_index.get_or_insert(weth);
+        let bnt_idx = token_index.get_or_insert(BNT_ADDRESS);
+        let link_idx = token_index.get_or_insert(link);
+        assert_eq!(weth_idx, 0);
+        assert_eq!(bnt_idx, 1);
+        assert_eq!(link_idx, 2);
+
+        let leg_a_addr = address!("aaaa000000000000000000000000000000000001");
+        let leg_b_addr = address!("aaaa000000000000000000000000000000000002");
+
+        let (leg_a_pool_addr, leg_a_meta) =
+            bancor_pool_meta(leg_a_addr, weth, BNT_ADDRESS, weth_idx, bnt_idx);
+        let (leg_b_pool_addr, leg_b_meta) =
+            bancor_pool_meta(leg_b_addr, link, BNT_ADDRESS, link_idx, bnt_idx);
+
+        let mut registry: HashMap<Address, PoolMetadata> = HashMap::new();
+        registry.insert(leg_a_pool_addr, leg_a_meta.clone());
+        if leg_b_present {
+            registry.insert(leg_b_pool_addr, leg_b_meta.clone());
+        }
+
+        // Price graph: 3 vertices, 4 directed edges (each pool contributes
+        // forward + reverse). Reserves are chosen so the analytical
+        // multi-hop predictor accepts the swap without rounding to zero.
+        let mut graph = PriceGraph::new(3);
+        let leg_a_id = leg_a_meta.pool_id;
+        let leg_b_id = leg_b_meta.pool_id;
+        graph.add_edge(
+            weth_idx,
+            bnt_idx,
+            1.0,
+            leg_a_id,
+            leg_a_pool_addr,
+            ProtocolType::BancorV3,
+            U256::from(1u64),
+        );
+        graph.add_edge(
+            bnt_idx,
+            weth_idx,
+            1.0,
+            leg_a_id,
+            leg_a_pool_addr,
+            ProtocolType::BancorV3,
+            U256::from(1u64),
+        );
+        graph.add_edge(
+            link_idx,
+            bnt_idx,
+            1.0,
+            leg_b_id,
+            leg_b_pool_addr,
+            ProtocolType::BancorV3,
+            U256::from(1u64),
+        );
+        graph.add_edge(
+            bnt_idx,
+            link_idx,
+            1.0,
+            leg_b_id,
+            leg_b_pool_addr,
+            ProtocolType::BancorV3,
+            U256::from(1u64),
+        );
+        // Seed real reserves so update_edge_from_reserves operates on a
+        // live edge.
+        graph.update_edge_from_reserves(
+            weth_idx,
+            bnt_idx,
+            leg_a_id,
+            1_000_000_000_000_000_000_000.0,
+            2_000_000_000_000_000_000_000.0,
+            0.997,
+        );
+        graph.update_edge_from_reserves(
+            bnt_idx,
+            weth_idx,
+            leg_a_id,
+            2_000_000_000_000_000_000_000.0,
+            1_000_000_000_000_000_000_000.0,
+            0.997,
+        );
+        graph.update_edge_from_reserves(
+            link_idx,
+            bnt_idx,
+            leg_b_id,
+            500_000_000_000_000_000_000.0,
+            1_500_000_000_000_000_000_000.0,
+            0.997,
+        );
+        graph.update_edge_from_reserves(
+            bnt_idx,
+            link_idx,
+            leg_b_id,
+            1_500_000_000_000_000_000_000.0,
+            500_000_000_000_000_000_000.0,
+            0.997,
+        );
+
+        let pool_states = new_pool_state_cache();
+        let mut leg_a_pool =
+            BancorPool::new(leg_a_pool_addr, weth, BNT_ADDRESS, 30);
+        leg_a_pool.update_state(
+            U256::from(1_000_000_000_000_000_000_000u128),
+            U256::from(2_000_000_000_000_000_000_000u128),
+        );
+        pool_states.insert(leg_a_pool_addr, Arc::new(PoolState::Bancor(leg_a_pool)));
+        if leg_b_present {
+            let mut leg_b_pool =
+                BancorPool::new(leg_b_pool_addr, link, BNT_ADDRESS, 30);
+            leg_b_pool.update_state(
+                U256::from(500_000_000_000_000_000_000u128),
+                U256::from(1_500_000_000_000_000_000_000u128),
+            );
+            pool_states.insert(leg_b_pool_addr, Arc::new(PoolState::Bancor(leg_b_pool)));
+        }
+
+        Arc::new(SimContext::new(
+            Arc::new(ArcSwap::from_pointee(registry)),
+            Arc::new(ArcSwap::from_pointee(token_index)),
+            Arc::new(SnapshotManager::new(graph)),
+            BellmanFord::new(3, 1_000),
+            pool_states,
+            prediction_sink,
+            None,
+        ))
+    }
+
+    fn bancor_multihop_swap() -> DecodedSwap {
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let link = address!("514910771AF9Ca656af840dff83E8264EcF986CA");
+        DecodedSwap {
+            protocol: Protocol::BancorV3,
+            router: Address::ZERO,
+            token_in: weth,
+            token_out: link,
+            // 10 WETH — large enough that the after-fee amount survives the
+            // 2000 BNT denominator without rounding to zero.
+            amount_in: U256::from(10_000_000_000_000_000_000u128),
+            amount_out_min: U256::ZERO,
+            recipient: Address::ZERO,
+            fee_bps: 0,
+            path_extra: vec![],
+            curve_indices: None,
+        }
+    }
+
+    fn bancor_pending_event() -> PendingTxEvent {
+        PendingTxEvent {
+            tx_hash: B256::ZERO,
+            from: Address::ZERO,
+            to: Some(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")),
+            value: U256::ZERO,
+            input: vec![],
+            gas_price: 0,
+            first_seen_unix_nanos: 0,
+            raw_tx: vec![],
+        }
+    }
+
+    #[test]
+    fn bancor_multihop_emits_two_predictions_with_distinct_pool_addresses() {
+        let metrics = EngineMetrics::new();
+        let sink = Arc::new(LocalCapturingSink::new());
+        let ctx = multihop_sim_ctx(sink.clone(), /*leg_b_present=*/ true);
+        let swap = bancor_multihop_swap();
+        let event = bancor_pending_event();
+        try_post_state_scan_bancor_multihop(
+            &metrics,
+            &ctx,
+            "router",
+            &swap,
+            event.tx_hash,
+            event.to.unwrap(),
+            &event,
+        );
+        let rows = sink.snapshot();
+        // Two rows — one per affected pool.
+        assert_eq!(rows.len(), 2, "expected 2 prediction rows, got {}", rows.len());
+        // Both rows share the victim's tx hash.
+        assert!(rows.iter().all(|r| r.pending_tx_hash == event.tx_hash));
+        // Pool addresses are distinct (leg A vs leg B).
+        let pools: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.pool_address).collect();
+        assert_eq!(
+            pools.len(),
+            2,
+            "expected 2 distinct pool addresses, got {pools:?}"
+        );
+        // Both rows are tagged as Bancor predictions.
+        for row in &rows {
+            assert_eq!(row.protocol, PROTOCOL_BANCOR);
+        }
+    }
+
+    #[test]
+    fn bancor_multihop_skips_with_named_reason_when_second_pool_missing() {
+        let metrics = EngineMetrics::new();
+        let sink = Arc::new(LocalCapturingSink::new());
+        // Drop the LINK/BNT pool from the registry — the leg B lookup
+        // must fail under `bancor_second_pool_not_found` rather than
+        // bumping the generic `pool_not_registered` skip.
+        let ctx = multihop_sim_ctx(sink.clone(), /*leg_b_present=*/ false);
+        let swap = bancor_multihop_swap();
+        let event = bancor_pending_event();
+        let before = metrics.pending_arb_sim_skipped_count("bancor_second_pool_not_found");
+        try_post_state_scan_bancor_multihop(
+            &metrics,
+            &ctx,
+            "router",
+            &swap,
+            event.tx_hash,
+            event.to.unwrap(),
+            &event,
+        );
+        assert_eq!(
+            metrics.pending_arb_sim_skipped_count("bancor_second_pool_not_found"),
+            before + 1,
+            "bancor_second_pool_not_found must increment"
+        );
+        // No predictions written on the skip path.
+        assert!(sink.snapshot().is_empty());
+    }
+
+    #[test]
+    fn bancor_multihop_skips_when_predictor_returns_none() {
+        // Construct a SimContext whose leg A pool has zero reserves so the
+        // analytical predictor short-circuits to `None` on the first leg.
+        // The skip reason must be `bancor_multihop_low_confidence`, not a
+        // single-leg label.
+        let metrics = EngineMetrics::new();
+        let sink = Arc::new(LocalCapturingSink::new());
+        let ctx = multihop_sim_ctx(sink.clone(), /*leg_b_present=*/ true);
+        // Replace leg A pool state with a zero-reserve pool to force the
+        // predictor to bail. Reuse the registry's known leg A address.
+        let leg_a_addr = address!("aaaa000000000000000000000000000000000001");
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let empty_pool = BancorPool::new(leg_a_addr, weth, BNT_ADDRESS, 30);
+        ctx.pool_states
+            .insert(leg_a_addr, Arc::new(PoolState::Bancor(empty_pool)));
+
+        let swap = bancor_multihop_swap();
+        let event = bancor_pending_event();
+        let before =
+            metrics.pending_arb_sim_skipped_count("bancor_multihop_low_confidence");
+        try_post_state_scan_bancor_multihop(
+            &metrics,
+            &ctx,
+            "router",
+            &swap,
+            event.tx_hash,
+            event.to.unwrap(),
+            &event,
+        );
+        assert_eq!(
+            metrics.pending_arb_sim_skipped_count("bancor_multihop_low_confidence"),
+            before + 1,
+        );
+        assert!(sink.snapshot().is_empty());
+    }
+
+    #[test]
+    fn pre_sim_filter_passes_bancor_multihop_when_both_pools_registered() {
+        // Multi-hop pre-filter: both BNT pairs in the registry → pass.
+        let metrics = EngineMetrics::new();
+        let sink: Arc<dyn crate::mempool_writer::MempoolPredictionSink> =
+            Arc::new(LocalCapturingSink::new());
+        let ctx = multihop_sim_ctx(sink, /*leg_b_present=*/ true);
+        let swap = bancor_multihop_swap();
+        assert!(pre_sim_filter(&metrics, &ctx, &swap));
+        // No drops attributed to `not_in_registry` on the happy path.
+        assert_eq!(filtered_count(&metrics, "not_in_registry"), 0);
+    }
+
+    #[test]
+    fn pre_sim_filter_drops_bancor_multihop_when_second_pool_absent() {
+        // Multi-hop pre-filter: second pool missing → drop under
+        // `not_in_registry` (the spawn_blocking + graph clone must be
+        // skipped before the sim task starts).
+        let metrics = EngineMetrics::new();
+        let sink: Arc<dyn crate::mempool_writer::MempoolPredictionSink> =
+            Arc::new(LocalCapturingSink::new());
+        let ctx = multihop_sim_ctx(sink, /*leg_b_present=*/ false);
+        let swap = bancor_multihop_swap();
+        assert!(!pre_sim_filter(&metrics, &ctx, &swap));
+        assert_eq!(filtered_count(&metrics, "not_in_registry"), 1);
     }
 }
