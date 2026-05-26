@@ -14,6 +14,7 @@ use aether_common::types::ProtocolType;
 use dashmap::DashMap;
 
 use crate::balancer::BalancerPool;
+use crate::bancor::BancorPool;
 use crate::curve::CurvePool;
 use crate::uniswap_v2::UniswapV2Pool;
 use crate::uniswap_v3::UniswapV3Pool;
@@ -46,6 +47,7 @@ pub enum PoolState {
     SushiSwap(UniswapV2Pool),
     Curve(CurvePool),
     Balancer(BalancerPool),
+    Bancor(BancorPool),
 }
 
 impl PoolState {
@@ -56,6 +58,7 @@ impl PoolState {
             PoolState::UniswapV3(p) => p.address,
             PoolState::Curve(p) => p.address,
             PoolState::Balancer(p) => p.address,
+            PoolState::Bancor(p) => p.address,
         }
     }
 
@@ -67,6 +70,7 @@ impl PoolState {
             PoolState::SushiSwap(_) => ProtocolType::SushiSwap,
             PoolState::Curve(_) => ProtocolType::Curve,
             PoolState::Balancer(_) => ProtocolType::BalancerV2,
+            PoolState::Bancor(_) => ProtocolType::BancorV3,
         }
     }
 }
@@ -104,6 +108,7 @@ pub enum UnifiedPostState {
     UniswapV3(crate::uniswap_v3::V3PostState),
     Curve(crate::curve::CurvePostState),
     Balancer(crate::balancer::BalancerPostState),
+    Bancor(crate::bancor::BancorPostState),
 }
 
 impl UnifiedPostState {
@@ -115,6 +120,7 @@ impl UnifiedPostState {
             UnifiedPostState::UniswapV3(p) => p.amount_out,
             UnifiedPostState::Curve(p) => p.amount_out,
             UnifiedPostState::Balancer(p) => p.amount_out,
+            UnifiedPostState::Bancor(p) => p.amount_out,
         }
     }
 }
@@ -128,6 +134,7 @@ pub enum ReplayProtocol {
     UniswapV3,
     Curve,
     Balancer,
+    Bancor,
 }
 
 /// Run the analytical post-state predictor for the cached pool and
@@ -181,6 +188,20 @@ where
                 return None;
             }
             Some(UnifiedPostState::Balancer(post))
+        }
+        PoolState::Bancor(pool) => {
+            // Bancor's bonding curve is closed-form — `analytical` is
+            // always `true` on a `Some` return, so the low-confidence
+            // branch is dead. Kept for shape symmetry with the other
+            // pool families and to keep the metric label space stable
+            // if future Bancor pool variants (e.g. V2-style with
+            // non-equal weights) ever need to surface the flag.
+            let post = pool.predict_post_state(token_in, amount_in)?;
+            if !post.analytical {
+                on_fallback("bancor_multihop");
+                return None;
+            }
+            Some(UnifiedPostState::Bancor(post))
         }
         PoolState::UniswapV2(_) | PoolState::SushiSwap(_) => {
             // V2-family analytical predictor lives outside this crate
@@ -240,6 +261,14 @@ where
                 return replay(ReplayProtocol::Balancer);
             }
             Some(UnifiedPostState::Balancer(post))
+        }
+        PoolState::Bancor(pool) => {
+            let post = pool.predict_post_state(token_in, amount_in)?;
+            if !post.analytical {
+                on_fallback("bancor_multihop");
+                return replay(ReplayProtocol::Bancor);
+            }
+            Some(UnifiedPostState::Bancor(post))
         }
         PoolState::UniswapV2(_) | PoolState::SushiSwap(_) => {
             on_fallback("unknown_protocol");
@@ -404,6 +433,55 @@ mod cache_tests {
     }
 
     #[test]
+    fn predict_with_fallback_bancor_returns_state_for_single_pool_swap() {
+        // Single-pool Bancor swap (token <-> BNT) — predictor returns
+        // analytical=true, fallback closure should never fire.
+        let token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bnt = address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C");
+        let mut bancor = BancorPool::new(Address::ZERO, token, bnt, 30);
+        bancor.update_state(
+            U256::from(1_000_000_000_000_000_000_000u128),
+            U256::from(2_000_000_000_000_000_000_000u128),
+        );
+        let state = PoolState::Bancor(bancor);
+        let captured = std::cell::RefCell::new(Vec::<String>::new());
+        let result = predict_post_state_with_fallback(
+            &state,
+            token,
+            U256::from(1_000_000_000_000_000_000u64),
+            |reason| captured.borrow_mut().push(reason.to_string()),
+        );
+        assert!(matches!(result, Some(UnifiedPostState::Bancor(_))));
+        assert!(captured.borrow().is_empty());
+    }
+
+    #[test]
+    fn predict_with_fallback_bancor_returns_none_for_multihop() {
+        // Neither token_in nor token_out is BNT — predictor returns None
+        // (single-pool can't predict multi-hop) and the fallback closure
+        // does not fire because the rejection happens before the
+        // confidence check.
+        let token = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bnt = address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C");
+        let bogus = address!("dddddddddddddddddddddddddddddddddddddddd");
+        let mut bancor = BancorPool::new(Address::ZERO, token, bnt, 30);
+        bancor.update_state(
+            U256::from(1_000_000_000_000_000_000_000u128),
+            U256::from(2_000_000_000_000_000_000_000u128),
+        );
+        let state = PoolState::Bancor(bancor);
+        let captured = std::cell::RefCell::new(Vec::<String>::new());
+        let result = predict_post_state_with_fallback(
+            &state,
+            bogus,
+            U256::from(1_000_000_000_000_000_000u64),
+            |reason| captured.borrow_mut().push(reason.to_string()),
+        );
+        assert!(result.is_none());
+        assert!(captured.borrow().is_empty(), "no fallback expected on multihop bail");
+    }
+
+    #[test]
     fn predict_with_replay_v3_invokes_closure_on_tick_cross() {
         let mut v3 = UniswapV3Pool::new(
             address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
@@ -545,5 +623,12 @@ mod cache_tests {
             PoolState::Balancer(bal).protocol(),
             ProtocolType::BalancerV2
         );
+        let bancor = BancorPool::new(
+            Address::ZERO,
+            Address::ZERO,
+            address!("1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C"),
+            30,
+        );
+        assert_eq!(PoolState::Bancor(bancor).protocol(), ProtocolType::BancorV3);
     }
 }
