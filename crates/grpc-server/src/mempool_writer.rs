@@ -69,6 +69,10 @@ pub const PROTOCOL_BALANCER: &str = "balancer";
 /// downstream.
 #[allow(dead_code)]
 pub const PROTOCOL_BANCOR: &str = "bancor";
+/// 1inch v6 AggregationRouter decoder path. A single tx can emit one
+/// record per peeled pool (unoswap chain) or a single record with
+/// `pool_address = None` (opaque-executor swap); both flavours use this
+/// wire label.
 #[allow(dead_code)]
 pub const PROTOCOL_ONE_INCH_V6: &str = "one_inch_v6";
 

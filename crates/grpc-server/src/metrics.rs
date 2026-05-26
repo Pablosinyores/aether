@@ -739,6 +739,17 @@ impl EngineMetrics {
             .get()
     }
 
+    /// Read the current value of
+    /// `aether_pending_dex_tx_total{router, protocol, decoded}`. Used by
+    /// the 1inch multi-record dispatch tests to assert one bump per
+    /// peeled pool. `decoded` is `true` / `false` matching
+    /// [`Self::inc_pending_dex_tx`].
+    pub fn pending_dex_tx_count(&self, router: &str, protocol: &str, decoded: bool) -> u64 {
+        self.pending_dex_tx_total
+            .with_label_values(&[router, protocol, if decoded { "true" } else { "false" }])
+            .get()
+    }
+
     /// Observe one mempool-backrun validation latency sample. `result` is
     /// `"accept"` for a fully-successful sim (victim + arb both committed
     /// with positive net profit) or `"reject"` for every other outcome.
