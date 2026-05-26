@@ -139,6 +139,15 @@ pub enum PredictedPostState {
         reserve_in: f64,
         reserve_out: f64,
     },
+    /// Curve StableSwap: balances of the (token_in, token_out) coin pair
+    /// post-swap, expressed as `f64` so the JSONB row matches what the
+    /// price graph holds. The full N-coin balance vector lives in the
+    /// `CurvePostState` predictor output but only the two coins the
+    /// victim touched matter for graph-edge accuracy here.
+    Curve {
+        reserve_in: f64,
+        reserve_out: f64,
+    },
 }
 
 impl PredictedPostState {
@@ -509,13 +518,17 @@ mod tests {
                 reserve_in: 10.0,
                 reserve_out: 20.0,
             },
+            PredictedPostState::Curve {
+                reserve_in: 1_000_000.0,
+                reserve_out: 999_500.0,
+            },
         ] {
             let json = serde_json::to_value(&original).expect("serialize");
             let kind = json.get("kind").and_then(|v| v.as_str()).expect("kind present");
             // `kind` lives under `#[serde(rename_all = "snake_case")]` so a
             // future refactor that drops the rename surfaces here.
             assert!(
-                ["v2", "v3", "balancer"].contains(&kind),
+                ["v2", "v3", "balancer", "curve"].contains(&kind),
                 "unexpected kind {kind}"
             );
             let parsed: PredictedPostState = serde_json::from_value(json).expect("deserialize");
