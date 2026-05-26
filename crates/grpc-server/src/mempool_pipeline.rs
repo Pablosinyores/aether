@@ -623,25 +623,13 @@ fn try_post_state_scan(
     event_to: Address,
     event: &PendingTxEvent,
 ) {
-    // Curve post-state scan is intentionally deferred to a follow-up PR
-    // (the V3/Balancer branch downstream needs a parallel Curve arm that
-    // routes through `unified_to_post_reserves`'s Curve variant + the
-    // PredictedPostState writer). For now, log the decoded swap via
-    // `emit_decoded` upstream so `pending_dex_tx_total{protocol="curve"}`
-    // climbs, then bail out with a dedicated skip reason. The decoder is
-    // the unblock that matters here; turning that signal into a cycle
-    // candidate is the next increment.
-    if swap.protocol == Protocol::Curve {
-        metrics.inc_pending_arb_sim_skipped("curve_post_state_pending");
-        return;
-    }
     // Bancor V3 post-state scan is intentionally deferred to a follow-up
-    // PR. The BancorPool predictor lives in `aether-pools` (BNT-
-    // intermediary swap math) but lacks an analytical post-state hook
-    // through `predict_post_state_with_fallback`. Decoded swaps already
-    // surface on `pending_dex_tx_total{protocol="bancor_v3"}` via
-    // `emit_decoded` upstream; the cycle-scan integration is the next
-    // increment. Same scope-cut as the Curve decoder PR.
+    // PR. `BancorPool` is not in the `PoolState` enum and has no
+    // `predict_post_state` analytical hook yet — adding both is its own
+    // ~500 LOC change (BNT bonding-curve math + PoolState/UnifiedPostState
+    // extension). Decoded swaps already surface on
+    // `pending_dex_tx_total{protocol="bancor_v3"}` via `emit_decoded`
+    // upstream; the cycle-scan integration is the next increment.
     if swap.protocol == Protocol::BancorV3 {
         metrics.inc_pending_arb_sim_skipped("bancor_post_state_pending");
         return;
@@ -652,7 +640,7 @@ fn try_post_state_scan(
         Protocol::SushiSwap => ProtocolType::SushiSwap,
         Protocol::UniswapV3 => ProtocolType::UniswapV3,
         Protocol::BalancerV2 => ProtocolType::BalancerV2,
-        Protocol::Curve => unreachable!("curve early-returned above"),
+        Protocol::Curve => ProtocolType::Curve,
         Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     };
 
@@ -711,7 +699,7 @@ fn try_post_state_scan(
             let dx = u256_to_f64_saturating(swap.amount_in);
             predict_v2_post_state(edge_fwd.reserve_in, edge_fwd.reserve_out, dx, fee_factor)
         }
-        Protocol::UniswapV3 | Protocol::BalancerV2 => {
+        Protocol::UniswapV3 | Protocol::BalancerV2 | Protocol::Curve => {
             let pool_addr = meta.pool_id.address;
             let Some(state_arc) = ctx.pool_states.get(&pool_addr).map(|r| Arc::clone(r.value()))
             else {
@@ -736,7 +724,6 @@ fn try_post_state_scan(
             }
             (pin, pout)
         }
-        Protocol::Curve => unreachable!("curve early-returned above"),
         Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     };
 
@@ -771,7 +758,10 @@ fn try_post_state_scan(
             reserve_in: post_in,
             reserve_out: post_out,
         },
-        Protocol::Curve => unreachable!("curve early-returned above"),
+        Protocol::Curve => PredictedPostState::Curve {
+            reserve_in: post_in,
+            reserve_out: post_out,
+        },
         Protocol::BancorV3 => unreachable!("bancor early-returned above"),
     }
     .into_json();
@@ -1327,7 +1317,16 @@ fn unified_to_post_reserves(
                 (b1, b0)
             }
         }
-        UnifiedPostState::Curve(_) => (0.0, 0.0),
+        UnifiedPostState::Curve(c) => {
+            // `CurvePostState.i`/`.j` are the swap direction (token_in / token_out)
+            // *as the predictor saw it*, regardless of the pool's underlying
+            // token ordering — so `new_balance_in` is always for `swap_token_in`
+            // and `new_balance_out` is always for the other side. No swap_token_in
+            // vs meta.token0/token1 comparison is needed here.
+            let post_in = u256_to_f64_saturating(c.new_balance_in);
+            let post_out = u256_to_f64_saturating(c.new_balance_out);
+            (post_in, post_out)
+        }
     }
 }
 
@@ -1501,6 +1500,59 @@ mod tests {
             None,
             pending_event(None, vec![0x12, 0x34, 0x56, 0x78]),
         );
+    }
+
+    // ----- unified_to_post_reserves Curve arm -----
+
+    #[test]
+    fn unified_to_post_reserves_curve_uses_predictor_balances_directly() {
+        use aether_common::types::PoolId;
+        use aether_pools::curve::CurvePostState;
+        use aether_pools::UnifiedPostState;
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let usdt = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let meta = PoolMetadata {
+            token0_idx: 0,
+            token1_idx: 1,
+            token0: usdc,
+            token1: usdt,
+            pool_id: PoolId {
+                address: Address::ZERO,
+                protocol: ProtocolType::Curve,
+            },
+            protocol: ProtocolType::Curve,
+            fee_bps: 4,
+            tick_spacing: None,
+        };
+        let post = UnifiedPostState::Curve(CurvePostState {
+            i: 0,
+            j: 1,
+            new_balance_in: U256::from(11_000_000u64),
+            new_balance_out: U256::from(9_900_000u64),
+            amount_out: U256::from(99_500u64),
+            analytical: true,
+        });
+        // Curve predictor already reports "in" and "out" relative to the
+        // swap direction — the helper must trust them directly, regardless
+        // of swap_token_in vs meta.token0/token1 ordering.
+        let (pin, pout) = unified_to_post_reserves(usdc, &meta, &post);
+        assert!((pin - 11_000_000.0).abs() < 1e-6);
+        assert!((pout - 9_900_000.0).abs() < 1e-6);
+
+        // Reverse direction: predictor would have flipped `i`/`j` upstream;
+        // helper still trusts `new_balance_in`/`new_balance_out` directly,
+        // which is the contract documented on the function.
+        let post_reverse = UnifiedPostState::Curve(CurvePostState {
+            i: 1,
+            j: 0,
+            new_balance_in: U256::from(11_000_000u64),
+            new_balance_out: U256::from(9_900_000u64),
+            amount_out: U256::from(99_500u64),
+            analytical: true,
+        });
+        let (pin_r, pout_r) = unified_to_post_reserves(usdt, &meta, &post_reverse);
+        assert!((pin_r - 11_000_000.0).abs() < 1e-6);
+        assert!((pout_r - 9_900_000.0).abs() < 1e-6);
     }
 
     // ----- predict_v2_post_state -----
