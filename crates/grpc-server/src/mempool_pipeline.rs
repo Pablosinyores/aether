@@ -121,6 +121,12 @@ pub struct BackrunValidatorConfig {
     /// the SimContext attaches it). Atomic load on every shadow-sim.
     pub mempool_prewarm:
         Arc<ArcSwap<Option<Arc<aether_simulator::fork::PrewarmedState>>>>,
+    /// Optional `AetherExecutor` runtime bytecode injected into the revm
+    /// CacheDB at `executor_address` before each arb sim. Populated when
+    /// running against a forked chain where the contract is not yet
+    /// deployed (demo / shadow runs). `None` for production runs where the
+    /// address resolves against on-chain bytecode.
+    pub executor_bytecode: Option<alloy::primitives::Bytes>,
 }
 
 /// State the post-state simulator needs to run after a successful decode.
@@ -1560,6 +1566,7 @@ fn run_backrun_validation(
         profit_token: cfg.profit_token,
         profit_recipient: cfg.searcher_caller,
         balance_slot: cfg.balance_slot,
+        executor_bytecode: cfg.executor_bytecode.clone(),
     };
 
     let result = validate_backrun_rpc(state, &victim, &arb, &params);
@@ -2338,6 +2345,7 @@ mod tests {
             sim_semaphore: Arc::new(Semaphore::new(1)),
             provider: None,
             mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
+            executor_bytecode: None,
         }
     }
 
@@ -2469,6 +2477,7 @@ mod tests {
             sim_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             provider: None,
             mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
+            executor_bytecode: None,
         };
 
         let shared_handle = Arc::clone(&ctx_inner.mempool_prewarm);
