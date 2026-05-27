@@ -216,6 +216,22 @@ sol! {
         function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
         function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) external payable;
         function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external;
+
+        /// Liquidity-management entry points. They share the router address
+        /// with the swap surface, so live mempool traffic mixes them in
+        /// freely. We never backrun pool-LP edits — the AMM invariant after
+        /// add/remove liquidity is identical to before for a swapper's
+        /// purposes (no marginal price change). Declaring them here gives
+        /// us their selectors so the top-level dispatcher can skip them
+        /// silently instead of polluting the `unknown_selector` metric.
+        function addLiquidity(address tokenA, address tokenB, uint256 amountADesired, uint256 amountBDesired, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external;
+        function addLiquidityETH(address token, uint256 amountTokenDesired, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline) external payable;
+        function removeLiquidity(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external;
+        function removeLiquidityETH(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline) external;
+        function removeLiquidityWithPermit(address tokenA, address tokenB, uint256 liquidity, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) external;
+        function removeLiquidityETHWithPermit(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) external;
+        function removeLiquidityETHSupportingFeeOnTransferTokens(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline) external;
+        function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(address token, uint256 liquidity, uint256 amountTokenMin, uint256 amountETHMin, address to, uint256 deadline, bool approveMax, uint8 v, bytes32 r, bytes32 s) external;
     }
 
     /// UniswapV3 SwapRouter (deadline) and SwapRouter02 (no deadline) flavours.
@@ -642,12 +658,20 @@ fn try_extract_multicall(
     Ok(None)
 }
 
-/// Recognise an inner-call selector that's legal inside a UniV3 multicall
-/// but doesn't move pool state (`selfPermit*`, `unwrapWETH9*`, `refundETH`,
-/// `sweepToken*`). Returning `true` here lets the multicall dispatcher
-/// silently skip the helper instead of bumping `unknown_selector` for a
-/// well-formed payload.
+/// Recognise a selector that targets a known router but doesn't move pool
+/// state in a way that's interesting to a backrunner. Two families qualify:
+///
+/// 1. UniV3 multicall helpers (`selfPermit*`, `unwrapWETH9*`, `refundETH`,
+///    `sweepToken*`) — legal inside `multicall(bytes[])` payloads.
+/// 2. UniV2 liquidity-management entry points (`addLiquidity*`,
+///    `removeLiquidity*` and their permit / fee-on-transfer variants) —
+///    they share the router address with the swap surface and appear
+///    frequently in live mempool traffic.
+///
+/// Returning `true` here lets the dispatcher silently skip the helper
+/// instead of bumping `unknown_selector` for a well-formed payload.
 fn try_is_known_non_swap_helper(selector: [u8; 4]) -> bool {
+    use IUniswapV2Router02 as v2;
     use IUniswapV3Router::*;
     selector == selfPermitCall::SELECTOR
         || selector == selfPermitAllowedCall::SELECTOR
@@ -658,6 +682,14 @@ fn try_is_known_non_swap_helper(selector: [u8; 4]) -> bool {
         || selector == refundETHCall::SELECTOR
         || selector == sweepTokenCall::SELECTOR
         || selector == sweepTokenWithFeeCall::SELECTOR
+        || selector == v2::addLiquidityCall::SELECTOR
+        || selector == v2::addLiquidityETHCall::SELECTOR
+        || selector == v2::removeLiquidityCall::SELECTOR
+        || selector == v2::removeLiquidityETHCall::SELECTOR
+        || selector == v2::removeLiquidityWithPermitCall::SELECTOR
+        || selector == v2::removeLiquidityETHWithPermitCall::SELECTOR
+        || selector == v2::removeLiquidityETHSupportingFeeOnTransferTokensCall::SELECTOR
+        || selector == v2::removeLiquidityETHWithPermitSupportingFeeOnTransferTokensCall::SELECTOR
 }
 
 fn try_uni_v2_family(
@@ -1666,6 +1698,76 @@ mod tests {
         .abi_encode();
         let err = decode_pending(Address::ZERO, &calldata).unwrap_err();
         assert!(matches!(err, DecodeError::EmptyPath));
+    }
+
+    #[test]
+    fn decode_v2_remove_liquidity_eth_silently_skipped() {
+        // `removeLiquidityETH` is selector 0x02751cec and accounted for
+        // ~22% of the `unknown_selector` noise in the most recent shadow
+        // run. It is an LP edit, not a swap — the dispatcher must return
+        // an empty record set rather than bubble an UnknownSelector error.
+        use IUniswapV2Router02::removeLiquidityETHCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let calldata = removeLiquidityETHCall {
+            token: weth,
+            liquidity: U256::from(1u64),
+            amountTokenMin: U256::ZERO,
+            amountETHMin: U256::ZERO,
+            to: Address::ZERO,
+            deadline: U256::ZERO,
+        }
+        .abi_encode();
+        let uni_v2_router = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");
+        let swaps = decode_pending_many(uni_v2_router, &calldata).expect("decode");
+        assert!(
+            swaps.is_empty(),
+            "liquidity-management entry points must not produce swap records"
+        );
+    }
+
+    #[test]
+    fn decode_v2_add_liquidity_eth_silently_skipped() {
+        // Mirrors the remove-side test for the additive selector
+        // (0xf305d719) so a regression that re-introduces it as
+        // UnknownSelector is caught directly.
+        use IUniswapV2Router02::addLiquidityETHCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let calldata = addLiquidityETHCall {
+            token: weth,
+            amountTokenDesired: U256::from(1u64),
+            amountTokenMin: U256::ZERO,
+            amountETHMin: U256::ZERO,
+            to: Address::ZERO,
+            deadline: U256::ZERO,
+        }
+        .abi_encode();
+        let uni_v2_router = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");
+        let swaps = decode_pending_many(uni_v2_router, &calldata).expect("decode");
+        assert!(swaps.is_empty());
+    }
+
+    #[test]
+    fn decode_v2_remove_liquidity_with_permit_silently_skipped() {
+        // The permit / FOT siblings sit on the same code path; assert one
+        // representative permit-style entry to lock the cohort in.
+        use IUniswapV2Router02::removeLiquidityETHWithPermitCall;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let calldata = removeLiquidityETHWithPermitCall {
+            token: weth,
+            liquidity: U256::from(1u64),
+            amountTokenMin: U256::ZERO,
+            amountETHMin: U256::ZERO,
+            to: Address::ZERO,
+            deadline: U256::ZERO,
+            approveMax: false,
+            v: 0,
+            r: Default::default(),
+            s: Default::default(),
+        }
+        .abi_encode();
+        let uni_v2_router = address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D");
+        let swaps = decode_pending_many(uni_v2_router, &calldata).expect("decode");
+        assert!(swaps.is_empty());
     }
 
     // ── Curve pool-direct decoder ──
