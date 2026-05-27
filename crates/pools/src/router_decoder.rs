@@ -287,14 +287,23 @@ sol! {
             uint256 amountOut;
             uint256 amountInMaximum;
         }
+        // SwapRouter (V1, with deadline) and SwapRouter02 (V2, no deadline)
+        // share the canonical Solidity function names on chain. The selector
+        // is keccak256 of `<name>(<tuple>)`, so the Rust function name
+        // we pass to `sol!` MUST be the on-chain name — using disambiguating
+        // suffixes like `exactInputSingle02` produces selectors that no
+        // real router ever emits. Declaring both signatures with the same
+        // name relies on `sol!`'s overload-renaming (`<name>_0` / `<name>_1`
+        // suffix in generated Rust types) while keeping the ABI signature
+        // — and therefore the selector — faithful to mainnet.
         function exactInputSingle(ExactInputSingleParams params) external payable returns (uint256);
-        function exactInputSingle02(ExactInputSingleParams02 params) external payable returns (uint256);
+        function exactInputSingle(ExactInputSingleParams02 params) external payable returns (uint256);
         function exactInput(ExactInputParams params) external payable returns (uint256);
-        function exactInput02(ExactInputParams02 params) external payable returns (uint256);
+        function exactInput(ExactInputParams02 params) external payable returns (uint256);
         function exactOutputSingle(ExactOutputSingleParams params) external payable returns (uint256);
-        function exactOutputSingle02(ExactOutputSingleParams02 params) external payable returns (uint256);
+        function exactOutputSingle(ExactOutputSingleParams02 params) external payable returns (uint256);
         function exactOutput(ExactOutputParams params) external payable returns (uint256);
-        function exactOutput02(ExactOutputParams02 params) external payable returns (uint256);
+        function exactOutput(ExactOutputParams02 params) external payable returns (uint256);
 
         /// Non-swap helpers that legally appear inside `multicall(bytes[])`
         /// payloads. We only need their selectors so the inner-call
@@ -803,8 +812,8 @@ fn try_uni_v3_family(
     router: Address,
 ) -> Result<Option<DecodedSwap>, DecodeError> {
     use IUniswapV3Router::*;
-    if selector == exactInputSingleCall::SELECTOR {
-        let c = exactInputSingleCall::abi_decode(calldata)
+    if selector == exactInputSingle_0Call::SELECTOR {
+        let c = exactInputSingle_0Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         return Ok(Some(DecodedSwap {
             protocol: Protocol::UniswapV3,
@@ -821,8 +830,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactInputSingle02Call::SELECTOR {
-        let c = exactInputSingle02Call::abi_decode(calldata)
+    if selector == exactInputSingle_1Call::SELECTOR {
+        let c = exactInputSingle_1Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         return Ok(Some(DecodedSwap {
             protocol: Protocol::UniswapV3,
@@ -839,8 +848,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactInputCall::SELECTOR {
-        let c = exactInputCall::abi_decode(calldata)
+    if selector == exactInput_0Call::SELECTOR {
+        let c = exactInput_0Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         let (token_in, token_out, fee, extras) = parse_v3_path(&c.params.path)?;
         return Ok(Some(DecodedSwap {
@@ -858,8 +867,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactInput02Call::SELECTOR {
-        let c = exactInput02Call::abi_decode(calldata)
+    if selector == exactInput_1Call::SELECTOR {
+        let c = exactInput_1Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         let (token_in, token_out, fee, extras) = parse_v3_path(&c.params.path)?;
         return Ok(Some(DecodedSwap {
@@ -886,8 +895,8 @@ fn try_uni_v3_family(
     // unambiguous; downstream maths that needs `amount_in` directly should
     // recompute via the V3 quoter (single-call exactOutput is rare on
     // mainnet — most flow goes through exactInput).
-    if selector == exactOutputSingleCall::SELECTOR {
-        let c = exactOutputSingleCall::abi_decode(calldata)
+    if selector == exactOutputSingle_0Call::SELECTOR {
+        let c = exactOutputSingle_0Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         return Ok(Some(DecodedSwap {
             protocol: Protocol::UniswapV3,
@@ -904,8 +913,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactOutputSingle02Call::SELECTOR {
-        let c = exactOutputSingle02Call::abi_decode(calldata)
+    if selector == exactOutputSingle_1Call::SELECTOR {
+        let c = exactOutputSingle_1Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         return Ok(Some(DecodedSwap {
             protocol: Protocol::UniswapV3,
@@ -922,8 +931,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactOutputCall::SELECTOR {
-        let c = exactOutputCall::abi_decode(calldata)
+    if selector == exactOutput_0Call::SELECTOR {
+        let c = exactOutput_0Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         // exactOutput paths are encoded in reverse: token_out first, then
         // intermediate tokens, with token_in last. `parse_v3_path` returns
@@ -946,8 +955,8 @@ fn try_uni_v3_family(
             one_inch_zero_for_one: None,
         }));
     }
-    if selector == exactOutput02Call::SELECTOR {
-        let c = exactOutput02Call::abi_decode(calldata)
+    if selector == exactOutput_1Call::SELECTOR {
+        let c = exactOutput_1Call::abi_decode(calldata)
             .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
         let (path_first, path_second, fee, extras) = parse_v3_path(&c.params.path)?;
         let (token_in, token_out) = swap_path_first_hop_for_exact_output(path_first, path_second, &extras);
@@ -1509,6 +1518,68 @@ mod tests {
         assert!(matches!(err, DecodeError::TooShort));
     }
 
+    /// SwapRouter02 (V2) selectors observed in mainnet traffic. Locks in
+    /// that the `sol!` overload-renaming produces selectors matching the
+    /// canonical Solidity names, not the prior `*02` shim names that
+    /// produced macro-fabricated selectors no router ever emits.
+    #[test]
+    fn univ3_swap_router_v2_selectors_match_mainnet() {
+        use IUniswapV3Router::*;
+        assert_eq!(
+            exactInputSingle_1Call::SELECTOR,
+            [0x04, 0xe4, 0x5a, 0xaf],
+            "exactInputSingle (SwapRouter02, no deadline) must be 0x04e45aaf"
+        );
+        assert_eq!(
+            exactOutputSingle_1Call::SELECTOR,
+            [0x50, 0x23, 0xb4, 0xdf],
+            "exactOutputSingle (SwapRouter02, no deadline) must be 0x5023b4df"
+        );
+        assert_eq!(
+            exactInput_1Call::SELECTOR,
+            [0xb8, 0x58, 0x18, 0x3f],
+            "exactInput (SwapRouter02, no deadline) must be 0xb858183f"
+        );
+        assert_eq!(
+            exactOutput_1Call::SELECTOR,
+            [0x09, 0xb8, 0x13, 0x46],
+            "exactOutput (SwapRouter02, no deadline) must be 0x09b81346"
+        );
+        // V1 (with-deadline) selectors are a regression sentinel — they
+        // were already correct and must remain so after the overload
+        // rename.
+        assert_eq!(exactInputSingle_0Call::SELECTOR, [0x41, 0x4b, 0xf3, 0x89]);
+        assert_eq!(exactOutputSingle_0Call::SELECTOR, [0xdb, 0x3e, 0x21, 0x98]);
+        assert_eq!(exactInput_0Call::SELECTOR, [0xc0, 0x4b, 0x8d, 0x59]);
+        assert_eq!(exactOutput_0Call::SELECTOR, [0xf2, 0x8c, 0x04, 0x98]);
+    }
+
+    #[test]
+    fn decode_uniswap_v3_swap_router_v2_exact_input_single() {
+        // V2 = no deadline field. End-to-end decode must succeed for the
+        // canonical 0x04e45aaf calldata observed in production traffic.
+        use IUniswapV3Router::{ExactInputSingleParams02, exactInputSingle_1Call};
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let params = ExactInputSingleParams02 {
+            tokenIn: weth,
+            tokenOut: usdc,
+            fee: alloy::primitives::Uint::<24, 1>::from(3000u32),
+            recipient: Address::ZERO,
+            amountIn: U256::from(1_000_000_000_000_000_000u128),
+            amountOutMinimum: U256::from(2_500_000_000u128),
+            sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
+        };
+        let calldata = exactInputSingle_1Call { params }.abi_encode();
+        let univ3_swap_router02 = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
+        let decoded = decode_pending(univ3_swap_router02, &calldata).expect("decode");
+        assert_eq!(decoded.protocol, Protocol::UniswapV3);
+        assert_eq!(
+            decoded.amount_in,
+            U256::from(1_000_000_000_000_000_000u128)
+        );
+    }
+
     #[test]
     fn unknown_selector_returned_for_random_bytes() {
         let to = Address::ZERO;
@@ -1559,7 +1630,7 @@ mod tests {
 
     #[test]
     fn decode_uniswap_v3_exact_input_single_with_deadline() {
-        use IUniswapV3Router::{exactInputSingleCall, ExactInputSingleParams};
+        use IUniswapV3Router::{exactInputSingle_0Call, ExactInputSingleParams};
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let recip = address!("000000000000000000000000000000000000dEaD");
@@ -1574,7 +1645,7 @@ mod tests {
             amountOutMinimum: U256::from(1_000u64),
             sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
         };
-        let calldata = exactInputSingleCall { params }.abi_encode();
+        let calldata = exactInputSingle_0Call { params }.abi_encode();
         let router = address!("E592427A0AEce92De3Edee1F18E0157C05861564");
         let decoded = decode_pending(router, &calldata).expect("should decode");
         assert_eq!(decoded.protocol, Protocol::UniswapV3);
@@ -1795,7 +1866,7 @@ mod tests {
         amount_in: U256,
         recipient: Address,
     ) -> Vec<u8> {
-        use IUniswapV3Router::{exactInputSingleCall, ExactInputSingleParams};
+        use IUniswapV3Router::{exactInputSingle_0Call, ExactInputSingleParams};
         let params = ExactInputSingleParams {
             tokenIn: token_in,
             tokenOut: token_out,
@@ -1806,7 +1877,7 @@ mod tests {
             amountOutMinimum: U256::from(1u64),
             sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
         };
-        exactInputSingleCall { params }.abi_encode()
+        exactInputSingle_0Call { params }.abi_encode()
     }
 
     fn univ3_router() -> Address {
@@ -1956,7 +2027,7 @@ mod tests {
 
     #[test]
     fn decode_exact_output_single_surfaces_amount_out_as_amount_in() {
-        use IUniswapV3Router::{exactOutputSingleCall, ExactOutputSingleParams};
+        use IUniswapV3Router::{exactOutputSingle_0Call, ExactOutputSingleParams};
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
         let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let params = ExactOutputSingleParams {
@@ -1969,7 +2040,7 @@ mod tests {
             amountInMaximum: U256::from(2u64) * U256::from(10u64).pow(U256::from(18u64)),
             sqrtPriceLimitX96: alloy::primitives::U160::ZERO,
         };
-        let calldata = exactOutputSingleCall { params }.abi_encode();
+        let calldata = exactOutputSingle_0Call { params }.abi_encode();
         let swap = decode_pending(univ3_router(), &calldata).expect("decode");
         assert_eq!(swap.protocol, Protocol::UniswapV3);
         assert_eq!(swap.token_in, weth);
