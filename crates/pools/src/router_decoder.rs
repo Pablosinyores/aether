@@ -462,6 +462,22 @@ sol! {
 
         function uniswapV3Swap(uint256 amount, uint256 minReturn, uint256[] pools) external payable returns (uint256);
         function uniswapV3SwapTo(address payable recipient, uint256 amount, uint256 minReturn, uint256[] pools) external payable returns (uint256);
+
+        /// Limit-order admin entry points. They share the router address
+        /// with the swap surface but never move AMM pool state in a way a
+        /// backrunner can exploit — `cancelOrder` is a maker-side state
+        /// flip, and `fillContractOrder` settles an off-chain order against
+        /// a maker's pre-signed allowance rather than triggering an AMM
+        /// swap. The decoder declares them only to recover their selectors
+        /// so the dispatcher can silently skip them instead of bumping
+        /// `unknown_selector`.
+        function cancelOrder(uint256 makerTraits, bytes32 orderHash) external;
+        function fillContractOrder(
+            (uint256, uint256, uint256, uint256, uint256, uint256, uint256, uint256) order,
+            bytes signature,
+            uint256 amount,
+            uint256 takerTraits
+        ) external returns (uint256, uint256, bytes32);
     }
 }
 
@@ -676,10 +692,16 @@ fn try_extract_multicall(
 ///    `removeLiquidity*` and their permit / fee-on-transfer variants) —
 ///    they share the router address with the swap surface and appear
 ///    frequently in live mempool traffic.
+/// 3. 1inch v6 limit-order admin entry points (`cancelOrder`,
+///    `fillContractOrder`) — they share the router address with the
+///    aggregator swap surface and account for ~34% of `unknown_selector`
+///    noise from the 1inch router in the most recent shadow run, but
+///    neither moves AMM pool state directly.
 ///
 /// Returning `true` here lets the dispatcher silently skip the helper
 /// instead of bumping `unknown_selector` for a well-formed payload.
 fn try_is_known_non_swap_helper(selector: [u8; 4]) -> bool {
+    use IOneInchV6Router as v6;
     use IUniswapV2Router02 as v2;
     use IUniswapV3Router::*;
     selector == selfPermitCall::SELECTOR
@@ -699,6 +721,8 @@ fn try_is_known_non_swap_helper(selector: [u8; 4]) -> bool {
         || selector == v2::removeLiquidityETHWithPermitCall::SELECTOR
         || selector == v2::removeLiquidityETHSupportingFeeOnTransferTokensCall::SELECTOR
         || selector == v2::removeLiquidityETHWithPermitSupportingFeeOnTransferTokensCall::SELECTOR
+        || selector == v6::cancelOrderCall::SELECTOR
+        || selector == v6::fillContractOrderCall::SELECTOR
 }
 
 fn try_uni_v2_family(
@@ -1609,6 +1633,47 @@ mod tests {
         assert_eq!(
             decoded.amount_in,
             U256::from(1_000_000_000_000_000_000u128)
+        );
+    }
+
+    /// 1inch v6 limit-order admin selectors observed in mainnet traffic.
+    /// Locks the canonical on-chain selectors in so a future ABI tweak
+    /// (e.g. renaming the function in the sol! block without overload
+    /// awareness) is caught here instead of by a silent regression in the
+    /// `unknown_selector` metric.
+    #[test]
+    fn one_inch_v6_admin_selectors_match_mainnet() {
+        use IOneInchV6Router::*;
+        assert_eq!(
+            cancelOrderCall::SELECTOR,
+            [0xb6, 0x8f, 0xb0, 0x20],
+            "cancelOrder(uint256,bytes32) must be 0xb68fb020"
+        );
+        assert_eq!(
+            fillContractOrderCall::SELECTOR,
+            [0xcc, 0x71, 0x3a, 0x04],
+            "fillContractOrder(...) must be 0xcc713a04"
+        );
+    }
+
+    #[test]
+    fn decode_1inch_cancel_order_silently_skipped() {
+        // `cancelOrder` accounted for ~14 of 44 unknown_selector hits in
+        // the last shadow run. It's a maker-side state flip on the limit
+        // order surface, not a swap — the dispatcher must drop it instead
+        // of bubbling UnknownSelector.
+        use IOneInchV6Router::cancelOrderCall;
+        use alloy::primitives::FixedBytes;
+        let calldata = cancelOrderCall {
+            makerTraits: U256::ZERO,
+            orderHash: FixedBytes::<32>::ZERO,
+        }
+        .abi_encode();
+        let one_inch_router = ONE_INCH_V6_ROUTER;
+        let swaps = decode_pending_many(one_inch_router, &calldata).expect("decode");
+        assert!(
+            swaps.is_empty(),
+            "limit-order admin entry points must not produce swap records"
         );
     }
 
