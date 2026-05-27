@@ -51,9 +51,11 @@ RUN_DIR="$ROOT/reports/demo_$TS"
 LOG_DIR="$RUN_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# Per-process PID + log file tracking for cleanup.
-declare -A PIDS=()
-declare -a CHILD_LOOPS=()
+# Per-process PID + log file tracking for cleanup. Two parallel arrays
+# instead of associative arrays so the script works on macOS bash 3.2.
+PID_NAMES=()
+PID_VALUES=()
+CHILD_LOOPS=()
 
 # ─────────────────────────────────────────────────────────────────────────
 # CLI flag parsing
@@ -82,26 +84,33 @@ cleanup() {
   warn "Shutting down. Run dir: $RUN_DIR"
 
   # Kill restart-loop PIDs first so they don't respawn their children.
-  for loop_pid in "${CHILD_LOOPS[@]}"; do
-    if [ -n "$loop_pid" ] && kill -0 "$loop_pid" 2>/dev/null; then
-      kill "$loop_pid" 2>/dev/null || true
-    fi
-  done
+  if [ ${#CHILD_LOOPS[@]:-0} -gt 0 ]; then
+    for loop_pid in "${CHILD_LOOPS[@]}"; do
+      if [ -n "$loop_pid" ] && kill -0 "$loop_pid" 2>/dev/null; then
+        kill "$loop_pid" 2>/dev/null || true
+      fi
+    done
+  fi
 
   # Then kill the binaries themselves.
-  for name in "${!PIDS[@]}"; do
-    local pid="${PIDS[$name]}"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      log "Stopping $name (PID $pid)"
-      kill "$pid" 2>/dev/null || true
-    fi
-  done
+  if [ ${#PID_NAMES[@]:-0} -gt 0 ]; then
+    local i=0
+    while [ $i -lt ${#PID_NAMES[@]} ]; do
+      local name="${PID_NAMES[$i]}"
+      local pid="${PID_VALUES[$i]}"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        log "Stopping $name (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+      fi
+      i=$((i + 1))
+    done
+  fi
   wait 2>/dev/null || true
 
   # Final summary query — what did we record?
-  if command -v psql >/dev/null 2>&1 && [ -n "${DATABASE_URL:-}" ]; then
+  if [ -n "${DATABASE_URL:-}" ]; then
     log "Final bundles snapshot (last 10 shadow rows):"
-    psql "$DATABASE_URL" -c "
+    PSQL "$DATABASE_URL" -c "
       SELECT id, profit_eth, gas_used, submitted_at, is_shadow
       FROM bundles
       WHERE is_shadow = true
@@ -109,7 +118,7 @@ cleanup() {
       LIMIT 10;
     " || true
     log "Counts since demo start:"
-    psql "$DATABASE_URL" -c "
+    PSQL "$DATABASE_URL" -c "
       SELECT
         (SELECT count(*) FROM bundles WHERE is_shadow = true AND submitted_at >= '$TS'::timestamptz) AS shadow_bundles,
         (SELECT count(*) FROM mempool_predictions WHERE decoded_at >= '$TS'::timestamptz) AS predictions,
@@ -150,18 +159,24 @@ fi
 export ETH_RPC_URL="${ETH_RPC_URL:-https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}}"
 
 # DATABASE_URL — points at the Postgres container the compose file spins
-# up (port 5433 to avoid colliding with host-side Postgres on 5432).
-export DATABASE_URL="${DATABASE_URL:-postgres://aether:aether@localhost:5433/aether}"
+# up. Compose exposes 5432; if a host-side Postgres collides, stop it or
+# override DATABASE_URL in .env.
+export DATABASE_URL="${DATABASE_URL:-postgres://aether:aether@127.0.0.1:5432/aether}"
 
 # MEMPOOL_LEDGER_DSN — separate logical DSN for the mempool writer; we
 # reuse the same physical Postgres for demo simplicity (production
 # separates them).
 export MEMPOOL_LEDGER_DSN="${MEMPOOL_LEDGER_DSN:-$DATABASE_URL}"
 
-# AETHER_EXECUTOR_ADDRESS — arbitrary sentinel. revm injects the
-# AetherExecutor bytecode at this address (PR #165) so it doesn't need
-# to be a real deployed contract.
-export AETHER_EXECUTOR_ADDRESS="${AETHER_EXECUTOR_ADDRESS:-0x000000000000000000000000000000000000aaaa}"
+# AETHER_EXECUTOR_ADDRESS — must point at an address with on-chain
+# bytecode because cmd/executor/main.go runs eth_getCode at startup
+# and aborts on empty account (a production safety check). For the
+# demo we use UniV3 SwapRouter02 as a placeholder — it has bytecode,
+# so the executor's check passes; revm's per-sim bytecode injection
+# (#165) overrides it inside the actual sim so the address itself is
+# functionally irrelevant. Shadow mode never broadcasts, so no risk
+# of sending a real tx to the wrong contract.
+export AETHER_EXECUTOR_ADDRESS="${AETHER_EXECUTOR_ADDRESS:-0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45}"
 
 # Bytecode artifact path — produced by `forge build` in step 4.
 export AETHER_EXECUTOR_BYTECODE_PATH="${AETHER_EXECUTOR_BYTECODE_PATH:-contracts/out/AetherExecutor.sol/AetherExecutor.json}"
@@ -177,12 +192,33 @@ export MEMPOOL_TRACKING=1
 export AETHER_MEMPOOL_SIM_CONCURRENCY="${AETHER_MEMPOOL_SIM_CONCURRENCY:-16}"
 export RECONCILER_METRICS_ADDR="${RECONCILER_METRICS_ADDR:-:9094}"
 
-for cmd in docker psql cargo go forge jq lsof curl; do
+for cmd in docker cargo go forge jq lsof curl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     err "Missing required tool: $cmd"
     exit 1
   fi
 done
+
+# psql wrapper — uses host psql if installed, else `docker compose exec`
+# into the Postgres container so the demo has no extra host dependency.
+PSQL_VIA_DOCKER=0
+if command -v psql >/dev/null 2>&1; then
+  PSQL() { psql "$@"; }
+else
+  PSQL_VIA_DOCKER=1
+  PSQL() {
+    # Strip the DSN arg; container psql connects to local socket.
+    local args=()
+    for a in "$@"; do
+      case "$a" in
+        postgres://*|postgresql://*) ;;  # drop
+        *) args+=("$a") ;;
+      esac
+    done
+    docker compose -f deploy/docker/docker-compose.yml exec -T postgres \
+      psql -U aether -d aether "${args[@]}"
+  }
+fi
 
 # Free ports we'll be binding.
 for port in 9090 9092 9094 50051 8080 3000; do
@@ -200,18 +236,22 @@ log "Preflight OK"
 # Step 2 — observability stack
 # ─────────────────────────────────────────────────────────────────────────
 
-step 2 "Booting observability stack (Postgres + Prometheus + Grafana + Loki + Alertmanager)"
+step 2 "Booting observability stack (Postgres + Prometheus + Grafana + Loki + Promtail)"
+# Alertmanager intentionally omitted from the demo profile: it requires
+# SLACK_WEBHOOK_URL at startup and the shadow run has nothing to alert
+# on (no bundles submitted → no inclusion misses → no PnL halts).
+# Re-add it when running against live submission.
 docker compose -f deploy/docker/docker-compose.yml up -d \
-  postgres prometheus grafana loki promtail alertmanager 2>&1 | tail -5
+  postgres prometheus grafana loki promtail 2>&1 | tail -5
 
 # Wait for Postgres readiness.
 for i in {1..30}; do
-  if psql "$DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then
+  if PSQL "$DATABASE_URL" -c "SELECT 1" >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-psql "$DATABASE_URL" -c "SELECT 1" >/dev/null || { err "Postgres still not ready after 30s"; exit 1; }
+PSQL "$DATABASE_URL" -c "SELECT 1" >/dev/null || { err "Postgres still not ready after 30s"; exit 1; }
 
 log "Observability stack up. Grafana: http://localhost:3000 (admin/admin)"
 
@@ -220,11 +260,27 @@ log "Observability stack up. Grafana: http://localhost:3000 (admin/admin)"
 # ─────────────────────────────────────────────────────────────────────────
 
 step 3 "Applying Postgres migrations"
-./scripts/db_migrate.sh "$DATABASE_URL" 2>&1 | tail -5
+# Apply migrations directly via psql (avoids sqlx-cli dependency). Each
+# migration is idempotent (CREATE TABLE IF NOT EXISTS / CREATE INDEX IF
+# NOT EXISTS) so re-runs are safe. Path resolves inside the container
+# because we mount the repo dir into postgres compose service... actually
+# the postgres container doesn't have the repo mounted, so we pipe the
+# .sql file via stdin instead.
+for sqlfile in migrations/*.sql; do
+  log "  applying $(basename "$sqlfile")"
+  if [ "$PSQL_VIA_DOCKER" -eq 1 ]; then
+    docker compose -f deploy/docker/docker-compose.yml exec -T postgres \
+      psql -U aether -d aether < "$sqlfile" >/dev/null 2>&1 || \
+      warn "    $(basename "$sqlfile") returned non-zero (likely already applied)"
+  else
+    psql "$DATABASE_URL" -f "$sqlfile" >/dev/null 2>&1 || \
+      warn "    $(basename "$sqlfile") returned non-zero (likely already applied)"
+  fi
+done
 
 if [ "$FRESH" -eq 1 ]; then
   warn "--fresh: truncating demo tables"
-  psql "$DATABASE_URL" -c "
+  PSQL "$DATABASE_URL" -c "
     TRUNCATE TABLE bundles, arbs, mempool_predictions, mempool_reconciliation,
                    inclusion_results, pnl_daily RESTART IDENTITY CASCADE;
   " || true
@@ -241,13 +297,16 @@ if [ ! -f target/release/aether-rust ]; then
   cargo build --release --bins 2>&1 | tail -3
 fi
 
-if [ ! -f bin/aether-executor ]; then
-  log "Building Go binaries..."
-  mkdir -p bin
-  go build -o bin/aether-executor ./cmd/executor
-  go build -o bin/aether-reconciler ./cmd/reconciler
-  go build -o bin/aether-monitor ./cmd/monitor
-fi
+mkdir -p bin
+# Build each Go binary independently — earlier `if [ ! -f bin/aether-executor ]`
+# wrapper skipped the other two when executor existed, leaving demo with
+# missing reconciler / monitor.
+for goprog in executor reconciler monitor pooldiscovery; do
+  if [ ! -f "bin/aether-$goprog" ]; then
+    log "Building bin/aether-$goprog..."
+    go build -o "bin/aether-$goprog" "./cmd/$goprog" 2>&1 | tail -3
+  fi
+done
 
 if [ ! -f contracts/out/AetherExecutor.sol/AetherExecutor.json ]; then
   log "Building Solidity artifacts..."
@@ -266,16 +325,17 @@ log "Artifacts ready"
 # Step 5 — pool registry refresh (one-shot)
 # ─────────────────────────────────────────────────────────────────────────
 
-step 5 "Refreshing pool registry from on-chain factories (one-shot)"
-if [ -f bin/aether-pooldiscovery ] || go build -o bin/aether-pooldiscovery ./cmd/pooldiscovery; then
-  bin/aether-pooldiscovery \
-    --rpc-url "$ETH_RPC_URL" \
-    --output config/pools.toml \
-    --limit 500 \
-    >> "$LOG_DIR/pooldiscovery.log" 2>&1 || warn "pooldiscovery non-fatal failure (continuing)"
-fi
-pool_count=$(grep -c '^\[\[pool\]\]' config/pools.toml || echo 0)
+step 5 "Pool registry check (using existing config/pools.toml)"
+# Skip overwriting config/pools.toml — pooldiscovery's --output regenerates
+# the file with only the top N discovered pools, which is fine for a fresh
+# repo but destructive for a curated registry. Operators who want to refresh
+# should run pooldiscovery manually before the demo.
+pool_count=$(grep -c '^\[\[pools\]\]' config/pools.toml 2>/dev/null || echo 0)
 log "Pool registry: $pool_count pools loaded"
+if [ "$pool_count" -lt 100 ]; then
+  warn "Pool registry has $pool_count pools — sparse. Candidate rate will be low."
+  warn "Refresh manually with: bin/aether-pooldiscovery --rpc-url \$ETH_RPC_URL --output config/pools.toml --limit 1000"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────
 # Step 6 — Rust core (with auto-restart loop)
@@ -308,7 +368,8 @@ spawn_with_restart() {
   sleep 2
   local child_pid
   child_pid=$(pgrep -P "$loop_pid" -n || true)
-  PIDS[$name]="$child_pid"
+  PID_NAMES+=("$name")
+  PID_VALUES+=("$child_pid")
   log "$name started (loop PID $loop_pid, child PID $child_pid). Log: $log_file"
 }
 
@@ -383,7 +444,7 @@ echo ""
 # Live counts loop — polls Postgres every 10s, prints decoded / candidates /
 # shadow-bundles counts since demo start. Lightweight (3 quick aggregates).
 while true; do
-  read -r predictions candidates bundles_total <<< "$(psql -At -F' ' "$DATABASE_URL" -c "
+  read -r predictions candidates bundles_total <<< "$(PSQL -At -F' ' "$DATABASE_URL" -c "
     SELECT
       (SELECT count(*) FROM mempool_predictions WHERE decoded_at >= '$TS'::timestamptz),
       (SELECT count(*) FROM mempool_predictions WHERE profit_factor_predicted IS NOT NULL AND profit_factor_predicted > 1.0 AND decoded_at >= '$TS'::timestamptz),
