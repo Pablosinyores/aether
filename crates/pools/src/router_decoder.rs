@@ -546,6 +546,24 @@ mod ur_commands {
     /// a UniV2 `address[]` path. Inputs ABI:
     /// `(address recipient, uint256 amountOut, uint256 amountInMaximum, address[] path, bool payerIsUser)`.
     pub const V2_SWAP_EXACT_OUT: u8 = 0x09;
+
+    /// `V4_SWAP` — wraps a Uniswap V4 PoolManager action stream
+    /// (`(bytes actions, bytes[] params)`) inside a single UR input
+    /// slot. Dominates current Universal Router V2 traffic: the
+    /// production captures collected during the E5 fixture sweep at
+    /// block ~25187100 showed `0x10` at the top level of roughly
+    /// 80 percent of UR V2 calls, with the actual swap math living
+    /// one layer deeper.
+    ///
+    /// Decoding V4 actions requires modelling the V4 PoolManager
+    /// (PoolKey, hooks address, per-action ABI shapes) and is not
+    /// part of the current V2/V3 backrun target surface. Until that
+    /// lands the dispatcher treats this opcode as a *named* skip —
+    /// distinct from the catch-all unknown-opcode skip — so the
+    /// pipeline can size the missed-volume from a dedicated metric
+    /// label and we can decide whether full V4 support clears the
+    /// effort bar.
+    pub const V4_SWAP: u8 = 0x10;
 }
 
 /// 1inch v6 pool-encoding bit constants. The router packs each pool word
@@ -1711,6 +1729,24 @@ fn decode_ur_opcode(
                 one_inch_zero_for_one: None,
             }))
         }
+        ur_commands::V4_SWAP => {
+            // V4 PoolManager action stream — see the docstring on
+            // `ur_commands::V4_SWAP` for the rationale on why this is
+            // skipped rather than decoded. The `debug!` is intentional
+            // so an operator tailing the log can size the missed
+            // volume against the existing `unknown_selector`
+            // numerators without a fresh metric migration. Lifting
+            // this branch to a real handler is gated on V4 PoolManager
+            // pricing + reserve modelling, which lives outside the
+            // current backrun target surface.
+            tracing::debug!(
+                target: "aether_pools::router_decoder",
+                router = %router,
+                input_len = input.len(),
+                "ur_v4_swap_unsupported"
+            );
+            Ok(None)
+        }
         _ => Ok(None),
     }
 }
@@ -2034,6 +2070,38 @@ mod tests {
         assert_eq!(swaps[0].amount_out_min, amount_out_min);
         assert_eq!(swaps[0].recipient, recipient);
         assert_eq!(swaps[0].router, ur);
+    }
+
+    #[test]
+    fn decode_universal_router_v4_swap_silently_skipped() {
+        // V4_SWAP wraps a Uniswap V4 PoolManager action stream — out
+        // of scope for the current V2/V3 backrun target surface. The
+        // dispatcher must drop it without erroring so a UR call that
+        // mixes V4_SWAP with a recognised V2/V3 opcode still surfaces
+        // the recognised swap.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let path = pack_v3_path(weth, 3000, usdc);
+        let inputs: Vec<Bytes> = vec![
+            // Opaque V4 action stream placeholder — decoder reads len
+            // but never parses the body.
+            vec![0u8; 64].into(),
+            encode_v3_exact_in_input(Address::ZERO, U256::from(1u64), U256::ZERO, &path, true)
+                .into(),
+        ];
+        let commands = Bytes::from(vec![ur_commands::V4_SWAP, ur_commands::V3_SWAP_EXACT_IN]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(
+            swaps.len(),
+            1,
+            "V4_SWAP must be dropped, the V3 swap alongside must survive"
+        );
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV3);
+        assert_eq!(swaps[0].fee_bps, 3000);
     }
 
     #[test]
