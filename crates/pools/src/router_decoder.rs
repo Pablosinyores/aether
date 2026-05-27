@@ -479,6 +479,23 @@ sol! {
             uint256 takerTraits
         ) external returns (uint256, uint256, bytes32);
     }
+
+    /// Uniswap Universal Router — `execute(bytes commands, bytes[] inputs)`
+    /// and its deadline-bearing sibling. The router is a small VM: each
+    /// byte in `commands` is an opcode that consumes the corresponding
+    /// entry from the parallel `inputs[]` array. The two `execute`
+    /// signatures differ only in the trailing `deadline` parameter, so
+    /// `sol!`'s overload renaming (`_0Call` / `_1Call`) keeps both
+    /// selectors faithful to the on-chain values. Tuple ABIs of each
+    /// individual opcode's input are NOT declared here — the opcode
+    /// parser in [`try_universal_router`] walks `inputs[]` element by
+    /// element using the per-opcode ABI shape documented in
+    /// `Commands.sol`.
+    #[allow(missing_docs)]
+    interface IUniversalRouter {
+        function execute(bytes commands, bytes[] inputs) external payable;
+        function execute(bytes commands, bytes[] inputs, uint256 deadline) external payable;
+    }
 }
 
 /// 1inch v6 AggregationRouter address on Ethereum Mainnet. Pinned here so
@@ -486,6 +503,33 @@ sol! {
 /// truth — adding a chain or moving routers means editing one constant.
 pub const ONE_INCH_V6_ROUTER: Address =
     address!("111111125421cA6dc452d289314280a0f8842A65");
+
+/// Uniswap Universal Router (V2, deployed April 2024) on Ethereum Mainnet.
+pub const UNIVERSAL_ROUTER_V2: Address =
+    address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+
+/// Uniswap Universal Router (V1.2, predecessor) on Ethereum Mainnet. Still
+/// receives traffic from integrators that haven't migrated to V2 — keep
+/// it in the recognised router set so we can decode both side-by-side.
+pub const UNIVERSAL_ROUTER_V12: Address =
+    address!("3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD");
+
+/// Universal Router command bytes (a subset — only those the decoder
+/// actually inspects). The full opcode table lives in Uniswap's
+/// `Commands.sol`; everything not listed here falls through the
+/// dispatcher as a no-op for our purposes (the opcode runs on-chain
+/// but doesn't move AMM pool state in a way a backrunner can exploit).
+mod ur_commands {
+    /// Mask isolating the opcode bits (low 6) from the optional flag
+    /// bits (high 2 — `FLAG_ALLOW_REVERT` and unused). Universal Router
+    /// dispatch ignores the flag bits when looking up the handler.
+    pub const COMMAND_TYPE_MASK: u8 = 0x3f;
+
+    /// `V3_SWAP_EXACT_IN` — swap an exact input amount along a packed
+    /// UniV3 path. Inputs ABI:
+    /// `(address recipient, uint256 amountIn, uint256 amountOutMinimum, bytes path, bool payerIsUser)`.
+    pub const V3_SWAP_EXACT_IN: u8 = 0x00;
+}
 
 /// 1inch v6 pool-encoding bit constants. The router packs each pool word
 /// as `low 160 bits = pool address`, with flag bits in the high end. The
@@ -625,6 +669,11 @@ fn decode_at_depth(
     // 1inch v6 AggregationRouter — multi-record producer; peeled before
     // try_decode_single so the per-hop pool addresses propagate.
     if let Some(swaps) = try_one_inch_v6(selector, calldata, to)? {
+        return Ok(swaps);
+    }
+    // Uniswap Universal Router — also a multi-record producer (one
+    // record per swap-typed opcode in the `commands` byte stream).
+    if let Some(swaps) = try_universal_router(selector, calldata, to)? {
         return Ok(swaps);
     }
     if let Some(swap) = try_decode_single(selector, calldata, to)? {
@@ -1444,6 +1493,121 @@ fn try_one_inch_v6(
     Ok(None)
 }
 
+/// Universal Router dispatcher.
+///
+/// `execute(bytes commands, bytes[] inputs[, uint256 deadline])` is a
+/// command-byte VM, not an ABI-encoded swap. Each byte in `commands`
+/// is an opcode (after masking with [`ur_commands::COMMAND_TYPE_MASK`])
+/// that consumes one entry from the parallel `inputs[]` array. Opcodes
+/// fall into three buckets:
+///
+/// 1. **Swap opcodes** (`V3_SWAP_EXACT_IN`, `V3_SWAP_EXACT_OUT`,
+///    `V2_SWAP_EXACT_IN`, `V2_SWAP_EXACT_OUT`) — decode the input as a
+///    typed tuple and emit one [`DecodedSwap`].
+/// 2. **Permit / wrap / sweep helpers** (`PERMIT2_*`, `WRAP_ETH`,
+///    `UNWRAP_WETH`, `SWEEP`, `TRANSFER`, `PAY_PORTION`,
+///    `BALANCE_CHECK_ERC20`) — no AMM state change; skipped silently.
+/// 3. **Unknown opcodes** — also skipped silently (the on-chain VM may
+///    add new opcodes ahead of our decoder; bumping `unknown_selector`
+///    for every unfamiliar command would drown the metric).
+///
+/// This first cut implements only `V3_SWAP_EXACT_IN` — the highest
+/// traffic opcode by an order of magnitude. Additional swap opcodes
+/// land as follow-up PRs (see decoder backlog E4).
+fn try_universal_router(
+    selector: [u8; 4],
+    calldata: &[u8],
+    router: Address,
+) -> Result<Option<Vec<DecodedSwap>>, DecodeError> {
+    use IUniversalRouter::*;
+
+    let (commands, inputs) = if selector == execute_0Call::SELECTOR {
+        let c = execute_0Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        (c.commands, c.inputs)
+    } else if selector == execute_1Call::SELECTOR {
+        let c = execute_1Call::abi_decode(calldata)
+            .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+        (c.commands, c.inputs)
+    } else {
+        return Ok(None);
+    };
+
+    if commands.len() != inputs.len() {
+        // Malformed payload — commands stream and inputs array must be
+        // parallel. Treat as decode failure rather than partial decode
+        // so the pipeline doesn't act on half-parsed traffic.
+        return Err(DecodeError::AbiDecode(format!(
+            "Universal Router: commands.len()={} but inputs.len()={}",
+            commands.len(),
+            inputs.len()
+        )));
+    }
+
+    let mut out: Vec<DecodedSwap> = Vec::new();
+    for (cmd_byte, input) in commands.iter().zip(inputs.iter()) {
+        let opcode = cmd_byte & ur_commands::COMMAND_TYPE_MASK;
+        if let Some(swap) = decode_ur_opcode(opcode, input.as_ref(), router)? {
+            out.push(swap);
+        }
+        // Non-swap or unknown opcodes are intentionally skipped (see
+        // function-level doc). The opcode index is preserved by virtue
+        // of iterating in parallel — no record means no contribution to
+        // the swap stream, which is exactly what a permit / wrap /
+        // unknown step would produce.
+    }
+    Ok(Some(out))
+}
+
+/// Decode a single Universal Router opcode into an optional [`DecodedSwap`].
+///
+/// Returns `Ok(None)` for non-swap opcodes (permit, wrap, sweep, ...).
+/// Returns `Err(...)` only if a recognised swap opcode has malformed
+/// inputs — unrecognised opcodes are dropped silently to keep the
+/// decoder robust against future opcode additions on the on-chain VM.
+fn decode_ur_opcode(
+    opcode: u8,
+    input: &[u8],
+    router: Address,
+) -> Result<Option<DecodedSwap>, DecodeError> {
+    match opcode {
+        ur_commands::V3_SWAP_EXACT_IN => {
+            // Tuple shape, per Commands.sol:
+            //   (address recipient, uint256 amountIn,
+            //    uint256 amountOutMinimum, bytes path, bool payerIsUser)
+            // `path` is the canonical UniV3 packed
+            // token | fee | token | fee | … | token byte stream.
+            use alloy::sol_types::{SolType, sol_data};
+            type V3ExactInTuple = (
+                sol_data::Address,
+                sol_data::Uint<256>,
+                sol_data::Uint<256>,
+                sol_data::Bytes,
+                sol_data::Bool,
+            );
+            let (recipient, amount_in, amount_out_min, path, _payer_is_user) =
+                V3ExactInTuple::abi_decode_params(input)
+                    .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            let (token_in, token_out, fee, path_extra) = parse_v3_path(&path)?;
+            Ok(Some(DecodedSwap {
+                protocol: Protocol::UniswapV3,
+                router,
+                token_in,
+                token_out,
+                amount_in,
+                amount_out_min,
+                recipient,
+                fee_bps: fee,
+                path_extra,
+                curve_indices: None,
+                pool_address: None,
+                one_inch_zero_for_one: None,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// WETH on Ethereum mainnet. The `ethUnoswap*` family swaps native ETH
 /// into a token; the router wraps to WETH on the way in, so downstream
 /// pool lookups should key off WETH rather than `Address::ZERO`.
@@ -1675,6 +1839,176 @@ mod tests {
             swaps.is_empty(),
             "limit-order admin entry points must not produce swap records"
         );
+    }
+
+    /// Universal Router `execute` selectors must match the canonical
+    /// on-chain values. Locking these here prevents a regression where
+    /// either signature gets renamed in the `sol!` block and silently
+    /// drifts to a fabricated selector.
+    #[test]
+    fn universal_router_execute_selectors_match_mainnet() {
+        use IUniversalRouter::*;
+        assert_eq!(
+            execute_0Call::SELECTOR,
+            [0x24, 0x85, 0x6b, 0xc3],
+            "execute(bytes,bytes[]) must be 0x24856bc3"
+        );
+        assert_eq!(
+            execute_1Call::SELECTOR,
+            [0x35, 0x93, 0x56, 0x4c],
+            "execute(bytes,bytes[],uint256) must be 0x3593564c"
+        );
+    }
+
+    /// Build a packed UniV3 path: `token_in | fee | token_out` (43 bytes).
+    fn pack_v3_path(token_in: Address, fee: u32, token_out: Address) -> Vec<u8> {
+        let mut out = Vec::with_capacity(43);
+        out.extend_from_slice(token_in.as_slice());
+        out.push(((fee >> 16) & 0xff) as u8);
+        out.push(((fee >> 8) & 0xff) as u8);
+        out.push((fee & 0xff) as u8);
+        out.extend_from_slice(token_out.as_slice());
+        out
+    }
+
+    /// Encode the input bytes for a `V3_SWAP_EXACT_IN` opcode using the
+    /// `sol_types` low-level encoder so the test stays decoupled from
+    /// whatever bytes layout the production handler expects.
+    fn encode_v3_exact_in_input(
+        recipient: Address,
+        amount_in: U256,
+        amount_out_min: U256,
+        path: &[u8],
+        payer_is_user: bool,
+    ) -> Vec<u8> {
+        use alloy::sol_types::{SolType, sol_data};
+        type Tup = (
+            sol_data::Address,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Bytes,
+            sol_data::Bool,
+        );
+        Tup::abi_encode_params(&(
+            recipient,
+            amount_in,
+            amount_out_min,
+            path.to_vec(),
+            payer_is_user,
+        ))
+    }
+
+    #[test]
+    fn decode_universal_router_single_v3_swap_exact_in() {
+        // A single-opcode UR call mirroring the simplest WETH→USDC swap
+        // a Universal-Router-backed front-end would emit. Decoder must
+        // surface one `Protocol::UniswapV3` swap with the path's
+        // (token_in, token_out, fee) intact.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let path = pack_v3_path(weth, 3000, usdc);
+        let recipient = address!("000000000000000000000000000000000000dEaD");
+        let amount_in = U256::from(1_000_000_000_000_000_000u128);
+        let amount_out_min = U256::from(2_500_000_000u128);
+        let inputs: Vec<Bytes> =
+            vec![encode_v3_exact_in_input(recipient, amount_in, amount_out_min, &path, true).into()];
+        let commands = Bytes::from(vec![0x00]); // V3_SWAP_EXACT_IN
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV3);
+        assert_eq!(swaps[0].token_in, weth);
+        assert_eq!(swaps[0].token_out, usdc);
+        assert_eq!(swaps[0].fee_bps, 3000);
+        assert_eq!(swaps[0].amount_in, amount_in);
+        assert_eq!(swaps[0].amount_out_min, amount_out_min);
+        assert_eq!(swaps[0].recipient, recipient);
+        assert_eq!(swaps[0].router, ur);
+    }
+
+    #[test]
+    fn decode_universal_router_skips_non_swap_opcodes() {
+        // Real UR payloads almost always wrap a swap with `WRAP_ETH`
+        // before and `UNWRAP_WETH` after. Those must be dropped silently
+        // — the decoder is only interested in opcodes that move pool
+        // state.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let path = pack_v3_path(weth, 500, usdc);
+        let inputs: Vec<Bytes> = vec![
+            vec![0u8; 32].into(), // WRAP_ETH placeholder input (opaque to us)
+            encode_v3_exact_in_input(
+                Address::ZERO,
+                U256::from(1u64),
+                U256::ZERO,
+                &path,
+                true,
+            )
+            .into(),
+            vec![0u8; 32].into(), // UNWRAP_WETH placeholder input
+        ];
+        let commands = Bytes::from(vec![0x0b, 0x00, 0x0c]); // WRAP_ETH, V3_SWAP_EXACT_IN, UNWRAP_WETH
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(
+            swaps.len(),
+            1,
+            "wrap / unwrap opcodes must be skipped, only the swap remains"
+        );
+        assert_eq!(swaps[0].fee_bps, 500);
+    }
+
+    #[test]
+    fn decode_universal_router_mismatched_commands_inputs_rejected() {
+        // Commands length must equal inputs length. A mismatch indicates
+        // a malformed payload that we shouldn't half-process.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let calldata = execute_0Call {
+            commands: Bytes::from(vec![0x00, 0x00]),
+            inputs: vec![vec![0u8; 32].into()], // 1 input but 2 commands
+        }
+        .abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let err = decode_pending_many(ur, &calldata).unwrap_err();
+        assert!(
+            matches!(err, DecodeError::AbiDecode(_)),
+            "expected AbiDecode for length mismatch, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn decode_universal_router_with_deadline_overload() {
+        // The deadline-bearing `execute_1` is the most common entry point
+        // for wallet-issued UR calls; cover it alongside `execute_0`.
+        use IUniversalRouter::execute_1Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let path = pack_v3_path(weth, 10000, usdc);
+        let inputs: Vec<Bytes> = vec![
+            encode_v3_exact_in_input(Address::ZERO, U256::from(42u64), U256::ZERO, &path, true)
+                .into(),
+        ];
+        let commands = Bytes::from(vec![0x00]);
+        let calldata = execute_1Call {
+            commands,
+            inputs,
+            deadline: U256::from(99u64),
+        }
+        .abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].fee_bps, 10000);
+        assert_eq!(swaps[0].amount_in, U256::from(42u64));
     }
 
     #[test]
