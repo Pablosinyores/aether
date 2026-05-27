@@ -111,10 +111,12 @@ cleanup() {
   if [ -n "${DATABASE_URL:-}" ]; then
     log "Final bundles snapshot (last 10 shadow rows):"
     PSQL "$DATABASE_URL" -c "
-      SELECT id, profit_eth, gas_used, submitted_at, is_shadow
-      FROM bundles
-      WHERE is_shadow = true
-      ORDER BY submitted_at DESC
+      SELECT b.bundle_id, b.target_block, b.gas_used, b.submitted_at, b.is_shadow,
+             a.net_profit_wei
+      FROM bundles b
+      LEFT JOIN arbs a ON a.arb_id = b.arb_id
+      WHERE b.is_shadow = true
+      ORDER BY b.submitted_at DESC
       LIMIT 10;
     " || true
     log "Counts since demo start:"
@@ -122,7 +124,7 @@ cleanup() {
       SELECT
         (SELECT count(*) FROM bundles WHERE is_shadow = true AND submitted_at >= '$TS'::timestamptz) AS shadow_bundles,
         (SELECT count(*) FROM mempool_predictions WHERE decoded_at >= '$TS'::timestamptz) AS predictions,
-        (SELECT count(*) FROM mempool_reconciliation WHERE reconciled_at >= '$TS'::timestamptz) AS reconciliations,
+        (SELECT count(*) FROM mempool_reconciliation WHERE resolution_ts >= '$TS'::timestamptz) AS reconciliations,
         (SELECT count(*) FROM arbs WHERE ts >= '$TS'::timestamptz) AS arbs_detected;
     " || true
   fi
