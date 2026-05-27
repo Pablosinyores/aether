@@ -529,6 +529,23 @@ mod ur_commands {
     /// UniV3 path. Inputs ABI:
     /// `(address recipient, uint256 amountIn, uint256 amountOutMinimum, bytes path, bool payerIsUser)`.
     pub const V3_SWAP_EXACT_IN: u8 = 0x00;
+
+    /// `V3_SWAP_EXACT_OUT` — swap to receive an exact output amount along
+    /// a packed UniV3 path. The path is encoded in **reverse** order
+    /// (`token_out | fee | ... | token_in`) so the on-chain quoter can
+    /// walk it from the destination back to the source. Inputs ABI:
+    /// `(address recipient, uint256 amountOut, uint256 amountInMaximum, bytes path, bool payerIsUser)`.
+    pub const V3_SWAP_EXACT_OUT: u8 = 0x01;
+
+    /// `V2_SWAP_EXACT_IN` — swap an exact input amount along a UniV2
+    /// `address[]` path. Inputs ABI:
+    /// `(address recipient, uint256 amountIn, uint256 amountOutMinimum, address[] path, bool payerIsUser)`.
+    pub const V2_SWAP_EXACT_IN: u8 = 0x08;
+
+    /// `V2_SWAP_EXACT_OUT` — swap to receive an exact output amount along
+    /// a UniV2 `address[]` path. Inputs ABI:
+    /// `(address recipient, uint256 amountOut, uint256 amountInMaximum, address[] path, bool payerIsUser)`.
+    pub const V2_SWAP_EXACT_OUT: u8 = 0x09;
 }
 
 /// 1inch v6 pool-encoding bit constants. The router packs each pool word
@@ -1570,6 +1587,21 @@ fn decode_ur_opcode(
     input: &[u8],
     router: Address,
 ) -> Result<Option<DecodedSwap>, DecodeError> {
+    use alloy::sol_types::{SolType, sol_data};
+    type V3Tuple = (
+        sol_data::Address,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Bytes,
+        sol_data::Bool,
+    );
+    type V2Tuple = (
+        sol_data::Address,
+        sol_data::Uint<256>,
+        sol_data::Uint<256>,
+        sol_data::Array<sol_data::Address>,
+        sol_data::Bool,
+    );
     match opcode {
         ur_commands::V3_SWAP_EXACT_IN => {
             // Tuple shape, per Commands.sol:
@@ -1577,16 +1609,8 @@ fn decode_ur_opcode(
             //    uint256 amountOutMinimum, bytes path, bool payerIsUser)
             // `path` is the canonical UniV3 packed
             // token | fee | token | fee | … | token byte stream.
-            use alloy::sol_types::{SolType, sol_data};
-            type V3ExactInTuple = (
-                sol_data::Address,
-                sol_data::Uint<256>,
-                sol_data::Uint<256>,
-                sol_data::Bytes,
-                sol_data::Bool,
-            );
             let (recipient, amount_in, amount_out_min, path, _payer_is_user) =
-                V3ExactInTuple::abi_decode_params(input)
+                V3Tuple::abi_decode_params(input)
                     .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
             let (token_in, token_out, fee, path_extra) = parse_v3_path(&path)?;
             Ok(Some(DecodedSwap {
@@ -1598,6 +1622,89 @@ fn decode_ur_opcode(
                 amount_out_min,
                 recipient,
                 fee_bps: fee,
+                path_extra,
+                curve_indices: None,
+                pool_address: None,
+                one_inch_zero_for_one: None,
+            }))
+        }
+        ur_commands::V3_SWAP_EXACT_OUT => {
+            // Tuple shape: `(recipient, amountOut, amountInMaximum, path, payerIsUser)`.
+            // Path is reversed (token_out first, token_in last). Follow
+            // the same surfacing convention as the V3 exactOutput single /
+            // multi-hop family elsewhere in this module: `amount_in` =
+            // user-committed amountOut, `amount_out_min` = per-hop cap on
+            // input spend.
+            let (recipient, amount_out, amount_in_max, path, _payer_is_user) =
+                V3Tuple::abi_decode_params(input)
+                    .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            let (path_first, path_second, fee, extras) = parse_v3_path(&path)?;
+            let (token_in, token_out) =
+                swap_path_first_hop_for_exact_output(path_first, path_second, &extras);
+            Ok(Some(DecodedSwap {
+                protocol: Protocol::UniswapV3,
+                router,
+                token_in,
+                token_out,
+                amount_in: amount_out,
+                amount_out_min: amount_in_max,
+                recipient,
+                fee_bps: fee,
+                path_extra: extras,
+                curve_indices: None,
+                pool_address: None,
+                one_inch_zero_for_one: None,
+            }))
+        }
+        ur_commands::V2_SWAP_EXACT_IN => {
+            // Tuple shape: `(recipient, amountIn, amountOutMin, address[] path, payerIsUser)`.
+            // The path is an explicit array; the first hop is `path[0] →
+            // path[1]`. Reject empty / single-element paths as malformed.
+            let (recipient, amount_in, amount_out_min, path, _payer_is_user) =
+                V2Tuple::abi_decode_params(input)
+                    .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            if path.len() < 2 {
+                return Err(DecodeError::EmptyPath);
+            }
+            let (token_in, token_out) = (path[0], path[1]);
+            let path_extra: Vec<Address> = path.into_iter().skip(2).collect();
+            Ok(Some(DecodedSwap {
+                protocol: Protocol::UniswapV2,
+                router,
+                token_in,
+                token_out,
+                amount_in,
+                amount_out_min,
+                recipient,
+                fee_bps: 0,
+                path_extra,
+                curve_indices: None,
+                pool_address: None,
+                one_inch_zero_for_one: None,
+            }))
+        }
+        ur_commands::V2_SWAP_EXACT_OUT => {
+            // Tuple shape: `(recipient, amountOut, amountInMaximum, address[] path, payerIsUser)`.
+            // Unlike V3 exact-out the V2 path is *not* reversed — `path[0]`
+            // is still the input token. Same exact-out surfacing
+            // convention as the V3 branch above.
+            let (recipient, amount_out, amount_in_max, path, _payer_is_user) =
+                V2Tuple::abi_decode_params(input)
+                    .map_err(|e| DecodeError::AbiDecode(e.to_string()))?;
+            if path.len() < 2 {
+                return Err(DecodeError::EmptyPath);
+            }
+            let (token_in, token_out) = (path[0], path[1]);
+            let path_extra: Vec<Address> = path.into_iter().skip(2).collect();
+            Ok(Some(DecodedSwap {
+                protocol: Protocol::UniswapV2,
+                router,
+                token_in,
+                token_out,
+                amount_in: amount_out,
+                amount_out_min: amount_in_max,
+                recipient,
+                fee_bps: 0,
                 path_extra,
                 curve_indices: None,
                 pool_address: None,
@@ -2009,6 +2116,187 @@ mod tests {
         assert_eq!(swaps.len(), 1);
         assert_eq!(swaps[0].fee_bps, 10000);
         assert_eq!(swaps[0].amount_in, U256::from(42u64));
+    }
+
+    /// Encode V3 exact-out tuple. Same ABI shape as exact-in — the
+    /// difference is the path orientation (token_out first) and the
+    /// semantic re-mapping the decoder applies.
+    fn encode_v3_exact_out_input(
+        recipient: Address,
+        amount_out: U256,
+        amount_in_max: U256,
+        path: &[u8],
+        payer_is_user: bool,
+    ) -> Vec<u8> {
+        encode_v3_exact_in_input(recipient, amount_out, amount_in_max, path, payer_is_user)
+    }
+
+    /// Encode V2 swap tuple `(recipient, amount, amount_limit, address[] path, bool)`.
+    fn encode_v2_input(
+        recipient: Address,
+        amount: U256,
+        amount_limit: U256,
+        path: Vec<Address>,
+        payer_is_user: bool,
+    ) -> Vec<u8> {
+        use alloy::sol_types::{SolType, sol_data};
+        type V2Tuple = (
+            sol_data::Address,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Array<sol_data::Address>,
+            sol_data::Bool,
+        );
+        V2Tuple::abi_encode_params(&(recipient, amount, amount_limit, path, payer_is_user))
+    }
+
+    #[test]
+    fn decode_universal_router_v3_swap_exact_out_reverses_path() {
+        // V3 exact-out paths are encoded token_out → token_in. The
+        // decoder must surface `(token_in, token_out)` in canonical
+        // pool-pair order so registry lookups land on the same edge as
+        // the equivalent exact-in swap would.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        // Encoded order: token_out (USDC) | fee | token_in (WETH).
+        let path = pack_v3_path(usdc, 3000, weth);
+        let amount_out = U256::from(2_500_000_000u128);
+        let amount_in_max = U256::from(2_000_000_000_000_000_000u128);
+        let inputs: Vec<Bytes> = vec![encode_v3_exact_out_input(
+            Address::ZERO,
+            amount_out,
+            amount_in_max,
+            &path,
+            true,
+        )
+        .into()];
+        let commands = Bytes::from(vec![ur_commands::V3_SWAP_EXACT_OUT]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV3);
+        assert_eq!(swaps[0].token_in, weth, "exact-out path must be flipped");
+        assert_eq!(swaps[0].token_out, usdc);
+        assert_eq!(swaps[0].fee_bps, 3000);
+        assert_eq!(
+            swaps[0].amount_in, amount_out,
+            "exact-out surfaces user-committed amountOut as amount_in"
+        );
+        assert_eq!(swaps[0].amount_out_min, amount_in_max);
+    }
+
+    #[test]
+    fn decode_universal_router_v2_swap_exact_in() {
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+        let amount_in = U256::from(1_000_000_000_000_000_000u128);
+        let amount_out_min = U256::from(2_500_000_000u128);
+        let inputs: Vec<Bytes> = vec![encode_v2_input(
+            Address::ZERO,
+            amount_in,
+            amount_out_min,
+            vec![weth, dai, usdc],
+            true,
+        )
+        .into()];
+        let commands = Bytes::from(vec![ur_commands::V2_SWAP_EXACT_IN]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV2);
+        assert_eq!(swaps[0].token_in, weth);
+        assert_eq!(swaps[0].token_out, dai);
+        assert_eq!(swaps[0].path_extra, vec![usdc]);
+        assert_eq!(swaps[0].amount_in, amount_in);
+        assert_eq!(swaps[0].amount_out_min, amount_out_min);
+        assert_eq!(swaps[0].fee_bps, 0, "V2 has no per-pool fee tier");
+    }
+
+    #[test]
+    fn decode_universal_router_v2_swap_exact_out() {
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let amount_out = U256::from(2_500_000_000u128);
+        let amount_in_max = U256::from(2_000_000_000_000_000_000u128);
+        let inputs: Vec<Bytes> = vec![encode_v2_input(
+            Address::ZERO,
+            amount_out,
+            amount_in_max,
+            vec![weth, usdc], // V2 path is NOT reversed for exact-out
+            true,
+        )
+        .into()];
+        let commands = Bytes::from(vec![ur_commands::V2_SWAP_EXACT_OUT]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 1);
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV2);
+        assert_eq!(swaps[0].token_in, weth);
+        assert_eq!(swaps[0].token_out, usdc);
+        assert_eq!(swaps[0].amount_in, amount_out);
+        assert_eq!(swaps[0].amount_out_min, amount_in_max);
+    }
+
+    #[test]
+    fn decode_universal_router_v2_swap_rejects_empty_path() {
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let inputs: Vec<Bytes> = vec![encode_v2_input(
+            Address::ZERO,
+            U256::from(1u64),
+            U256::ZERO,
+            vec![], // empty path
+            true,
+        )
+        .into()];
+        let commands = Bytes::from(vec![ur_commands::V2_SWAP_EXACT_IN]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let err = decode_pending_many(ur, &calldata).unwrap_err();
+        assert!(matches!(err, DecodeError::EmptyPath));
+    }
+
+    #[test]
+    fn decode_universal_router_mixed_v2_and_v3_swap_chain() {
+        // Realistic UR payload — V2 hop into WETH, V3 hop out of WETH —
+        // must produce two swap records, one per protocol, in order.
+        use IUniversalRouter::execute_0Call;
+        use alloy::primitives::Bytes;
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+        let v2_path = vec![dai, weth];
+        let v3_path = pack_v3_path(weth, 500, usdc);
+        let inputs: Vec<Bytes> = vec![
+            encode_v2_input(Address::ZERO, U256::from(1u64), U256::ZERO, v2_path, true).into(),
+            encode_v3_exact_in_input(Address::ZERO, U256::from(1u64), U256::ZERO, &v3_path, false)
+                .into(),
+        ];
+        let commands = Bytes::from(vec![
+            ur_commands::V2_SWAP_EXACT_IN,
+            ur_commands::V3_SWAP_EXACT_IN,
+        ]);
+        let calldata = execute_0Call { commands, inputs }.abi_encode();
+        let ur = address!("66a9893cC07D91D95644AEDD05D03f95e1dBA8Af");
+        let swaps = decode_pending_many(ur, &calldata).expect("decode");
+        assert_eq!(swaps.len(), 2, "one record per swap-typed opcode");
+        assert_eq!(swaps[0].protocol, Protocol::UniswapV2);
+        assert_eq!(swaps[0].token_in, dai);
+        assert_eq!(swaps[0].token_out, weth);
+        assert_eq!(swaps[1].protocol, Protocol::UniswapV3);
+        assert_eq!(swaps[1].token_in, weth);
+        assert_eq!(swaps[1].token_out, usdc);
+        assert_eq!(swaps[1].fee_bps, 500);
     }
 
     #[test]
