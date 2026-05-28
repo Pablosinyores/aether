@@ -233,9 +233,15 @@ pub async fn prewarm_state(
 
     let storage_gate = gate.clone();
     let storage_provider = provider.clone();
+    // Clone the cache handle into the closure so the storage stream can
+    // write fresh fetch results back. Cheap — `V2ReservesCache` is
+    // `Arc<DashMap>` under the hood. `None` keeps the original
+    // RPC-every-time behaviour for callers that opt out.
+    let storage_cache_handle = v2_reserves_cache.cloned();
     let storage_stream = futures::stream::iter(storage_to_fetch.into_iter().map(move |addr| {
         let p = storage_provider.clone();
         let g = storage_gate.clone();
+        let cache = storage_cache_handle.clone();
         async move {
             let _permit = g.acquire().await.ok()?;
             match p
@@ -244,6 +250,16 @@ pub async fn prewarm_state(
                 .await
             {
                 Ok(value) if value != U256::ZERO => {
+                    // Write back into the WS-fed cache so the next
+                    // pre-warm cycle for this pool hits locally. The
+                    // recorded `block_number` is the target block of this
+                    // fetch — same value the freshness gate will compare
+                    // against on the next cycle, so a fetch at block N
+                    // makes the pool fresh for block N+1.
+                    if let Some(c) = cache.as_ref() {
+                        let (r0, r1) = crate::v2_reserves_cache::unpack_slot8(value);
+                        c.record(addr, r0, r1, block_number);
+                    }
                     Some((addr, U256::from(V2_RESERVES_SLOT), value))
                 }
                 Ok(_) => None,

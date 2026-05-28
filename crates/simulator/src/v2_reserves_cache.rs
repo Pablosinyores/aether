@@ -37,6 +37,19 @@ fn uint112_mask() -> U256 {
     (U256::from(1u64) << 112) - U256::from(1u64)
 }
 
+/// Inverse of [`ReserveSnapshot::pack_slot8`]: decode a raw UniV2 slot-8
+/// value into the `(reserve0, reserve1)` pair, discarding the high 32 bits
+/// (`blockTimestampLast`) which the cache always stores as zero.
+///
+/// Used by the pre-warm path to write fresh RPC `eth_getStorageAt` results
+/// back into the cache so subsequent cycles serve them locally.
+pub fn unpack_slot8(slot: U256) -> (U256, U256) {
+    let mask = uint112_mask();
+    let r0 = slot & mask;
+    let r1 = (slot >> RESERVE1_SHIFT) & mask;
+    (r0, r1)
+}
+
 /// Latest reserve pair captured for a single pool. `block_number` is the
 /// chain head at which the underlying Sync event was emitted; the pre-warm
 /// path can use it to reject stale entries during reorgs.
@@ -265,6 +278,39 @@ mod tests {
         cache.record(pool, U256::from(1u64), U256::from(2u64), 50);
         // Target block 100, lag 3 -> oldest acceptable = 97; cached at 50 -> miss.
         assert!(cache.get_fresh(pool, 100, 3).is_none());
+    }
+
+    /// `unpack_slot8` must be the exact inverse of `pack_slot8` so RPC
+    /// results written back via the prewarm fetch path round-trip to the
+    /// same `(reserve0, reserve1)` the cache would have emitted itself.
+    /// The high 32 bits (timestamp) are dropped — the cache never stores
+    /// them and consumers don't depend on them.
+    #[test]
+    fn pack_unpack_slot8_roundtrip() {
+        let snap = ReserveSnapshot {
+            reserve0: U256::from(0x1234_5678u64),
+            reserve1: U256::from(0xAABB_CCDDu64),
+            block_number: 99,
+        };
+        let packed = snap.pack_slot8();
+        let (r0, r1) = unpack_slot8(packed);
+        assert_eq!(r0, snap.reserve0);
+        assert_eq!(r1, snap.reserve1);
+    }
+
+    /// Real RPC `eth_getStorageAt` returns slot 8 with the timestamp band
+    /// populated. The unpacker must ignore it instead of bleeding it into
+    /// `reserve1`.
+    #[test]
+    fn unpack_slot8_ignores_timestamp_band() {
+        // Build a real-shape slot: timestamp = 0xDEADBEEF, reserve1 = 7, reserve0 = 11.
+        let timestamp = U256::from(0xDEAD_BEEFu64) << 224;
+        let reserve1 = U256::from(7u64) << RESERVE1_SHIFT;
+        let reserve0 = U256::from(11u64);
+        let slot = timestamp | reserve1 | reserve0;
+        let (r0, r1) = unpack_slot8(slot);
+        assert_eq!(r0, U256::from(11u64));
+        assert_eq!(r1, U256::from(7u64));
     }
 
     /// `get_fresh_status` must split the miss path into Stale vs Missing so
