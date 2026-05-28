@@ -7,6 +7,7 @@ use futures::StreamExt;
 use revm::bytecode::Bytecode;
 
 use crate::bytecode_cache::BytecodeCache;
+use crate::slot_prefetch::{batch_v2_reserves, V2ReservesResult};
 use crate::v2_reserves_cache::{V2CacheLookup, V2ReservesCache};
 use revm::database::CacheDB;
 
@@ -67,6 +68,19 @@ pub struct PrewarmStats {
     /// V2 pool addresses absent from the cache (never recorded by the WS
     /// writer); fell through to `eth_getStorageAt`.
     pub v2_reserves_cache_missing: usize,
+    /// Multicall3 batches dispatched this cycle. At most one per
+    /// `prewarm_state` invocation today; expressed as a counter so future
+    /// expansion (V3 slot0, ERC20 balances) can increment it without API
+    /// churn.
+    pub multicall_batches: usize,
+    /// V2 pool reserves served by a Multicall3 batch instead of an
+    /// individual `eth_getStorageAt`. Each entry saves ~20 Alchemy CU.
+    pub multicall_v2_slots: usize,
+    /// Multicall batches that errored end-to-end and forced a per-pool
+    /// fallback. Should sit at zero in steady state; a non-zero value
+    /// usually means the Multicall3 contract is unreachable on the
+    /// configured chain or the response decoder hit malformed bytes.
+    pub multicall_fallbacks: usize,
 }
 
 impl PrewarmedState {
@@ -76,7 +90,11 @@ impl PrewarmedState {
     /// lazy RPC fetch so on-chain ETH holdings are never clobbered with zero.
     pub fn inject_into(&self, state: &mut RpcForkedState) {
         for (code_hash, bytecode) in &self.code_cache {
-            state.db.cache.contracts.insert(*code_hash, bytecode.clone());
+            state
+                .db
+                .cache
+                .contracts
+                .insert(*code_hash, bytecode.clone());
         }
         for &(addr, slot, value) in &self.storage {
             if let Err(e) = state.db.insert_account_storage(addr, slot, value) {
@@ -176,9 +194,8 @@ pub async fn prewarm_state(
             match p.get_code_at(addr).block_id(block_id).await {
                 Ok(code) if !code.is_empty() => {
                     let code_hash = alloy::primitives::keccak256(&code);
-                    let bytecode = Bytecode::new_raw(
-                        revm::primitives::Bytes::copy_from_slice(&code),
-                    );
+                    let bytecode =
+                        Bytecode::new_raw(revm::primitives::Bytes::copy_from_slice(&code));
                     if let Some(c) = cache.as_ref() {
                         if let Err(e) = c.put(addr, code_hash, &code) {
                             warn!(%addr, error = %e, "pre-warm: bytecode cache persist failed");
@@ -231,6 +248,58 @@ pub async fn prewarm_state(
         storage_to_fetch.extend_from_slice(v2_pool_addresses);
     }
 
+    // Multicall3 batch path: collapse N `eth_getStorageAt` round-trips
+    // into one `eth_call`. Saves ~(N-1) × 20 CU on Alchemy and drops the
+    // in-flight RPC count from N to 1 — the real win under burst load that
+    // drives free-tier 429 throttling. Falls back transparently to the
+    // per-pool stream on multicall failure (network, decode, or contract
+    // unreachable on this chain), so behaviour is strictly additive.
+    let mut multicall_v2_storage: Vec<(Address, U256, U256)> = Vec::new();
+    let mut multicall_batches = 0usize;
+    let mut multicall_fallbacks = 0usize;
+    if !storage_to_fetch.is_empty() {
+        multicall_batches = 1;
+        match batch_v2_reserves(provider, block_number, &storage_to_fetch).await {
+            Ok(results) => {
+                let mut served: std::collections::HashSet<Address> =
+                    std::collections::HashSet::with_capacity(results.len());
+                for V2ReservesResult {
+                    pool,
+                    reserve0,
+                    reserve1,
+                } in &results
+                {
+                    let snap = crate::v2_reserves_cache::ReserveSnapshot {
+                        reserve0: *reserve0,
+                        reserve1: *reserve1,
+                        block_number,
+                    };
+                    multicall_v2_storage.push((
+                        *pool,
+                        U256::from(V2_RESERVES_SLOT),
+                        snap.pack_slot8(),
+                    ));
+                    if let Some(c) = v2_reserves_cache {
+                        c.record(*pool, *reserve0, *reserve1, block_number);
+                    }
+                    served.insert(*pool);
+                }
+                // Per-pool fallback handles only pools whose individual
+                // sub-call reverted inside the batch (typically a stale
+                // address that no longer hosts a V2 pair).
+                storage_to_fetch.retain(|a| !served.contains(a));
+            }
+            Err(e) => {
+                multicall_fallbacks = 1;
+                warn!(
+                    error = %e,
+                    pools = storage_to_fetch.len(),
+                    "pre-warm: multicall3 batch failed; falling back to per-pool eth_getStorageAt",
+                );
+            }
+        }
+    }
+
     let storage_gate = gate.clone();
     let storage_provider = provider.clone();
     // Clone the cache handle into the closure so the storage stream can
@@ -281,6 +350,7 @@ pub async fn prewarm_state(
     let bytecode_rpc_fetches = code_results.iter().filter(|r| r.is_some()).count();
     let v2_reserves_cache_hits = ws_storage.len();
     let storage_warmed = storage_results.iter().filter(|r| r.is_some()).count();
+    let multicall_v2_slots = multicall_v2_storage.len();
     debug!(
         bytecode_cache_hits,
         bytecode_rpc_fetches,
@@ -288,6 +358,9 @@ pub async fn prewarm_state(
         v2_reserves_cache_stale = v2_stale,
         v2_reserves_cache_missing = v2_missing,
         storage_warmed,
+        multicall_batches,
+        multicall_v2_slots,
+        multicall_fallbacks,
         max_concurrent,
         "Block pre-warm complete"
     );
@@ -298,6 +371,7 @@ pub async fn prewarm_state(
     code_cache.extend(code_results.into_iter().flatten());
 
     let mut storage = ws_storage;
+    storage.extend(multicall_v2_storage);
     storage.extend(storage_results.into_iter().flatten());
 
     PrewarmedState {
@@ -309,6 +383,9 @@ pub async fn prewarm_state(
             v2_reserves_cache_hits,
             v2_reserves_cache_stale: v2_stale,
             v2_reserves_cache_missing: v2_missing,
+            multicall_batches,
+            multicall_v2_slots,
+            multicall_fallbacks,
         },
     }
 }
@@ -457,12 +534,7 @@ impl ForkedState {
     }
 
     /// Insert an account with balance and nonce
-    pub fn insert_account_with_nonce(
-        &mut self,
-        address: Address,
-        balance: U256,
-        nonce: u64,
-    ) {
+    pub fn insert_account_with_nonce(&mut self, address: Address, balance: U256, nonce: u64) {
         let info = AccountInfo {
             balance,
             nonce,
@@ -659,9 +731,18 @@ mod tests {
 
         let db_account = state.db.cache.accounts.get(&addr).unwrap();
         assert_eq!(db_account.storage.len(), 3);
-        assert_eq!(*db_account.storage.get(&U256::from(0)).unwrap(), U256::from(111));
-        assert_eq!(*db_account.storage.get(&U256::from(1)).unwrap(), U256::from(222));
-        assert_eq!(*db_account.storage.get(&U256::from(2)).unwrap(), U256::from(333));
+        assert_eq!(
+            *db_account.storage.get(&U256::from(0)).unwrap(),
+            U256::from(111)
+        );
+        assert_eq!(
+            *db_account.storage.get(&U256::from(1)).unwrap(),
+            U256::from(222)
+        );
+        assert_eq!(
+            *db_account.storage.get(&U256::from(2)).unwrap(),
+            U256::from(333)
+        );
     }
 
     // ── Pre-warm concurrency cap ───────────────────────────────────
@@ -788,8 +869,7 @@ mod tests {
             .connect_http("http://127.0.0.1:1/".parse().unwrap())
             .erased();
 
-        let state =
-            prewarm_state(&provider, 1, &[addr_a, addr_b], &[], Some(&cache), None).await;
+        let state = prewarm_state(&provider, 1, &[addr_a, addr_b], &[], Some(&cache), None).await;
 
         assert_eq!(
             state.code_cache.len(),

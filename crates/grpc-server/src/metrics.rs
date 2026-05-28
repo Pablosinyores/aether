@@ -201,6 +201,22 @@ pub struct EngineMetrics {
     /// V2 pool addresses absent from the WS cache (never recorded by the
     /// `Sync` writer). Expected to decay toward zero as the cache warms.
     prewarm_v2_reserves_cache_missing_total: IntCounter,
+    /// Multicall3 batches dispatched by the pre-warm storage path. A batch
+    /// collapses N `eth_getStorageAt` round-trips into a single `eth_call`,
+    /// so the rate of this counter is the rate of "N→1" RPC compressions.
+    prewarm_multicall_batches_total: IntCounter,
+    /// V2 pool reserves served via a Multicall3 sub-call rather than an
+    /// individual `eth_getStorageAt`. Each entry saves ~20 Alchemy CU vs the
+    /// per-pool path; the ratio of this to `prewarm_v2_reserves_cache_*` is
+    /// the dashboard for "how many slots paid the eth_call price vs the
+    /// per-storage price".
+    prewarm_multicall_v2_slots_total: IntCounter,
+    /// Multicall batches that errored end-to-end (network, decode, contract
+    /// unreachable) and forced the per-pool stream to handle the entire
+    /// batch. Should sit at zero in steady state — sustained growth is the
+    /// signal that the configured Multicall3 deployment is unreachable on
+    /// this chain.
+    prewarm_multicall_fallbacks_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -351,8 +367,7 @@ impl EngineMetrics {
             // hand-picked so the histogram is meaningful with as few as 200
             // samples — production traffic fills it in seconds.
             .buckets(vec![
-                50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0,
-                60_000.0,
+                50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0, 30_000.0, 60_000.0,
             ]),
         )
         .expect("aether_mempool_first_seen_to_inclusion_ms histogram");
@@ -438,6 +453,21 @@ impl EngineMetrics {
             "V2 pool addresses never seen by the WS Sync writer",
         )
         .expect("aether_prewarm_v2_reserves_cache_missing_total counter");
+        let prewarm_multicall_batches_total = IntCounter::new(
+            "aether_prewarm_multicall_batches_total",
+            "Multicall3 batches dispatched by the pre-warm storage path",
+        )
+        .expect("aether_prewarm_multicall_batches_total counter");
+        let prewarm_multicall_v2_slots_total = IntCounter::new(
+            "aether_prewarm_multicall_v2_slots_total",
+            "V2 pool reserves served via a Multicall3 sub-call instead of eth_getStorageAt",
+        )
+        .expect("aether_prewarm_multicall_v2_slots_total counter");
+        let prewarm_multicall_fallbacks_total = IntCounter::new(
+            "aether_prewarm_multicall_fallbacks_total",
+            "Multicall3 batches that errored and forced a per-pool eth_getStorageAt fallback",
+        )
+        .expect("aether_prewarm_multicall_fallbacks_total counter");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -535,6 +565,15 @@ impl EngineMetrics {
         registry
             .register(Box::new(prewarm_v2_reserves_cache_missing_total.clone()))
             .expect("register aether_prewarm_v2_reserves_cache_missing_total");
+        registry
+            .register(Box::new(prewarm_multicall_batches_total.clone()))
+            .expect("register aether_prewarm_multicall_batches_total");
+        registry
+            .register(Box::new(prewarm_multicall_v2_slots_total.clone()))
+            .expect("register aether_prewarm_multicall_v2_slots_total");
+        registry
+            .register(Box::new(prewarm_multicall_fallbacks_total.clone()))
+            .expect("register aether_prewarm_multicall_fallbacks_total");
 
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
@@ -599,6 +638,9 @@ impl EngineMetrics {
             prewarm_v2_reserves_cache_hits_total,
             prewarm_v2_reserves_cache_stale_total,
             prewarm_v2_reserves_cache_missing_total,
+            prewarm_multicall_batches_total,
+            prewarm_multicall_v2_slots_total,
+            prewarm_multicall_fallbacks_total,
         }
     }
 
@@ -618,6 +660,28 @@ impl EngineMetrics {
             .inc_by(stats.v2_reserves_cache_stale as u64);
         self.prewarm_v2_reserves_cache_missing_total
             .inc_by(stats.v2_reserves_cache_missing as u64);
+        self.prewarm_multicall_batches_total
+            .inc_by(stats.multicall_batches as u64);
+        self.prewarm_multicall_v2_slots_total
+            .inc_by(stats.multicall_v2_slots as u64);
+        self.prewarm_multicall_fallbacks_total
+            .inc_by(stats.multicall_fallbacks as u64);
+    }
+
+    /// Read the multicall batches counter. Public so tests can assert
+    /// wiring without re-parsing Prometheus text.
+    pub fn prewarm_multicall_batches_count(&self) -> u64 {
+        self.prewarm_multicall_batches_total.get()
+    }
+
+    /// Read the multicall V2-slots-served counter.
+    pub fn prewarm_multicall_v2_slots_count(&self) -> u64 {
+        self.prewarm_multicall_v2_slots_total.get()
+    }
+
+    /// Read the multicall fallback counter.
+    pub fn prewarm_multicall_fallbacks_count(&self) -> u64 {
+        self.prewarm_multicall_fallbacks_total.get()
     }
 
     /// Read the bytecode-cache hit counter. Public so tests can assert
@@ -685,7 +749,6 @@ impl EngineMetrics {
     pub fn observe_mempool_post_state_replay_latency_ms(&self, ms: f64) {
         self.mempool_post_state_replay_latency_ms.observe(ms);
     }
-
 
     pub fn observe_detection_latency_us(&self, us: u128) {
         let ms = us as f64 / 1000.0;
@@ -1108,11 +1171,11 @@ mod tests {
         assert!(output.contains(r#"aether_decode_errors_total{reason="insufficient_topics"} 1"#));
     }
 
-    /// Apply a synthetic `PrewarmStats` payload and assert each of the five
-    /// new counters records the right total. Mirrors the path the engine
-    /// and mempool refresher take after `prewarm_state` returns.
+    /// Apply a synthetic `PrewarmStats` payload and assert each of the
+    /// cache + multicall counters records the right total. Mirrors the path
+    /// the engine and mempool refresher take after `prewarm_state` returns.
     #[test]
-    fn record_prewarm_stats_bumps_all_five_counters() {
+    fn record_prewarm_stats_bumps_all_counters() {
         use aether_simulator::fork::PrewarmStats;
         let metrics = EngineMetrics::new();
 
@@ -1122,6 +1185,9 @@ mod tests {
             v2_reserves_cache_hits: 100,
             v2_reserves_cache_stale: 3,
             v2_reserves_cache_missing: 11,
+            multicall_batches: 5,
+            multicall_v2_slots: 60,
+            multicall_fallbacks: 1,
         });
         // Second call must accumulate, not overwrite — counters are deltas.
         metrics.record_prewarm_stats(PrewarmStats {
@@ -1130,6 +1196,9 @@ mod tests {
             v2_reserves_cache_hits: 1,
             v2_reserves_cache_stale: 1,
             v2_reserves_cache_missing: 1,
+            multicall_batches: 2,
+            multicall_v2_slots: 13,
+            multicall_fallbacks: 0,
         });
 
         assert_eq!(metrics.prewarm_bytecode_cache_hits_count(), 43);
@@ -1137,6 +1206,9 @@ mod tests {
         assert_eq!(metrics.prewarm_v2_reserves_cache_hits_count(), 101);
         assert_eq!(metrics.prewarm_v2_reserves_cache_stale_count(), 4);
         assert_eq!(metrics.prewarm_v2_reserves_cache_missing_count(), 12);
+        assert_eq!(metrics.prewarm_multicall_batches_count(), 7);
+        assert_eq!(metrics.prewarm_multicall_v2_slots_count(), 73);
+        assert_eq!(metrics.prewarm_multicall_fallbacks_count(), 1);
 
         let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
         for name in [
@@ -1145,6 +1217,9 @@ mod tests {
             "aether_prewarm_v2_reserves_cache_hits_total 101",
             "aether_prewarm_v2_reserves_cache_stale_total 4",
             "aether_prewarm_v2_reserves_cache_missing_total 12",
+            "aether_prewarm_multicall_batches_total 7",
+            "aether_prewarm_multicall_v2_slots_total 73",
+            "aether_prewarm_multicall_fallbacks_total 1",
         ] {
             assert!(output.contains(name), "missing or wrong: {name}");
         }
