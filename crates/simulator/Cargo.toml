@@ -15,9 +15,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 futures = "0.3"
+redb = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = "3"
 
 [[bench]]
 name = "simulation"

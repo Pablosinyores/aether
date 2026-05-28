@@ -61,3 +61,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 bigdecimal = "0.4"
+# Embedded ACID key/value store (used for the bytecode disk cache: pure Rust,
+# zero C dependencies, copy-on-write semantics).
+redb = "2"
