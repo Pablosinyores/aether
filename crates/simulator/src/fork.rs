@@ -3,6 +3,8 @@ use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider};
 use futures::future::join_all;
 use revm::bytecode::Bytecode;
+
+use crate::bytecode_cache::BytecodeCache;
 use revm::database::CacheDB;
 use revm::database_interface::EmptyDB;
 use revm::state::AccountInfo;
@@ -59,19 +61,42 @@ impl PrewarmedState {
 /// **`v2_pool_addresses`**: UniswapV2 / SushiSwap pools whose packed-reserve
 /// slot (slot 8) is pre-fetched. This is the single most impactful storage
 /// slot to warm — `getReserves()` reads it on every V2 swap path.
+///
+/// **`bytecode_cache`**: when supplied, addresses already resident in the
+/// cache short-circuit the `eth_getCode` call entirely; freshly fetched
+/// bytecode is persisted back so subsequent block cycles serve from the
+/// cache. Pass `None` to retain the historical RPC-every-time behaviour.
 pub async fn prewarm_state(
     provider: &DynProvider<Ethereum>,
     block_number: u64,
     code_addresses: &[Address],
     v2_pool_addresses: &[Address],
+    bytecode_cache: Option<&BytecodeCache>,
 ) -> PrewarmedState {
     let block_id = BlockId::from(block_number);
 
-    // Fetch contract code for every address in parallel.
-    // Returns (code_hash, bytecode) pairs — we warm the bytecode cache only,
+    // Partition addresses into cache hits (served locally) and misses (must
+    // RPC). Hits bypass the entire RPC fan-out so they don't even contribute
+    // to the in-flight burst that drives free-tier 429s.
+    let mut cached: Vec<(B256, Bytecode)> = Vec::new();
+    let mut to_fetch: Vec<Address> = Vec::with_capacity(code_addresses.len());
+    if let Some(cache) = bytecode_cache {
+        for &addr in code_addresses {
+            match cache.get(addr) {
+                Some(hit) => cached.push(hit),
+                None => to_fetch.push(addr),
+            }
+        }
+    } else {
+        to_fetch.extend_from_slice(code_addresses);
+    }
+
+    // Fetch contract code for every cache-miss in parallel. Returns
+    // (code_hash, bytecode) pairs — we warm the bytecode cache only,
     // leaving account balance/nonce for lazy RPC fetch.
-    let code_futs = code_addresses.iter().map(|&addr| {
+    let code_futs = to_fetch.into_iter().map(|addr| {
         let p = provider.clone();
+        let cache = bytecode_cache.cloned();
         async move {
             match p.get_code_at(addr).block_id(block_id).await {
                 Ok(code) if !code.is_empty() => {
@@ -79,6 +104,11 @@ pub async fn prewarm_state(
                     let bytecode = Bytecode::new_raw(
                         revm::primitives::Bytes::copy_from_slice(&code),
                     );
+                    if let Some(c) = cache.as_ref() {
+                        if let Err(e) = c.put(addr, code_hash, &code) {
+                            warn!(%addr, error = %e, "pre-warm: bytecode cache persist failed");
+                        }
+                    }
                     Some((code_hash, bytecode))
                 }
                 Ok(_) => None, // empty bytecode (EOA)
@@ -116,14 +146,23 @@ pub async fn prewarm_state(
     let (code_results, storage_results) =
         tokio::join!(join_all(code_futs), join_all(storage_futs));
 
+    let cache_hits = cached.len();
+    let rpc_fetched = code_results.iter().filter(|r| r.is_some()).count();
+    let storage_warmed = storage_results.iter().filter(|r| r.is_some()).count();
     debug!(
-        code_warmed = code_results.iter().filter(|r| r.is_some()).count(),
-        storage_warmed = storage_results.iter().filter(|r| r.is_some()).count(),
+        cache_hits,
+        rpc_fetched,
+        storage_warmed,
         "Block pre-warm complete"
     );
 
+    // Merge cached + freshly fetched entries. Order doesn't matter because
+    // injection is keyed by code hash on the consumer side.
+    let mut code_cache = cached;
+    code_cache.extend(code_results.into_iter().flatten());
+
     PrewarmedState {
-        code_cache: code_results.into_iter().flatten().collect(),
+        code_cache,
         storage: storage_results.into_iter().flatten().collect(),
     }
 }
@@ -477,5 +516,67 @@ mod tests {
         assert_eq!(*db_account.storage.get(&U256::from(0)).unwrap(), U256::from(111));
         assert_eq!(*db_account.storage.get(&U256::from(1)).unwrap(), U256::from(222));
         assert_eq!(*db_account.storage.get(&U256::from(2)).unwrap(), U256::from(333));
+    }
+
+    // ── prewarm + bytecode cache wiring ────────────────────────────
+
+    /// When every requested address is already resident in the bytecode
+    /// cache, `prewarm_state` must surface those entries without issuing a
+    /// single RPC. We exercise this by handing the function a provider
+    /// pointed at an unreachable port: any cache miss would trip the
+    /// connection refusal and produce a `warn!` log, but with a fully warm
+    /// cache the RPC code path is never entered and the returned state
+    /// reflects exactly what was pre-populated.
+    #[tokio::test]
+    async fn prewarm_state_skips_rpc_on_full_cache_hit() {
+        use crate::bytecode_cache::BytecodeCache;
+        use alloy::providers::ProviderBuilder;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cache = BytecodeCache::open(tmp.path()).unwrap();
+
+        // Two addresses, each pre-populated with a distinct bytecode.
+        let addr_a = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let code_a = vec![0x60u8, 0x80, 0x60, 0x40, 0x52];
+        let hash_a = alloy::primitives::keccak256(&code_a);
+        cache.put(addr_a, hash_a, &code_a).unwrap();
+
+        let addr_b = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let code_b = vec![0x60u8, 0x00, 0x60, 0x00, 0xf3];
+        let hash_b = alloy::primitives::keccak256(&code_b);
+        cache.put(addr_b, hash_b, &code_b).unwrap();
+
+        // Localhost on a port we'll never bind to — guarantees any RPC
+        // attempt fails fast (and surfaces a `warn!`) instead of hanging.
+        let provider = ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1/".parse().unwrap())
+            .erased();
+
+        let state = prewarm_state(&provider, 1, &[addr_a, addr_b], &[], Some(&cache)).await;
+
+        assert_eq!(
+            state.code_cache.len(),
+            2,
+            "both addresses must come back via the cache, not RPC"
+        );
+        let returned_hashes: std::collections::HashSet<_> =
+            state.code_cache.iter().map(|(h, _)| *h).collect();
+        assert!(returned_hashes.contains(&hash_a));
+        assert!(returned_hashes.contains(&hash_b));
+    }
+
+    /// Without a cache, the function must behave exactly as before. Pointing
+    /// at an unreachable RPC and supplying no addresses gives us a stable
+    /// "all paths empty" baseline that verifies the new signature did not
+    /// break the historical `None`-cache code path.
+    #[tokio::test]
+    async fn prewarm_state_without_cache_returns_empty_for_empty_input() {
+        use alloy::providers::ProviderBuilder;
+        let provider = ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1/".parse().unwrap())
+            .erased();
+        let state = prewarm_state(&provider, 1, &[], &[], None).await;
+        assert!(state.code_cache.is_empty());
+        assert!(state.storage.is_empty());
     }
 }

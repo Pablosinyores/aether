@@ -209,6 +209,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "MEMPOOL_POST_STATE_REPLAY enabled — V3 tick-crossing swaps will escalate to revm fork-replay"
                 );
             }
+            // Plumb the engine's bytecode cache (when configured via
+            // `AETHER_BYTECODE_CACHE_PATH`) into the mempool prewarm path so
+            // address-keyed `eth_getCode` hits skip the RPC round-trip.
+            sim_ctx_inner =
+                sim_ctx_inner.with_bytecode_cache(engine.bytecode_cache().cloned());
             let sim_ctx = Arc::new(sim_ctx_inner);
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),

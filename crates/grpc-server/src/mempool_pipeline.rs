@@ -182,6 +182,9 @@ pub struct SimContext {
     /// bytecode on every attempt. `None` until the first refresh lands.
     pub mempool_prewarm:
         Arc<ArcSwap<Option<Arc<aether_simulator::fork::PrewarmedState>>>>,
+    /// Optional persistent bytecode cache. Threaded into `prewarm_state` so
+    /// addresses already on disk skip the `eth_getCode` round-trip.
+    pub bytecode_cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
 }
 
 impl SimContext {
@@ -208,7 +211,20 @@ impl SimContext {
             pair_index_cache: Mutex::new(None),
             post_state_replay_enabled: false,
             mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
+            bytecode_cache: None,
         }
+    }
+
+    /// Attach a persistent bytecode cache. Future `prewarm_state` calls that
+    /// receive this `SimContext` will consult the cache before issuing
+    /// `eth_getCode` and persist any freshly fetched bytecode back. Passing
+    /// `None` is equivalent to the historical RPC-every-time behaviour.
+    pub fn with_bytecode_cache(
+        mut self,
+        cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
+    ) -> Self {
+        self.bytecode_cache = cache;
+        self
     }
 
     /// Flip the revm post-state replay fallback on. Callers should also
@@ -435,9 +451,14 @@ async fn run_prewarm_refresh(
     let pool_count = registry_guard.len();
     drop(registry_guard);
 
-    let fresh =
-        aether_simulator::fork::prewarm_state(provider, block_number, &code_addrs, &v2_addrs)
-            .await;
+    let fresh = aether_simulator::fork::prewarm_state(
+        provider,
+        block_number,
+        &code_addrs,
+        &v2_addrs,
+        sim_ctx.bytecode_cache.as_deref(),
+    )
+    .await;
 
     sim_ctx
         .mempool_prewarm
