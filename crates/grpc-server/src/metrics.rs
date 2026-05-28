@@ -182,6 +182,25 @@ pub struct EngineMetrics {
     /// Pools whose bytecode + V2 reserve slots were warmed by the most
     /// recent refresh. Set to the snapshot's pool count on success.
     mempool_prewarm_warm_pools: IntGauge,
+    /// Code addresses pre-warm served from the persistent bytecode cache
+    /// without issuing `eth_getCode`. Counted per address per cycle so the
+    /// rate metric tracks "RPC calls avoided", not just cycles touched.
+    prewarm_bytecode_cache_hits_total: IntCounter,
+    /// Code addresses pre-warm had to fetch via `eth_getCode` (cache miss
+    /// or no cache configured). The ratio of this to
+    /// `prewarm_bytecode_cache_hits_total` is the headline RPC-reduction
+    /// dashboard.
+    prewarm_bytecode_rpc_fetches_total: IntCounter,
+    /// V2 pool addresses pre-warm served from the WS-fed reserves cache
+    /// without issuing `eth_getStorageAt`.
+    prewarm_v2_reserves_cache_hits_total: IntCounter,
+    /// V2 pool addresses present in the WS cache but rejected by the
+    /// freshness gate (older than `V2_RESERVES_MAX_LAG_BLOCKS`).
+    /// Sustained non-zero growth = WS subscription lag or reorg churn.
+    prewarm_v2_reserves_cache_stale_total: IntCounter,
+    /// V2 pool addresses absent from the WS cache (never recorded by the
+    /// `Sync` writer). Expected to decay toward zero as the cache warms.
+    prewarm_v2_reserves_cache_missing_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -394,6 +413,31 @@ impl EngineMetrics {
             "Pools whose bytecode + V2 reserve slots were warmed by the most recent refresh",
         )
         .expect("aether_mempool_prewarm_warm_pools gauge");
+        let prewarm_bytecode_cache_hits_total = IntCounter::new(
+            "aether_prewarm_bytecode_cache_hits_total",
+            "Code addresses pre-warm served from the persistent bytecode cache without eth_getCode",
+        )
+        .expect("aether_prewarm_bytecode_cache_hits_total counter");
+        let prewarm_bytecode_rpc_fetches_total = IntCounter::new(
+            "aether_prewarm_bytecode_rpc_fetches_total",
+            "Code addresses pre-warm fetched via eth_getCode (cache miss or cache disabled)",
+        )
+        .expect("aether_prewarm_bytecode_rpc_fetches_total counter");
+        let prewarm_v2_reserves_cache_hits_total = IntCounter::new(
+            "aether_prewarm_v2_reserves_cache_hits_total",
+            "V2 pool addresses pre-warm served from the WS-fed reserves cache",
+        )
+        .expect("aether_prewarm_v2_reserves_cache_hits_total counter");
+        let prewarm_v2_reserves_cache_stale_total = IntCounter::new(
+            "aether_prewarm_v2_reserves_cache_stale_total",
+            "V2 pool addresses present in cache but rejected by the freshness gate",
+        )
+        .expect("aether_prewarm_v2_reserves_cache_stale_total counter");
+        let prewarm_v2_reserves_cache_missing_total = IntCounter::new(
+            "aether_prewarm_v2_reserves_cache_missing_total",
+            "V2 pool addresses never seen by the WS Sync writer",
+        )
+        .expect("aether_prewarm_v2_reserves_cache_missing_total counter");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -476,6 +520,21 @@ impl EngineMetrics {
         registry
             .register(Box::new(mempool_prewarm_warm_pools.clone()))
             .expect("register aether_mempool_prewarm_warm_pools");
+        registry
+            .register(Box::new(prewarm_bytecode_cache_hits_total.clone()))
+            .expect("register aether_prewarm_bytecode_cache_hits_total");
+        registry
+            .register(Box::new(prewarm_bytecode_rpc_fetches_total.clone()))
+            .expect("register aether_prewarm_bytecode_rpc_fetches_total");
+        registry
+            .register(Box::new(prewarm_v2_reserves_cache_hits_total.clone()))
+            .expect("register aether_prewarm_v2_reserves_cache_hits_total");
+        registry
+            .register(Box::new(prewarm_v2_reserves_cache_stale_total.clone()))
+            .expect("register aether_prewarm_v2_reserves_cache_stale_total");
+        registry
+            .register(Box::new(prewarm_v2_reserves_cache_missing_total.clone()))
+            .expect("register aether_prewarm_v2_reserves_cache_missing_total");
 
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
@@ -535,7 +594,56 @@ impl EngineMetrics {
             mempool_prewarm_refresh_total,
             mempool_prewarm_refresh_duration_ms,
             mempool_prewarm_warm_pools,
+            prewarm_bytecode_cache_hits_total,
+            prewarm_bytecode_rpc_fetches_total,
+            prewarm_v2_reserves_cache_hits_total,
+            prewarm_v2_reserves_cache_stale_total,
+            prewarm_v2_reserves_cache_missing_total,
         }
+    }
+
+    /// Apply one `PrewarmStats` snapshot to the five cache counters. Called
+    /// by both the block-driven `Engine` pre-warm path and the mempool
+    /// pre-warm refresher so the metric reflects all cycles, not just one.
+    /// Zero-count fields are inc-by-zero (cheap no-op) — keeps the call
+    /// site branch-free.
+    pub fn record_prewarm_stats(&self, stats: aether_simulator::fork::PrewarmStats) {
+        self.prewarm_bytecode_cache_hits_total
+            .inc_by(stats.bytecode_cache_hits as u64);
+        self.prewarm_bytecode_rpc_fetches_total
+            .inc_by(stats.bytecode_rpc_fetches as u64);
+        self.prewarm_v2_reserves_cache_hits_total
+            .inc_by(stats.v2_reserves_cache_hits as u64);
+        self.prewarm_v2_reserves_cache_stale_total
+            .inc_by(stats.v2_reserves_cache_stale as u64);
+        self.prewarm_v2_reserves_cache_missing_total
+            .inc_by(stats.v2_reserves_cache_missing as u64);
+    }
+
+    /// Read the bytecode-cache hit counter. Public so tests can assert
+    /// cache wiring without re-parsing Prometheus text.
+    pub fn prewarm_bytecode_cache_hits_count(&self) -> u64 {
+        self.prewarm_bytecode_cache_hits_total.get()
+    }
+
+    /// Read the bytecode-cache RPC-fetch counter.
+    pub fn prewarm_bytecode_rpc_fetches_count(&self) -> u64 {
+        self.prewarm_bytecode_rpc_fetches_total.get()
+    }
+
+    /// Read the V2 reserves WS-hit counter.
+    pub fn prewarm_v2_reserves_cache_hits_count(&self) -> u64 {
+        self.prewarm_v2_reserves_cache_hits_total.get()
+    }
+
+    /// Read the V2 reserves stale-rejection counter.
+    pub fn prewarm_v2_reserves_cache_stale_count(&self) -> u64 {
+        self.prewarm_v2_reserves_cache_stale_total.get()
+    }
+
+    /// Read the V2 reserves missing-from-cache counter.
+    pub fn prewarm_v2_reserves_cache_missing_count(&self) -> u64 {
+        self.prewarm_v2_reserves_cache_missing_total.get()
     }
 
     /// Observe a successful first-seen → inclusion latency in ms.
@@ -998,5 +1106,47 @@ mod tests {
         assert!(output.contains(r#"aether_decode_errors_total{reason="unknown_topic"} 1"#));
         assert!(output.contains(r#"aether_decode_errors_total{reason="malformed_payload"} 1"#));
         assert!(output.contains(r#"aether_decode_errors_total{reason="insufficient_topics"} 1"#));
+    }
+
+    /// Apply a synthetic `PrewarmStats` payload and assert each of the five
+    /// new counters records the right total. Mirrors the path the engine
+    /// and mempool refresher take after `prewarm_state` returns.
+    #[test]
+    fn record_prewarm_stats_bumps_all_five_counters() {
+        use aether_simulator::fork::PrewarmStats;
+        let metrics = EngineMetrics::new();
+
+        metrics.record_prewarm_stats(PrewarmStats {
+            bytecode_cache_hits: 42,
+            bytecode_rpc_fetches: 7,
+            v2_reserves_cache_hits: 100,
+            v2_reserves_cache_stale: 3,
+            v2_reserves_cache_missing: 11,
+        });
+        // Second call must accumulate, not overwrite — counters are deltas.
+        metrics.record_prewarm_stats(PrewarmStats {
+            bytecode_cache_hits: 1,
+            bytecode_rpc_fetches: 1,
+            v2_reserves_cache_hits: 1,
+            v2_reserves_cache_stale: 1,
+            v2_reserves_cache_missing: 1,
+        });
+
+        assert_eq!(metrics.prewarm_bytecode_cache_hits_count(), 43);
+        assert_eq!(metrics.prewarm_bytecode_rpc_fetches_count(), 8);
+        assert_eq!(metrics.prewarm_v2_reserves_cache_hits_count(), 101);
+        assert_eq!(metrics.prewarm_v2_reserves_cache_stale_count(), 4);
+        assert_eq!(metrics.prewarm_v2_reserves_cache_missing_count(), 12);
+
+        let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
+        for name in [
+            "aether_prewarm_bytecode_cache_hits_total 43",
+            "aether_prewarm_bytecode_rpc_fetches_total 8",
+            "aether_prewarm_v2_reserves_cache_hits_total 101",
+            "aether_prewarm_v2_reserves_cache_stale_total 4",
+            "aether_prewarm_v2_reserves_cache_missing_total 12",
+        ] {
+            assert!(output.contains(name), "missing or wrong: {name}");
+        }
     }
 }

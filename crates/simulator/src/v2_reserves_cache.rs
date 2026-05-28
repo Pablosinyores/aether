@@ -112,14 +112,43 @@ impl V2ReservesCache {
         target_block: u64,
         max_lag: u64,
     ) -> Option<ReserveSnapshot> {
-        let snap = self.get(pool)?;
-        let oldest_acceptable = target_block.saturating_sub(max_lag);
-        if snap.block_number >= oldest_acceptable {
-            Some(snap)
-        } else {
-            None
+        match self.get_fresh_status(pool, target_block, max_lag) {
+            V2CacheLookup::Fresh(snap) => Some(snap),
+            V2CacheLookup::Stale | V2CacheLookup::Missing => None,
         }
     }
+
+    /// Same as [`get_fresh`] but distinguishes stale-but-present entries from
+    /// never-seen pools so the caller can bump separate `cache_hits` /
+    /// `cache_stale` counters. Both stale and missing paths still fall through
+    /// to RPC; the split is purely for observability.
+    pub fn get_fresh_status(
+        &self,
+        pool: Address,
+        target_block: u64,
+        max_lag: u64,
+    ) -> V2CacheLookup {
+        let Some(snap) = self.get(pool) else {
+            return V2CacheLookup::Missing;
+        };
+        let oldest_acceptable = target_block.saturating_sub(max_lag);
+        if snap.block_number >= oldest_acceptable {
+            V2CacheLookup::Fresh(snap)
+        } else {
+            V2CacheLookup::Stale
+        }
+    }
+}
+
+/// Outcome of a freshness-gated lookup. `Stale` carries no payload because
+/// the caller falls through to RPC regardless; it exists so we can count
+/// "lag-window rejected" pools separately from "never seen" ones, which
+/// behave very differently during reorgs and after WS reconnects.
+#[derive(Clone, Copy, Debug)]
+pub enum V2CacheLookup {
+    Fresh(ReserveSnapshot),
+    Stale,
+    Missing,
 }
 
 #[cfg(test)]
@@ -236,5 +265,33 @@ mod tests {
         cache.record(pool, U256::from(1u64), U256::from(2u64), 50);
         // Target block 100, lag 3 -> oldest acceptable = 97; cached at 50 -> miss.
         assert!(cache.get_fresh(pool, 100, 3).is_none());
+    }
+
+    /// `get_fresh_status` must split the miss path into Stale vs Missing so
+    /// the pre-warm path can count them separately. Both produce identical
+    /// behaviour on the convenience `get_fresh` wrapper, so this is the
+    /// only place where the distinction is observable.
+    #[test]
+    fn get_fresh_status_distinguishes_stale_from_missing() {
+        let cache = V2ReservesCache::new();
+        let unseen = address!("1111111111111111111111111111111111111111");
+        assert!(matches!(
+            cache.get_fresh_status(unseen, 100, 1),
+            V2CacheLookup::Missing
+        ));
+
+        let stale = address!("2222222222222222222222222222222222222222");
+        cache.record(stale, U256::from(1u64), U256::from(2u64), 90);
+        assert!(matches!(
+            cache.get_fresh_status(stale, 100, 1),
+            V2CacheLookup::Stale
+        ));
+
+        let fresh = address!("3333333333333333333333333333333333333333");
+        cache.record(fresh, U256::from(1u64), U256::from(2u64), 100);
+        assert!(matches!(
+            cache.get_fresh_status(fresh, 100, 1),
+            V2CacheLookup::Fresh(_)
+        ));
     }
 }

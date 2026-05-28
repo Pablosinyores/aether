@@ -2050,6 +2050,7 @@ impl AetherEngine {
                 Some(&self.v2_reserves_cache),
             )
             .await;
+            self.metrics.record_prewarm_stats(state.stats);
             Some(Arc::new(state))
         } else {
             None

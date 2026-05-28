@@ -7,7 +7,7 @@ use futures::StreamExt;
 use revm::bytecode::Bytecode;
 
 use crate::bytecode_cache::BytecodeCache;
-use crate::v2_reserves_cache::V2ReservesCache;
+use crate::v2_reserves_cache::{V2CacheLookup, V2ReservesCache};
 use revm::database::CacheDB;
 
 /// How many blocks of WS lag the pre-warm reads-from-cache path tolerates
@@ -40,6 +40,33 @@ pub struct PrewarmedState {
     code_cache: Vec<(B256, Bytecode)>,
     /// (address, slot, value) — pre-fetched storage slots (e.g. V2 reserves).
     storage: Vec<(Address, U256, U256)>,
+    /// Per-cycle counters surfaced for Prometheus instrumentation. Callers
+    /// read these once after `prewarm_state` returns and bump their counter
+    /// vectors — keeping the metric registration in the grpc-server crate
+    /// avoids a dependency edge from `aether_simulator` into Prometheus.
+    pub stats: PrewarmStats,
+}
+
+/// Lightweight counters describing what `prewarm_state` did this cycle.
+/// All fields are post-hoc — they describe work that already completed by
+/// the time the struct is returned.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PrewarmStats {
+    /// Code addresses served from the persistent bytecode cache without
+    /// touching RPC.
+    pub bytecode_cache_hits: usize,
+    /// Code addresses that missed the cache and required an `eth_getCode`
+    /// round-trip.
+    pub bytecode_rpc_fetches: usize,
+    /// V2 pool addresses served from the WS-fed reserves cache.
+    pub v2_reserves_cache_hits: usize,
+    /// V2 pool addresses present in the cache but rejected by the
+    /// freshness gate; they still cost an RPC fetch but the metric
+    /// captures lag visibility.
+    pub v2_reserves_cache_stale: usize,
+    /// V2 pool addresses absent from the cache (never recorded by the WS
+    /// writer); fell through to `eth_getStorageAt`.
+    pub v2_reserves_cache_missing: usize,
 }
 
 impl PrewarmedState {
@@ -181,16 +208,26 @@ pub async fn prewarm_state(
     const V2_RESERVES_SLOT: u64 = 8;
     let mut ws_storage: Vec<(Address, U256, U256)> = Vec::new();
     let mut storage_to_fetch: Vec<Address> = Vec::with_capacity(v2_pool_addresses.len());
+    let mut v2_stale: usize = 0;
+    let mut v2_missing: usize = 0;
     if let Some(rcache) = v2_reserves_cache {
         for &addr in v2_pool_addresses {
-            match rcache.get_fresh(addr, block_number, V2_RESERVES_MAX_LAG_BLOCKS) {
-                Some(snap) => {
+            match rcache.get_fresh_status(addr, block_number, V2_RESERVES_MAX_LAG_BLOCKS) {
+                V2CacheLookup::Fresh(snap) => {
                     ws_storage.push((addr, U256::from(V2_RESERVES_SLOT), snap.pack_slot8()));
                 }
-                None => storage_to_fetch.push(addr),
+                V2CacheLookup::Stale => {
+                    v2_stale += 1;
+                    storage_to_fetch.push(addr);
+                }
+                V2CacheLookup::Missing => {
+                    v2_missing += 1;
+                    storage_to_fetch.push(addr);
+                }
             }
         }
     } else {
+        v2_missing += v2_pool_addresses.len();
         storage_to_fetch.extend_from_slice(v2_pool_addresses);
     }
 
@@ -224,14 +261,16 @@ pub async fn prewarm_state(
         storage_stream.collect::<Vec<_>>(),
     );
 
-    let cache_hits = cached.len();
-    let rpc_fetched = code_results.iter().filter(|r| r.is_some()).count();
-    let ws_reserves_hits = ws_storage.len();
+    let bytecode_cache_hits = cached.len();
+    let bytecode_rpc_fetches = code_results.iter().filter(|r| r.is_some()).count();
+    let v2_reserves_cache_hits = ws_storage.len();
     let storage_warmed = storage_results.iter().filter(|r| r.is_some()).count();
     debug!(
-        cache_hits,
-        rpc_fetched,
-        ws_reserves_hits,
+        bytecode_cache_hits,
+        bytecode_rpc_fetches,
+        v2_reserves_cache_hits,
+        v2_reserves_cache_stale = v2_stale,
+        v2_reserves_cache_missing = v2_missing,
         storage_warmed,
         max_concurrent,
         "Block pre-warm complete"
@@ -248,6 +287,13 @@ pub async fn prewarm_state(
     PrewarmedState {
         code_cache,
         storage,
+        stats: PrewarmStats {
+            bytecode_cache_hits,
+            bytecode_rpc_fetches,
+            v2_reserves_cache_hits,
+            v2_reserves_cache_stale: v2_stale,
+            v2_reserves_cache_missing: v2_missing,
+        },
     }
 }
 

@@ -479,6 +479,7 @@ async fn run_prewarm_refresh(
         sim_ctx.v2_reserves_cache.as_ref(),
     )
     .await;
+    metrics.record_prewarm_stats(fresh.stats);
 
     sim_ctx
         .mempool_prewarm
