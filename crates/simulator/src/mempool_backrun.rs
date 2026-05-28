@@ -258,8 +258,20 @@ where
 
     let (victim_gas_used, victim_ok) = match evm.transact_commit(victim_env) {
         Ok(ExecutionResult::Success { gas_used, .. }) => (gas_used, true),
-        Ok(ExecutionResult::Revert { gas_used, .. }) => {
-            debug!(gas_used, "mempool-backrun: victim reverted");
+        Ok(ExecutionResult::Revert { gas_used, output }) => {
+            // Log the actual revert reason so dashboards / triage can tell
+            // an allowance failure (TRANSFER_FROM_FAILED) apart from a
+            // slippage failure (INSUFFICIENT_OUTPUT_AMOUNT) without having
+            // to re-replay the tx by hand.
+            let reason = decode_revert_reason(output.as_ref());
+            let selector = revert_selector(output.as_ref());
+            debug!(
+                gas_used,
+                reason = %reason,
+                selector = ?selector,
+                output_hex = %alloy::primitives::hex::encode(output.as_ref()),
+                "mempool-backrun: victim reverted"
+            );
             return BackrunSimResult::rejected(RejectReason::VictimReverted, gas_used, 0);
         }
         Ok(ExecutionResult::Halt { reason, gas_used }) => {
@@ -332,7 +344,13 @@ where
             }
             ExecutionResult::Revert { gas_used, output } => {
                 let selector = revert_selector(&output);
-                debug!(gas_used, ?selector, "mempool-backrun: arb leg reverted");
+                let reason = decode_revert_reason(&output);
+                debug!(
+                    gas_used,
+                    reason = %reason,
+                    ?selector,
+                    "mempool-backrun: arb leg reverted"
+                );
                 BackrunSimResult {
                     accepted: false,
                     gross_profit_wei: U256::ZERO,
@@ -372,6 +390,54 @@ fn revert_selector(output: &[u8]) -> [u8; 4] {
     let n = output.len().min(4);
     sel[..n].copy_from_slice(&output[..n]);
     sel
+}
+
+/// Decode a revert payload into a human-readable reason. Recognises the two
+/// Solidity-standard shapes (`Error(string)` and `Panic(uint256)`); anything
+/// else surfaces as a hex selector so the log keeps a stable signal even
+/// when third-party DEXes ship custom errors. Caller is responsible for
+/// hex-encoding overlong unknown payloads — we cap to keep log lines bounded.
+pub fn decode_revert_reason(output: &[u8]) -> String {
+    if output.is_empty() {
+        return "empty_revert".to_string();
+    }
+    // Solidity `Error(string)` — `0x08c379a0` + ABI-encoded string.
+    // Layout: selector(4) || offset(32) || length(32) || data(N, padded).
+    if output.len() >= 4 + 32 + 32 && output[0..4] == [0x08, 0xc3, 0x79, 0xa0] {
+        let len_word = &output[4 + 32..4 + 32 + 32];
+        // Length lives in the low 4 bytes; anything wider is malformed.
+        let len = u32::from_be_bytes([len_word[28], len_word[29], len_word[30], len_word[31]])
+            as usize;
+        let start = 4 + 32 + 32;
+        if len > 0 && start + len <= output.len() {
+            if let Ok(s) = std::str::from_utf8(&output[start..start + len]) {
+                return s.to_string();
+            }
+        }
+    }
+    // Solidity `Panic(uint256)` — `0x4e487b71` + 32-byte panic code.
+    if output.len() >= 4 + 32 && output[0..4] == [0x4e, 0x48, 0x7b, 0x71] {
+        let code_word = &output[4..36];
+        let code = u32::from_be_bytes([
+            code_word[28],
+            code_word[29],
+            code_word[30],
+            code_word[31],
+        ]);
+        return format!("Panic(0x{:02x})", code);
+    }
+    // Custom error — surface the 4-byte selector. Caller can grep against a
+    // signature DB (4byte.directory etc) to recover the human form.
+    if output.len() >= 4 {
+        return format!(
+            "custom_error_0x{}",
+            alloy::primitives::hex::encode(&output[0..4])
+        );
+    }
+    format!(
+        "short_revert_0x{}",
+        alloy::primitives::hex::encode(output)
+    )
 }
 
 /// Convenience for unit tests that only need an `EmptyDB`-backed cache.
@@ -521,6 +587,62 @@ mod tests {
             result.arb_gas_used > 0,
             "arb leg must have actually executed the injected bytecode"
         );
+    }
+
+    /// `Error(string)` revert from a UniV2 router's TransferHelper.
+    /// Real on-chain shape: selector 0x08c379a0, offset=0x20, len=32,
+    /// then the ASCII string. Verifies the decoder unwraps to the original
+    /// human-readable reason without losing any chars.
+    #[test]
+    fn decode_revert_reason_error_string_uniswap_v2_transfer_helper() {
+        // Real on-chain string the UniV2 router emits. 36 chars — exercises
+        // the ABI-padding branch since 36 % 32 != 0.
+        let msg: &[u8] = b"TransferHelper::TRANSFER_FROM_FAILED";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x08, 0xc3, 0x79, 0xa0]); // selector
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        payload.extend_from_slice(&offset); // offset = 32
+        let mut length = [0u8; 32];
+        length[31] = msg.len() as u8;
+        payload.extend_from_slice(&length);
+        payload.extend_from_slice(msg);
+        // ABI padding to 32-byte boundary
+        let pad = 32 - (msg.len() % 32);
+        if pad != 32 {
+            payload.extend(std::iter::repeat_n(0u8, pad));
+        }
+        let got = decode_revert_reason(&payload);
+        assert_eq!(got, "TransferHelper::TRANSFER_FROM_FAILED");
+    }
+
+    /// `Panic(uint256)` with code 0x11 (arithmetic over/underflow). Common
+    /// in Curve invariant math when a malformed swap is replayed.
+    #[test]
+    fn decode_revert_reason_panic_uint256() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x4e, 0x48, 0x7b, 0x71]); // selector
+        let mut code = [0u8; 32];
+        code[31] = 0x11;
+        payload.extend_from_slice(&code);
+        assert_eq!(decode_revert_reason(&payload), "Panic(0x11)");
+    }
+
+    /// Unknown 4-byte custom error selector must surface as hex so triage
+    /// can grep against 4byte.directory. Use a real UniV3 selector to make
+    /// the test more obviously meaningful: `0x7939f424` = `TLU(int24,int24)`.
+    #[test]
+    fn decode_revert_reason_custom_error_falls_back_to_selector_hex() {
+        let payload = [0x79, 0x39, 0xf4, 0x24];
+        assert_eq!(decode_revert_reason(&payload), "custom_error_0x7939f424");
+    }
+
+    /// Empty revert (no return data) is a real on-chain shape — `require()`
+    /// with no message string produces this. Must round-trip cleanly to a
+    /// non-panicking marker rather than indexing into a zero-length slice.
+    #[test]
+    fn decode_revert_reason_empty_payload() {
+        assert_eq!(decode_revert_reason(&[]), "empty_revert");
     }
 
     #[test]
