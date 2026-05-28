@@ -199,6 +199,12 @@ pub struct AetherEngine {
     /// When `Some`, `run_detection_cycle` uses `RpcForkedState` instead of
     /// the empty `ForkedState`.
     rpc_provider: Option<DynProvider<Ethereum>>,
+    /// Optional persistent bytecode cache. When opened (via the
+    /// `AETHER_BYTECODE_CACHE_PATH` env var) `prewarm_state` consults it
+    /// before issuing `eth_getCode` and writes back any freshly fetched
+    /// bytecode so subsequent block cycles serve cache hits. `None`
+    /// preserves the historical RPC-every-time behaviour.
+    bytecode_cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
     /// Prometheus metrics for engine operations.
     metrics: Arc<EngineMetrics>,
     /// Persistent trade ledger. NoopLedger by default; PgLedger when
@@ -424,6 +430,25 @@ impl AetherEngine {
             Some(provider.erased())
         });
 
+        // Open the persistent bytecode cache when configured. Failure to open
+        // never blocks engine startup — every cache operation degrades to
+        // `None` and falls through to the existing RPC path.
+        let bytecode_cache = std::env::var("AETHER_BYTECODE_CACHE_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|path| {
+                match aether_simulator::bytecode_cache::BytecodeCache::open(&path) {
+                    Ok(c) => {
+                        info!(path = %path, "bytecode cache opened");
+                        Some(Arc::new(c))
+                    }
+                    Err(e) => {
+                        warn!(path = %path, error = %e, "bytecode cache open failed; running without cache");
+                        None
+                    }
+                }
+            });
+
         // Start with a reasonable initial graph size (can grow dynamically).
         let initial_graph = PriceGraph::new(100);
         let snapshot_manager = Arc::new(SnapshotManager::new(initial_graph.clone()));
@@ -442,6 +467,7 @@ impl AetherEngine {
             pool_registry: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             pool_states: new_pool_state_cache(),
             rpc_provider,
+            bytecode_cache,
             metrics,
             ledger,
         }
@@ -1997,8 +2023,14 @@ impl AetherEngine {
             v2_addrs.sort_unstable();
             v2_addrs.dedup();
 
-            let state =
-                prewarm_state(provider, block_info.number, &code_addrs, &v2_addrs).await;
+            let state = prewarm_state(
+                provider,
+                block_info.number,
+                &code_addrs,
+                &v2_addrs,
+                self.bytecode_cache.as_deref(),
+            )
+            .await;
             Some(Arc::new(state))
         } else {
             None
@@ -2276,6 +2308,15 @@ impl AetherEngine {
     /// to build `RpcForkedState` per validation attempt.
     pub fn rpc_provider(&self) -> Option<DynProvider<Ethereum>> {
         self.rpc_provider.clone()
+    }
+
+    /// Borrow the persistent bytecode cache handle. `None` when the cache is
+    /// disabled (no `AETHER_BYTECODE_CACHE_PATH`). Cheap to `Arc::clone` for
+    /// downstream consumers (mempool `SimContext`).
+    pub fn bytecode_cache(
+        &self,
+    ) -> Option<&Arc<aether_simulator::bytecode_cache::BytecodeCache>> {
+        self.bytecode_cache.as_ref()
     }
 }
 
