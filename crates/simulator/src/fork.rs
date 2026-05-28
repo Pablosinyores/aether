@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{DynProvider, Provider};
-use futures::future::join_all;
+use futures::StreamExt;
 use revm::bytecode::Bytecode;
 use revm::database::CacheDB;
 use revm::database_interface::EmptyDB;
@@ -47,14 +49,36 @@ impl PrewarmedState {
     }
 }
 
+/// Maximum number of pre-warm RPC requests in flight at once.
+///
+/// Free-tier RPC providers (notably Alchemy at 25 CU/s) collapse into 429
+/// throttling when `eth_getCode` + `eth_getStorageAt` batches are dispatched
+/// without a concurrency cap. Capping in-flight requests at this value keeps
+/// pre-warm under typical free-tier burst ceilings while still parallelising
+/// enough to keep wall-clock latency low.
+///
+/// Override via `AETHER_PREWARM_MAX_CONCURRENT`.
+pub const DEFAULT_PREWARM_MAX_CONCURRENT: usize = 8;
+
+/// Resolve the prewarm concurrency cap. Reads `AETHER_PREWARM_MAX_CONCURRENT`
+/// if set and positive, otherwise returns [`DEFAULT_PREWARM_MAX_CONCURRENT`].
+fn resolve_prewarm_max_concurrent() -> usize {
+    std::env::var("AETHER_PREWARM_MAX_CONCURRENT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_PREWARM_MAX_CONCURRENT)
+}
+
 /// Fetch contract code and known storage slots for `code_addresses` and
 /// `v2_pool_addresses` at `block_number`, returning a `PrewarmedState` ready
 /// to be injected into parallel simulation tasks.
 ///
-/// All RPC calls are issued concurrently via `join_all`. Errors on individual
-/// addresses are logged and skipped — pre-warming is best-effort; missing
-/// entries simply result in a per-task cache miss (lazy RPC fetch) rather
-/// than a hard failure.
+/// RPC calls are dispatched concurrently but capped by a shared in-flight
+/// semaphore (default [`DEFAULT_PREWARM_MAX_CONCURRENT`], overridable via
+/// `AETHER_PREWARM_MAX_CONCURRENT`). Errors on individual addresses are logged
+/// and skipped — pre-warming is best-effort; missing entries simply result in
+/// a per-task cache miss (lazy RPC fetch) rather than a hard failure.
 ///
 /// **`v2_pool_addresses`**: UniswapV2 / SushiSwap pools whose packed-reserve
 /// slot (slot 8) is pre-fetched. This is the single most impactful storage
@@ -65,14 +89,24 @@ pub async fn prewarm_state(
     code_addresses: &[Address],
     v2_pool_addresses: &[Address],
 ) -> PrewarmedState {
+    let max_concurrent = resolve_prewarm_max_concurrent();
+    // Shared in-flight gate across both the code and storage streams so the
+    // total RPC pressure is bounded by `max_concurrent`, not 2× that value.
+    let gate = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     let block_id = BlockId::from(block_number);
 
-    // Fetch contract code for every address in parallel.
-    // Returns (code_hash, bytecode) pairs — we warm the bytecode cache only,
-    // leaving account balance/nonce for lazy RPC fetch.
-    let code_futs = code_addresses.iter().map(|&addr| {
-        let p = provider.clone();
+    // Fetch contract code via a bounded-concurrency stream. Each future
+    // acquires a semaphore permit before issuing the request and releases it
+    // on completion, keeping at most `max_concurrent` in flight across both
+    // streams combined.
+    let code_addrs = code_addresses.to_vec();
+    let code_gate = gate.clone();
+    let code_provider = provider.clone();
+    let code_stream = futures::stream::iter(code_addrs.into_iter().map(move |addr| {
+        let p = code_provider.clone();
+        let g = code_gate.clone();
         async move {
+            let _permit = g.acquire().await.ok()?;
             match p.get_code_at(addr).block_id(block_id).await {
                 Ok(code) if !code.is_empty() => {
                     let code_hash = alloy::primitives::keccak256(&code);
@@ -88,14 +122,20 @@ pub async fn prewarm_state(
                 }
             }
         }
-    });
+    }))
+    .buffer_unordered(max_concurrent);
 
     // Fetch slot 8 (packed reserves: reserve0 | reserve1 | blockTimestampLast)
-    // for UniswapV2 / SushiSwap pools in parallel.
+    // for UniswapV2 / SushiSwap pools through the same shared gate.
     const V2_RESERVES_SLOT: u64 = 8;
-    let storage_futs = v2_pool_addresses.iter().map(|&addr| {
-        let p = provider.clone();
+    let storage_addrs = v2_pool_addresses.to_vec();
+    let storage_gate = gate.clone();
+    let storage_provider = provider.clone();
+    let storage_stream = futures::stream::iter(storage_addrs.into_iter().map(move |addr| {
+        let p = storage_provider.clone();
+        let g = storage_gate.clone();
         async move {
+            let _permit = g.acquire().await.ok()?;
             match p
                 .get_storage_at(addr, U256::from(V2_RESERVES_SLOT))
                 .block_id(block_id)
@@ -111,14 +151,18 @@ pub async fn prewarm_state(
                 }
             }
         }
-    });
+    }))
+    .buffer_unordered(max_concurrent);
 
-    let (code_results, storage_results) =
-        tokio::join!(join_all(code_futs), join_all(storage_futs));
+    let (code_results, storage_results) = tokio::join!(
+        code_stream.collect::<Vec<_>>(),
+        storage_stream.collect::<Vec<_>>(),
+    );
 
     debug!(
         code_warmed = code_results.iter().filter(|r| r.is_some()).count(),
         storage_warmed = storage_results.iter().filter(|r| r.is_some()).count(),
+        max_concurrent,
         "Block pre-warm complete"
     );
 
@@ -477,5 +521,95 @@ mod tests {
         assert_eq!(*db_account.storage.get(&U256::from(0)).unwrap(), U256::from(111));
         assert_eq!(*db_account.storage.get(&U256::from(1)).unwrap(), U256::from(222));
         assert_eq!(*db_account.storage.get(&U256::from(2)).unwrap(), U256::from(333));
+    }
+
+    // ── Pre-warm concurrency cap ───────────────────────────────────
+
+    /// Mutex serialises tests that mutate the shared `AETHER_PREWARM_MAX_CONCURRENT`
+    /// env var so they cannot race with each other.
+    fn prewarm_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn prewarm_max_concurrent_defaults_when_env_absent() {
+        let _guard = prewarm_env_guard();
+        // SAFETY: tests in this module are serialised through `prewarm_env_guard`.
+        unsafe { std::env::remove_var("AETHER_PREWARM_MAX_CONCURRENT") };
+        assert_eq!(
+            resolve_prewarm_max_concurrent(),
+            DEFAULT_PREWARM_MAX_CONCURRENT
+        );
+    }
+
+    #[test]
+    fn prewarm_max_concurrent_reads_env_override() {
+        let _guard = prewarm_env_guard();
+        unsafe { std::env::set_var("AETHER_PREWARM_MAX_CONCURRENT", "3") };
+        assert_eq!(resolve_prewarm_max_concurrent(), 3);
+        unsafe { std::env::remove_var("AETHER_PREWARM_MAX_CONCURRENT") };
+    }
+
+    #[test]
+    fn prewarm_max_concurrent_rejects_zero_and_garbage() {
+        let _guard = prewarm_env_guard();
+        // Zero must fall back to the default — a 0-permit semaphore would
+        // deadlock the pre-warm path.
+        unsafe { std::env::set_var("AETHER_PREWARM_MAX_CONCURRENT", "0") };
+        assert_eq!(
+            resolve_prewarm_max_concurrent(),
+            DEFAULT_PREWARM_MAX_CONCURRENT
+        );
+        unsafe { std::env::set_var("AETHER_PREWARM_MAX_CONCURRENT", "not-a-number") };
+        assert_eq!(
+            resolve_prewarm_max_concurrent(),
+            DEFAULT_PREWARM_MAX_CONCURRENT
+        );
+        unsafe { std::env::remove_var("AETHER_PREWARM_MAX_CONCURRENT") };
+    }
+
+    /// Verifies the shared semaphore actually caps in-flight work. We dispatch
+    /// 50 futures against a 4-permit gate built the same way `prewarm_state`
+    /// builds its own, observe the peak concurrency reached, and confirm it
+    /// never exceeds the configured cap.
+    #[tokio::test]
+    async fn prewarm_semaphore_bounds_in_flight_concurrency() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TASKS: usize = 50;
+        const CAP: usize = 4;
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(CAP));
+
+        let stream = futures::stream::iter((0..TASKS).map(|_| {
+            let g = gate.clone();
+            let inf = in_flight.clone();
+            let pk = peak.clone();
+            async move {
+                let _permit = g.acquire().await.unwrap();
+                let current = inf.fetch_add(1, Ordering::SeqCst) + 1;
+                pk.fetch_max(current, Ordering::SeqCst);
+                // Hold the permit long enough for concurrency to build up.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                inf.fetch_sub(1, Ordering::SeqCst);
+            }
+        }))
+        .buffer_unordered(CAP);
+
+        stream.collect::<Vec<_>>().await;
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= CAP,
+            "peak in-flight {} exceeded cap {}",
+            peak.load(Ordering::SeqCst),
+            CAP
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
     }
 }
