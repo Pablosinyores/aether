@@ -214,6 +214,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // address-keyed `eth_getCode` hits skip the RPC round-trip.
             sim_ctx_inner =
                 sim_ctx_inner.with_bytecode_cache(engine.bytecode_cache().cloned());
+            // Plumb the engine's WS-fed V2 reserves cache so the mempool
+            // prewarm path can synthesise slot 8 for warm pools instead of
+            // round-tripping `eth_getStorageAt`.
+            sim_ctx_inner =
+                sim_ctx_inner.with_v2_reserves_cache(Some(engine.v2_reserves_cache()));
             let sim_ctx = Arc::new(sim_ctx_inner);
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
