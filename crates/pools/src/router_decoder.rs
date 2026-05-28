@@ -2812,7 +2812,7 @@ mod tests {
             sourceToken: weth,
             targetToken: bnt,
             sourceAmount: U256::from(1_000_000_000_000_000_000u128), // 1 WETH
-            minReturnAmount: U256::from(2_500u64 * 10u64.pow(18)),    // 2500 BNT
+            minReturnAmount: U256::from(2_500u64) * U256::from(1_000_000_000_000_000_000u128),    // 2500 BNT
             deadline: U256::from(99_999_999_999u64),
             beneficiary,
         }
@@ -2823,7 +2823,7 @@ mod tests {
         assert_eq!(decoded.token_in, weth);
         assert_eq!(decoded.token_out, bnt);
         assert_eq!(decoded.amount_in, U256::from(1_000_000_000_000_000_000u128));
-        assert_eq!(decoded.amount_out_min, U256::from(2_500u64 * 10u64.pow(18)));
+        assert_eq!(decoded.amount_out_min, U256::from(2_500u64) * U256::from(1_000_000_000_000_000_000u128));
         assert_eq!(decoded.recipient, beneficiary);
         assert_eq!(decoded.fee_bps, 0);
         assert!(decoded.path_extra.is_empty());
