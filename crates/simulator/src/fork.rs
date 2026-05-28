@@ -7,7 +7,15 @@ use futures::StreamExt;
 use revm::bytecode::Bytecode;
 
 use crate::bytecode_cache::BytecodeCache;
+use crate::v2_reserves_cache::V2ReservesCache;
 use revm::database::CacheDB;
+
+/// How many blocks of WS lag the pre-warm reads-from-cache path tolerates
+/// before falling back to RPC. `Sync` events arrive within ~50 ms of a
+/// block landing on the WS subscription; one block of slack (~12 s) is
+/// more than enough headroom under normal latency while still rejecting
+/// clearly stale snapshots after a reconnect or reorg.
+pub const V2_RESERVES_MAX_LAG_BLOCKS: u64 = 1;
 use revm::database_interface::EmptyDB;
 use revm::state::AccountInfo;
 use revm_database::{AlloyDB, BlockId, WrapDatabaseAsync};
@@ -90,12 +98,18 @@ fn resolve_prewarm_max_concurrent() -> usize {
 /// cache short-circuit the `eth_getCode` call entirely; freshly fetched
 /// bytecode is persisted back so subsequent block cycles serve from the
 /// cache. Pass `None` to retain the historical RPC-every-time behaviour.
+///
+/// **`v2_reserves_cache`**: when supplied, V2 pool addresses whose latest
+/// `Sync` event landed within [`V2_RESERVES_MAX_LAG_BLOCKS`] of
+/// `block_number` synthesise the slot-8 storage value locally and skip the
+/// `eth_getStorageAt` round-trip. Stale pools fall back to RPC.
 pub async fn prewarm_state(
     provider: &DynProvider<Ethereum>,
     block_number: u64,
     code_addresses: &[Address],
     v2_pool_addresses: &[Address],
     bytecode_cache: Option<&BytecodeCache>,
+    v2_reserves_cache: Option<&V2ReservesCache>,
 ) -> PrewarmedState {
     let max_concurrent = resolve_prewarm_max_concurrent();
     // Shared in-flight gate across both the code and storage streams so the
@@ -155,13 +169,34 @@ pub async fn prewarm_state(
     }))
     .buffer_unordered(max_concurrent);
 
-    // Fetch slot 8 (packed reserves: reserve0 | reserve1 | blockTimestampLast)
-    // for UniswapV2 / SushiSwap pools through the same shared gate.
+    // Slot 8 of every UniV2 pair packs `(blockTimestampLast << 224) |
+    // (reserve1 << 112) | reserve0`. Two paths feed it:
+    //
+    // 1. WS-fed `V2ReservesCache`: synthesise the slot locally for any pool
+    //    whose latest `Sync` event landed within `V2_RESERVES_MAX_LAG_BLOCKS`
+    //    of the target block. Stale or missing entries fall through.
+    // 2. Throttled RPC `eth_getStorageAt` for the remaining addresses,
+    //    sharing the in-flight semaphore with the code-fetch stream so the
+    //    combined RPC pressure is bounded by `max_concurrent`.
     const V2_RESERVES_SLOT: u64 = 8;
-    let storage_addrs = v2_pool_addresses.to_vec();
+    let mut ws_storage: Vec<(Address, U256, U256)> = Vec::new();
+    let mut storage_to_fetch: Vec<Address> = Vec::with_capacity(v2_pool_addresses.len());
+    if let Some(rcache) = v2_reserves_cache {
+        for &addr in v2_pool_addresses {
+            match rcache.get_fresh(addr, block_number, V2_RESERVES_MAX_LAG_BLOCKS) {
+                Some(snap) => {
+                    ws_storage.push((addr, U256::from(V2_RESERVES_SLOT), snap.pack_slot8()));
+                }
+                None => storage_to_fetch.push(addr),
+            }
+        }
+    } else {
+        storage_to_fetch.extend_from_slice(v2_pool_addresses);
+    }
+
     let storage_gate = gate.clone();
     let storage_provider = provider.clone();
-    let storage_stream = futures::stream::iter(storage_addrs.into_iter().map(move |addr| {
+    let storage_stream = futures::stream::iter(storage_to_fetch.into_iter().map(move |addr| {
         let p = storage_provider.clone();
         let g = storage_gate.clone();
         async move {
@@ -191,10 +226,12 @@ pub async fn prewarm_state(
 
     let cache_hits = cached.len();
     let rpc_fetched = code_results.iter().filter(|r| r.is_some()).count();
+    let ws_reserves_hits = ws_storage.len();
     let storage_warmed = storage_results.iter().filter(|r| r.is_some()).count();
     debug!(
         cache_hits,
         rpc_fetched,
+        ws_reserves_hits,
         storage_warmed,
         max_concurrent,
         "Block pre-warm complete"
@@ -205,9 +242,12 @@ pub async fn prewarm_state(
     let mut code_cache = cached;
     code_cache.extend(code_results.into_iter().flatten());
 
+    let mut storage = ws_storage;
+    storage.extend(storage_results.into_iter().flatten());
+
     PrewarmedState {
         code_cache,
-        storage: storage_results.into_iter().flatten().collect(),
+        storage,
     }
 }
 
@@ -686,7 +726,8 @@ mod tests {
             .connect_http("http://127.0.0.1:1/".parse().unwrap())
             .erased();
 
-        let state = prewarm_state(&provider, 1, &[addr_a, addr_b], &[], Some(&cache)).await;
+        let state =
+            prewarm_state(&provider, 1, &[addr_a, addr_b], &[], Some(&cache), None).await;
 
         assert_eq!(
             state.code_cache.len(),
@@ -709,8 +750,76 @@ mod tests {
         let provider = ProviderBuilder::new()
             .connect_http("http://127.0.0.1:1/".parse().unwrap())
             .erased();
-        let state = prewarm_state(&provider, 1, &[], &[], None).await;
+        let state = prewarm_state(&provider, 1, &[], &[], None, None).await;
         assert!(state.code_cache.is_empty());
         assert!(state.storage.is_empty());
+    }
+
+    /// Verifies the WS-fed V2 reserves cache short-circuits the storage
+    /// fetch path. A fully populated reserves cache must let `prewarm_state`
+    /// return slot-8 entries for every V2 pool address without ever
+    /// touching the RPC endpoint (which here is unreachable).
+    #[tokio::test]
+    async fn prewarm_state_skips_rpc_on_full_v2_reserves_hit() {
+        use crate::v2_reserves_cache::V2ReservesCache;
+        use alloy::providers::ProviderBuilder;
+
+        let rcache = V2ReservesCache::new();
+        let p1 = address!("1111111111111111111111111111111111111111");
+        let p2 = address!("2222222222222222222222222222222222222222");
+        let r0_p1 = U256::from(1_000u64);
+        let r1_p1 = U256::from(2_000u64);
+        let r0_p2 = U256::from(5_000u64);
+        let r1_p2 = U256::from(6_000u64);
+        rcache.record(p1, r0_p1, r1_p1, 100);
+        rcache.record(p2, r0_p2, r1_p2, 100);
+
+        let provider = ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1/".parse().unwrap())
+            .erased();
+
+        // Target the same block the cache recorded — well inside the lag
+        // window — so both pools must surface via the WS cache.
+        let state = prewarm_state(&provider, 100, &[], &[p1, p2], None, Some(&rcache)).await;
+
+        assert_eq!(
+            state.storage.len(),
+            2,
+            "both pools must surface slot-8 entries via the WS cache"
+        );
+        let by_addr: std::collections::HashMap<_, _> =
+            state.storage.iter().map(|(a, _, v)| (*a, *v)).collect();
+        // Decode the packed slot-8 layout to confirm reserve0 and reserve1
+        // round-trip intact for at least one pool.
+        let packed_p1 = by_addr.get(&p1).copied().expect("p1 entry");
+        let mask112 = (U256::from(1u64) << 112) - U256::from(1u64);
+        assert_eq!(packed_p1 & mask112, r0_p1);
+        assert_eq!((packed_p1 >> 112) & mask112, r1_p1);
+    }
+
+    /// Stale reserve snapshots (older than the lag window) must NOT short-
+    /// circuit the RPC call. The cache hit is rejected and the address
+    /// falls through to the normal RPC path; with an unreachable provider
+    /// that path errors and the address is simply absent from the result.
+    #[tokio::test]
+    async fn prewarm_state_falls_through_when_v2_cache_is_stale() {
+        use crate::v2_reserves_cache::V2ReservesCache;
+        use alloy::providers::ProviderBuilder;
+
+        let rcache = V2ReservesCache::new();
+        let p1 = address!("3333333333333333333333333333333333333333");
+        rcache.record(p1, U256::from(1u64), U256::from(2u64), 10);
+
+        let provider = ProviderBuilder::new()
+            .connect_http("http://127.0.0.1:1/".parse().unwrap())
+            .erased();
+
+        // Target block 100, cache entry at block 10 — well outside the
+        // 1-block lag window. RPC is unreachable so the result is empty.
+        let state = prewarm_state(&provider, 100, &[], &[p1], None, Some(&rcache)).await;
+        assert!(
+            state.storage.is_empty(),
+            "stale cache entries must not surface in pre-warm output"
+        );
     }
 }

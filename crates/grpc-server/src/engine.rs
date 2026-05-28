@@ -205,6 +205,12 @@ pub struct AetherEngine {
     /// bytecode so subsequent block cycles serve cache hits. `None`
     /// preserves the historical RPC-every-time behaviour.
     bytecode_cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
+    /// In-memory cache of UniswapV2 / SushiSwap pool reserves populated by
+    /// the WS `Sync` event handler. `prewarm_state` consults it before
+    /// issuing `eth_getStorageAt` for slot 8 of each pool. Always present
+    /// (lock-free `DashMap`-backed) but only effective once Sync events
+    /// have populated entries for the monitored pools.
+    v2_reserves_cache: aether_simulator::v2_reserves_cache::V2ReservesCache,
     /// Prometheus metrics for engine operations.
     metrics: Arc<EngineMetrics>,
     /// Persistent trade ledger. NoopLedger by default; PgLedger when
@@ -468,6 +474,7 @@ impl AetherEngine {
             pool_states: new_pool_state_cache(),
             rpc_provider,
             bytecode_cache,
+            v2_reserves_cache: aether_simulator::v2_reserves_cache::V2ReservesCache::new(),
             metrics,
             ledger,
         }
@@ -1449,6 +1456,17 @@ impl AetherEngine {
             } => {
                 debug!(%pool, ?protocol, "Pool reserve update");
 
+                // Capture the live reserves into the WS-fed cache so the
+                // next pre-warm cycle can serve slot 8 locally instead of
+                // round-tripping `eth_getStorageAt`. Only V2-family pools
+                // pack reserves at slot 8 in the format this cache emits;
+                // V3 / Curve / Balancer have richer state representations
+                // and stay on the existing RPC path.
+                if matches!(protocol, ProtocolType::UniswapV2 | ProtocolType::SushiSwap) {
+                    let block = self.current_block.load().number;
+                    self.v2_reserves_cache.record(pool, reserve0, reserve1, block);
+                }
+
                 // Look up pool metadata to get graph vertex indices.
                 let meta = self.pool_registry.load().get(&pool).cloned();
 
@@ -2029,6 +2047,7 @@ impl AetherEngine {
                 &code_addrs,
                 &v2_addrs,
                 self.bytecode_cache.as_deref(),
+                Some(&self.v2_reserves_cache),
             )
             .await;
             Some(Arc::new(state))
@@ -2317,6 +2336,13 @@ impl AetherEngine {
         &self,
     ) -> Option<&Arc<aether_simulator::bytecode_cache::BytecodeCache>> {
         self.bytecode_cache.as_ref()
+    }
+
+    /// Clone the V2 reserves cache populated by the WS `Sync` event handler.
+    /// The cache is internally `Arc`-backed so the clone is cheap; consumers
+    /// share a single underlying store with the engine writer side.
+    pub fn v2_reserves_cache(&self) -> aether_simulator::v2_reserves_cache::V2ReservesCache {
+        self.v2_reserves_cache.clone()
     }
 }
 

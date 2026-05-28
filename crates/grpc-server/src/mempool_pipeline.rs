@@ -185,6 +185,13 @@ pub struct SimContext {
     /// Optional persistent bytecode cache. Threaded into `prewarm_state` so
     /// addresses already on disk skip the `eth_getCode` round-trip.
     pub bytecode_cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
+    /// WS-fed V2 reserves cache. Threaded into `prewarm_state` so pools
+    /// whose latest `Sync` event arrived within
+    /// `aether_simulator::fork::V2_RESERVES_MAX_LAG_BLOCKS` of the target
+    /// block synthesise slot 8 locally instead of round-tripping
+    /// `eth_getStorageAt`. `None` retains the pre-existing RPC-every-time
+    /// behaviour.
+    pub v2_reserves_cache: Option<aether_simulator::v2_reserves_cache::V2ReservesCache>,
 }
 
 impl SimContext {
@@ -212,6 +219,7 @@ impl SimContext {
             post_state_replay_enabled: false,
             mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
             bytecode_cache: None,
+            v2_reserves_cache: None,
         }
     }
 
@@ -224,6 +232,17 @@ impl SimContext {
         cache: Option<Arc<aether_simulator::bytecode_cache::BytecodeCache>>,
     ) -> Self {
         self.bytecode_cache = cache;
+        self
+    }
+
+    /// Attach the engine's WS-fed V2 reserves cache. When set, the mempool
+    /// pre-warm path consults the cache for slot 8 of every UniV2 / Sushi
+    /// pool before issuing `eth_getStorageAt`.
+    pub fn with_v2_reserves_cache(
+        mut self,
+        cache: Option<aether_simulator::v2_reserves_cache::V2ReservesCache>,
+    ) -> Self {
+        self.v2_reserves_cache = cache;
         self
     }
 
@@ -457,6 +476,7 @@ async fn run_prewarm_refresh(
         &code_addrs,
         &v2_addrs,
         sim_ctx.bytecode_cache.as_deref(),
+        sim_ctx.v2_reserves_cache.as_ref(),
     )
     .await;
 
