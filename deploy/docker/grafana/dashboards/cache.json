@@ -1,0 +1,293 @@
+{
+  "uid": "aether-cache",
+  "title": "Aether — RPC Reduction Caches",
+  "tags": [
+    "aether",
+    "cache",
+    "rpc"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Bytecode cache hit ratio (cumulative)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aether_prewarm_bytecode_cache_hits_total{job=~\"aether-rust|aether-host-rust\"} / (aether_prewarm_bytecode_cache_hits_total{job=~\"aether-rust|aether-host-rust\"} + aether_prewarm_bytecode_rpc_fetches_total{job=~\"aether-rust|aether-host-rust\"})",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "V2 reserves cache hit ratio (cumulative)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aether_prewarm_v2_reserves_cache_hits_total{job=~\"aether-rust|aether-host-rust\"} / clamp_min(aether_prewarm_v2_reserves_cache_hits_total{job=~\"aether-rust|aether-host-rust\"} + aether_prewarm_v2_reserves_cache_missing_total{job=~\"aether-rust|aether-host-rust\"} + aether_prewarm_v2_reserves_cache_stale_total{job=~\"aether-rust|aether-host-rust\"}, 1)",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "RPC calls avoided (last 5m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(aether_prewarm_bytecode_cache_hits_total{job=~\"aether-rust|aether-host-rust\"}[5m]) + increase(aether_prewarm_v2_reserves_cache_hits_total{job=~\"aether-rust|aether-host-rust\"}[5m])",
+          "legendFormat": "avoided"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Warm pools (mempool refresher)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "aether_mempool_prewarm_warm_pools{job=~\"aether-rust|aether-host-rust\"}",
+          "legendFormat": "pools"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": ""
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Bytecode pre-warm: cache hits vs RPC fetches (per 1m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(aether_prewarm_bytecode_cache_hits_total{job=~\"aether-rust|aether-host-rust\"}[1m])",
+          "legendFormat": "cache hits"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(aether_prewarm_bytecode_rpc_fetches_total{job=~\"aether-rust|aether-host-rust\"}[1m])",
+          "legendFormat": "RPC fetches"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "stacking": { "mode": "none" }
+          }
+        }
+      },
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 8 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "V2 reserves pre-warm: hits / stale / missing (per 1m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(aether_prewarm_v2_reserves_cache_hits_total{job=~\"aether-rust|aether-host-rust\"}[1m])",
+          "legendFormat": "WS hits"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(aether_prewarm_v2_reserves_cache_stale_total{job=~\"aether-rust|aether-host-rust\"}[1m])",
+          "legendFormat": "stale (lag-rejected)"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(aether_prewarm_v2_reserves_cache_missing_total{job=~\"aether-rust|aether-host-rust\"}[1m])",
+          "legendFormat": "missing (no Sync yet)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          }
+        }
+      },
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 8 }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Mempool pre-warm refresh latency (ms)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(aether_mempool_prewarm_refresh_duration_ms_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_mempool_prewarm_refresh_duration_ms_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(aether_mempool_prewarm_refresh_duration_ms_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        }
+      },
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Mempool pre-warm inject (hit / miss per 1m)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(aether_mempool_prewarm_inject_total{job=~\"aether-rust|aether-host-rust\"}[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20
+          }
+        }
+      },
+      "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 }
+    }
+  ]
+}
