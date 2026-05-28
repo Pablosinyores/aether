@@ -3,6 +3,7 @@ pub mod calldata;
 pub mod fork;
 pub mod mempool_backrun;
 pub mod post_state_replay;
+pub mod v2_reserves_cache;
 
 use alloy::primitives::{Address, U256};
 use aether_common::types::SimulationResult;
