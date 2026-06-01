@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +52,21 @@ const (
 	// query. Twice the average block time so a 24-block prediction
 	// reaches the dropped state within ~12 s of its window closing.
 	staleSweepInterval = 6 * time.Second
+
+	// Retention sweep defaults. The mempool ledger (predictions + their
+	// reconciliation/profitability cascade children) grows ~per decoded
+	// swap, so over a multi-day unattended run it must be bounded.
+	// runRetentionLoop deletes rows older than the horizon on a slow
+	// cadence. Override via MEMPOOL_RETENTION_HOURS /
+	// MEMPOOL_RETENTION_INTERVAL_MINS; MEMPOOL_RETENTION_HOURS<=0 disables
+	// retention entirely (ledger grows unbounded — logged loudly at boot).
+	defaultRetentionHorizon  = 48 * time.Hour
+	minRetentionHorizon      = 1 * time.Hour
+	defaultRetentionInterval = 1 * time.Hour
+	minRetentionInterval     = 1 * time.Minute
+	// retentionPruneTimeout caps one DELETE so a wedged Postgres cannot
+	// stall the retention goroutine for a full sweep interval.
+	retentionPruneTimeout = 30 * time.Second
 
 	// receiptFetchTimeout caps how long the reconciler waits for a single
 	// `eth_getTransactionReceipt` round-trip. Sized for the p99 mainnet
@@ -117,8 +133,14 @@ func main() {
 		_ = metricsServer.Shutdown(shutdownCtx)
 	}()
 
+	retain, retentionInterval, retentionEnabled := retentionConfigFromEnv()
+
 	var wg sync.WaitGroup
-	wg.Add(2)
+	loops := 2
+	if retentionEnabled {
+		loops = 3
+	}
+	wg.Add(loops)
 	go func() {
 		defer wg.Done()
 		runHeaderLoop(rootCtx, ethClient, pgRecon, loopMetrics)
@@ -127,6 +149,14 @@ func main() {
 		defer wg.Done()
 		runStaleSweepLoop(rootCtx, ethClient, pgRecon)
 	}()
+	if retentionEnabled {
+		go func() {
+			defer wg.Done()
+			runRetentionLoop(rootCtx, pgRecon, loopMetrics, retentionInterval, retain)
+		}()
+	} else {
+		slog.Warn("mempool retention disabled (MEMPOOL_RETENTION_HOURS<=0) — ledger will grow unbounded")
+	}
 
 	<-rootCtx.Done()
 	slog.Info("shutdown signalled; waiting for loops to exit")
@@ -345,6 +375,71 @@ func runStaleSweepLoop(
 	}
 }
 
+// retentionConfigFromEnv resolves the retention horizon + sweep interval.
+// Returns enabled=false when MEMPOOL_RETENTION_HOURS<=0, which disables the
+// retention loop. Unparseable values fall back to the defaults rather than
+// disabling, so a typo never silently drops retention.
+func retentionConfigFromEnv() (retain, interval time.Duration, enabled bool) {
+	retain = defaultRetentionHorizon
+	if v := os.Getenv("MEMPOOL_RETENTION_HOURS"); v != "" {
+		if h, err := strconv.ParseFloat(v, 64); err == nil {
+			if h <= 0 {
+				return 0, 0, false
+			}
+			retain = time.Duration(h * float64(time.Hour))
+			if retain < minRetentionHorizon {
+				retain = minRetentionHorizon
+			}
+		}
+	}
+	interval = defaultRetentionInterval
+	if v := os.Getenv("MEMPOOL_RETENTION_INTERVAL_MINS"); v != "" {
+		if m, err := strconv.ParseFloat(v, 64); err == nil && m > 0 {
+			interval = time.Duration(m * float64(time.Minute))
+			if interval < minRetentionInterval {
+				interval = minRetentionInterval
+			}
+		}
+	}
+	return retain, interval, true
+}
+
+// runRetentionLoop periodically prunes the mempool ledger to a bounded
+// horizon. Mirrors runStaleSweepLoop: independent ticker, context-cancellable,
+// failures counted + logged but never fatal (a missed sweep just defers
+// deletion to the next tick).
+func runRetentionLoop(
+	ctx context.Context,
+	recon *db.PgMempoolReconciliation,
+	metrics *loopMetrics,
+	interval time.Duration,
+	retain time.Duration,
+) {
+	slog.Info("mempool retention loop started", "interval", interval, "retain", retain)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pruneCtx, cancel := context.WithTimeout(ctx, retentionPruneTimeout)
+			rows, err := recon.PruneMempoolLedger(pruneCtx, retain)
+			cancel()
+			if err != nil {
+				metrics.RetentionErrors.Inc()
+				slog.Warn("mempool retention prune failed", "err", err)
+				continue
+			}
+			if rows > 0 {
+				metrics.RetentionPrunedTotal.Add(float64(rows))
+				slog.Info("mempool retention pruned predictions (+cascade children)",
+					"rows", rows, "retain", retain)
+			}
+		}
+	}
+}
+
 func boolLabel(b bool) string {
 	if b {
 		return "true"
@@ -356,12 +451,14 @@ func boolLabel(b bool) string {
 // in-process by the header / sweep loops. The DB-layer metrics live with
 // PgMempoolReconciliation.
 type loopMetrics struct {
-	HeadersProcessed   prometheus.Counter
-	HeaderFetchErrors  prometheus.Counter
-	LookupErrors       prometheus.Counter
-	ReceiptFetchErrors prometheus.Counter
-	BlockDelta         prometheus.Histogram
-	PoolPathChecks     *prometheus.CounterVec
+	HeadersProcessed     prometheus.Counter
+	HeaderFetchErrors    prometheus.Counter
+	LookupErrors         prometheus.Counter
+	ReceiptFetchErrors   prometheus.Counter
+	BlockDelta           prometheus.Histogram
+	PoolPathChecks       *prometheus.CounterVec
+	RetentionPrunedTotal prometheus.Counter
+	RetentionErrors      prometheus.Counter
 }
 
 func newLoopMetrics(reg prometheus.Registerer) *loopMetrics {
@@ -391,10 +488,19 @@ func newLoopMetrics(reg prometheus.Registerer) *loopMetrics {
 			Name: "aether_mempool_pool_path_total",
 			Help: "Confirmed predictions whose receipt logs were checked against the predicted pool, by protocol and correctness",
 		}, []string{"protocol", "correct"}),
+		RetentionPrunedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "aether_mempool_retention_pruned_total",
+			Help: "Prediction rows deleted by the retention sweep (reconciliation + profitability children cascade-deleted)",
+		}),
+		RetentionErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "aether_mempool_retention_errors_total",
+			Help: "Retention sweep failures (PruneMempoolLedger errors)",
+		}),
 	}
 	reg.MustRegister(
 		m.HeadersProcessed, m.HeaderFetchErrors, m.LookupErrors,
 		m.ReceiptFetchErrors, m.BlockDelta, m.PoolPathChecks,
+		m.RetentionPrunedTotal, m.RetentionErrors,
 	)
 	return m
 }

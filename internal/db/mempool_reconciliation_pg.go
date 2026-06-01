@@ -15,6 +15,10 @@
 //   - MarkStaleAsDropped: batch SQL that inserts `outcome='dropped'` rows
 //     for every prediction past its 12-block grace window without a
 //     reconciliation row.
+//   - PruneMempoolLedger: time-based retention sweep. Deletes predictions
+//     older than a horizon; the ON DELETE CASCADE FKs drop the matching
+//     reconciliation + profitability rows, keeping the ledger bounded over a
+//     long unattended shadow run.
 //
 // See migrations/0004_mempool_reconciliation.sql for the schema.
 
@@ -80,16 +84,16 @@ type PendingPrediction struct {
 // public constants so callers can switch on a stable identifier instead of
 // re-typing the literal each time.
 type NewReconciliation struct {
-	PredictionID       uuid.UUID
-	ResolutionTs       time.Time
-	Outcome            string
-	ActualTargetBlock  *uint64
-	ActualTxIndex      *int
-	BlockDelta         *int
-	OrderingCorrect    *bool
-	PoolPathCorrect    *bool
-	ReplacedByTxHash   *[32]byte
-	FailureReason      *string
+	PredictionID      uuid.UUID
+	ResolutionTs      time.Time
+	Outcome           string
+	ActualTargetBlock *uint64
+	ActualTxIndex     *int
+	BlockDelta        *int
+	OrderingCorrect   *bool
+	PoolPathCorrect   *bool
+	ReplacedByTxHash  *[32]byte
+	FailureReason     *string
 }
 
 const (
@@ -199,9 +203,9 @@ func (r *PgMempoolReconciliation) LookupPredictionByTxHash(
 	`, txHash[:])
 
 	var (
-		pred       PendingPrediction
-		poolBytes  []byte
-		targetBlk  int64
+		pred      PendingPrediction
+		poolBytes []byte
+		targetBlk int64
 	)
 	if err := row.Scan(&pred.PredictionID, &pred.Protocol, &poolBytes, &targetBlk); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -277,6 +281,33 @@ func (r *PgMempoolReconciliation) MarkStaleAsDropped(
 		r.metrics.ReconciledTotal.WithLabelValues(OutcomeDropped).Add(float64(rows))
 	}
 	return rows, nil
+}
+
+// PruneMempoolLedger deletes `mempool_predictions` rows whose `decoded_at` is
+// older than `retain`, returning the number of prediction rows removed. The
+// ON DELETE CASCADE FKs on `mempool_reconciliation` and `mempool_profitability`
+// (migrations 0004 / 0005) drop the matching child rows in the same statement,
+// so one DELETE bounds all three tables.
+//
+// The cutoff is computed from the client clock (matching the client-set
+// `decoded_at` policy), and `decoded_at` is indexed (migrations/0003), so the
+// WHERE is an index range scan rather than a full table scan. A 48h-class
+// horizon is far past the reconciliation/scoring window (minutes), so pruned
+// rows are always fully resolved — retention never races the reconciler or
+// scorer for an in-flight prediction.
+func (r *PgMempoolReconciliation) PruneMempoolLedger(
+	ctx context.Context,
+	retain time.Duration,
+) (int64, error) {
+	cutoff := time.Now().Add(-retain)
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM mempool_predictions
+		WHERE decoded_at < $1
+	`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("prune mempool ledger: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (r *PgMempoolReconciliation) dispatch(ctx context.Context) {

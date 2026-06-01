@@ -1,5 +1,16 @@
 version: "3.8"
 
+# Bound container log growth for long (multi-day) shadow runs. Docker's
+# default json-file driver has no size cap, so over a week the per-container
+# logs grow without limit and can fill the host disk. Cap each at
+# 50MB x 5 files (~250MB/container) and apply via the `*default-logging`
+# anchor on every long-running service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   aether-rust:
     build:
@@ -28,6 +39,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   aether-go:
     build:
@@ -51,6 +63,7 @@ services:
       - aether-rust
     networks:
       - aether-net
+    logging: *default-logging
 
   prometheus:
     # Pin to a known-good major to avoid silent breaking upgrades on
@@ -66,6 +79,7 @@ services:
       - alertmanager
     networks:
       - aether-net
+    logging: *default-logging
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
@@ -102,6 +116,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   grafana:
     image: grafana/grafana:10.4.7
@@ -120,6 +135,7 @@ services:
       - prometheus
     networks:
       - aether-net
+    logging: *default-logging
 
   loki:
     image: grafana/loki:2.9.4
@@ -138,6 +154,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   promtail:
     image: grafana/promtail:2.9.4
@@ -153,6 +170,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   tempo:
     image: grafana/tempo:2.6.1
@@ -167,6 +185,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   canary:
     build:
@@ -183,6 +202,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   # Trade-ledger Postgres. Binaries are no-op backward-compatible when
   # DATABASE_URL is unset, so devs not using the ledger should not pay the
@@ -193,6 +213,26 @@ services:
     container_name: aether-postgres
     profiles:
       - ledger
+    # Tuned for the write/delete-heavy mempool ledger over a multi-day run.
+    # The retention sweep (PruneMempoolLedger) deletes old predictions daily,
+    # generating dead tuples in bursts; the aggressive autovacuum settings keep
+    # the high-churn tables from bloating between sweeps. max_connections is
+    # raised to give the engine writer, reconciler, scorer, monitor and ad-hoc
+    # psql headroom over the default 100.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "autovacuum_vacuum_scale_factor=0.05"
+      - "-c"
+      - "autovacuum_analyze_scale_factor=0.02"
+      - "-c"
+      - "autovacuum_vacuum_cost_limit=2000"
+      - "-c"
+      - "autovacuum_naptime=20s"
+      - "-c"
+      - "autovacuum_max_workers=4"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-aether}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aether}
@@ -209,6 +249,7 @@ services:
     restart: unless-stopped
     networks:
       - aether-net
+    logging: *default-logging
 
   # Local Ethereum node (opt-in). Start with: docker compose --profile node up -d
   # Shares /tmp/reth via volume so aether-rust can connect over IPC (/tmp/reth.ipc)
@@ -227,6 +268,7 @@ services:
       --ipcpath /tmp/reth.ipc
     networks:
       - aether-net
+    logging: *default-logging
 
 
 volumes:

@@ -99,3 +99,67 @@ groups:
         annotations:
           summary: "Alertmanager scrape target is down"
           description: "Prometheus has been unable to scrape alertmanager:9093 for 2m. Slack delivery is offline. Check the alertmanager container logs and SLACK_WEBHOOK_URL config."
+
+  # Unattended-run health for the public-mempool shadow soak (Arm A). These
+  # watch the observability pipeline (predictions -> reconciliation ->
+  # profitability) rather than the execution path, so they apply whether or
+  # not the executor/backrun validator is running.
+  - name: aether.shadow.rules
+    interval: 30s
+    rules:
+
+      # Fires only for a target that was scraped within the last hour and is
+      # now down — so a never-deployed target (wrong compose profile, or the
+      # executor in an Arm-A run) is silent by design, while a producer that
+      # actually died (or crash-loops past spawn_with_restart's backoff) pages.
+      - alert: AetherProducerDown
+        expr: |
+          up{job=~"aether-rust|aether-go|aether-host-rust|aether-host-reconciler|aether-host-scorer|aether-host-monitor"} == 0
+          and on(job, instance)
+          max_over_time(up{job=~"aether-rust|aether-go|aether-host-rust|aether-host-reconciler|aether-host-scorer|aether-host-monitor"}[1h]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aether producer {{ $labels.job }} is down"
+          description: "Prometheus could not scrape {{ $labels.job }} ({{ $labels.instance }}) for >2m after previously being up. A supervised process is down or crash-looping past its restart window — grep its log for an '[ALERT] crash-looping' line."
+
+      # Catches a silently-dead mempool WS subscription that does NOT crash the
+      # engine (so AetherProducerDown stays quiet): predictions simply stop
+      # being written. The 15m window + 15m `for` already gives ~30m of grace,
+      # and the boot suppression is belt-and-suspenders (no-op if the rust
+      # client does not export process_start_time_seconds).
+      - alert: MempoolPredictionsStalled
+        expr: |
+          sum(rate(aether_mempool_predictions_persisted_total[15m])) == 0
+          unless on() (
+            (time() - min(process_start_time_seconds{job=~"aether-rust|aether-host-rust"})) < 1800
+          )
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No mempool predictions persisted in 15m"
+          description: "aether_mempool_predictions_persisted_total has been flat for 15m while the engine is up — likely a dead WS subscription or a dropped MEMPOOL_LEDGER_DSN. The Arm-A headline ledger is not filling."
+
+      # PruneMempoolLedger errors usually mean Postgres connectivity/permission
+      # trouble; left unattended the predictions ledger then grows unbounded.
+      - alert: MempoolRetentionErrors
+        expr: increase(aether_mempool_retention_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mempool retention sweep is failing"
+          description: "PruneMempoolLedger errored {{ $value }} time(s) in 15m. The predictions ledger may grow unbounded; check Postgres reachability and the reconciler logs."
+
+      # Reconciliation writer channel saturated (or Postgres slow) — coverage
+      # gaps in the reconciliation table follow.
+      - alert: MempoolReconcilerDrops
+        expr: increase(aether_mempool_reconciler_drops_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reconciler is dropping writes"
+          description: "{{ $value }} reconciliation row(s) dropped in 10m — the writer channel saturated or Postgres is slow. Reconciliation coverage will have gaps."
