@@ -8,7 +8,9 @@
 pub mod cycle_gating;
 pub mod first_seen_tracker;
 pub mod historical;
+pub mod hot_token;
 pub(crate) mod metrics;
+pub mod pool_admission;
 pub mod profitability_writer;
 pub mod provider;
 

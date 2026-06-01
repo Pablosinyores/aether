@@ -1,5 +1,6 @@
 pub mod bytecode_cache;
 pub mod calldata;
+pub mod fee_on_transfer;
 pub mod fork;
 pub mod mempool_backrun;
 pub mod post_state_replay;

@@ -56,6 +56,7 @@ use uuid::Uuid;
 use crate::service::aether_proto;
 
 use crate::engine::PoolMetadata;
+use aether_grpc_server::hot_token::{HotTokenConfig, HotTokenTracker};
 use crate::mempool_writer::{
     MempoolPredictionSink, NewMempoolPrediction, PredictedPostState, PROTOCOL_BALANCER,
     PROTOCOL_BANCOR, PROTOCOL_CURVE, PROTOCOL_ONE_INCH_V6, PROTOCOL_SUSHI, PROTOCOL_UNI_V2, PROTOCOL_UNI_V3,
@@ -192,6 +193,12 @@ pub struct SimContext {
     /// `eth_getStorageAt`. `None` retains the pre-existing RPC-every-time
     /// behaviour.
     pub v2_reserves_cache: Option<aether_simulator::v2_reserves_cache::V2ReservesCache>,
+    /// Frequency-of-trade tracker over decoded mempool swaps, powering the
+    /// hot-token discovery loop (`AETHER_DISCOVERY=1`, see `discovery.rs`).
+    /// Every decoded swap is `record`ed here; the discovery loop reads
+    /// `candidates()` as its pool-admission source. Always present — cheap
+    /// when discovery is disabled (the loop simply never spawns).
+    pub hot_tokens: Arc<HotTokenTracker>,
 }
 
 impl SimContext {
@@ -220,6 +227,7 @@ impl SimContext {
             mempool_prewarm: Arc::new(ArcSwap::from_pointee(None)),
             bytecode_cache: None,
             v2_reserves_cache: None,
+            hot_tokens: Arc::new(HotTokenTracker::new(HotTokenConfig::default())),
         }
     }
 
@@ -527,6 +535,20 @@ fn handle_event(
             for swap in swaps {
                 emit_decoded(metrics, &router_label, &swap, &event);
                 let Some(ctx) = sim_ctx else { continue };
+                // Feed the hot-token discovery tracker before the pre-sim
+                // filter drops unregistered pairs — discovery surfaces fresh,
+                // frequently-traded tokens precisely from pairs not yet in the
+                // pool registry.
+                ctx.hot_tokens.record(
+                    swap.token_in,
+                    swap.token_out,
+                    swap.protocol,
+                    swap.pool_address,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
                 if !pre_sim_filter(metrics, ctx, &swap) {
                     continue;
                 }

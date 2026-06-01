@@ -18,6 +18,13 @@
 #   ./demo.sh --fresh      # truncate demo tables before start
 #   ./demo.sh --no-grafana # skip auto-open of Grafana in browser
 #
+# Run profile (env):
+#   AETHER_ARM=B (default) full pipeline incl. Go executor + revm backrun
+#                          validator.
+#   AETHER_ARM=A           analytical/observability only — predictions +
+#                          reconciler + profit scorer, NO executor and NO
+#                          backrun validator (the Arm-A shadow-run config).
+#
 # Prereqs (script will fail-fast with a clear error if missing):
 #   - .env populated (see DEMO_REQUIRED_ENV below)
 #   - docker / docker compose installed
@@ -170,15 +177,49 @@ export DATABASE_URL="${DATABASE_URL:-postgres://aether:aether@127.0.0.1:5432/aet
 # separates them).
 export MEMPOOL_LEDGER_DSN="${MEMPOOL_LEDGER_DSN:-$DATABASE_URL}"
 
-# AETHER_EXECUTOR_ADDRESS — must point at an address with on-chain
-# bytecode because cmd/executor/main.go runs eth_getCode at startup
-# and aborts on empty account (a production safety check). For the
-# demo we use UniV3 SwapRouter02 as a placeholder — it has bytecode,
-# so the executor's check passes; revm's per-sim bytecode injection
-# (#165) overrides it inside the actual sim so the address itself is
-# functionally irrelevant. Shadow mode never broadcasts, so no risk
-# of sending a real tx to the wrong contract.
-export AETHER_EXECUTOR_ADDRESS="${AETHER_EXECUTOR_ADDRESS:-0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45}"
+# AETHER_ARM selects the run profile (default B preserves prior behaviour).
+AETHER_ARM="${AETHER_ARM:-B}"
+
+if [ "$AETHER_ARM" = "A" ]; then
+  # Arm A: leave AETHER_EXECUTOR_ADDRESS UNSET so the engine logs
+  # "validator disabled" (main.rs gates the backrun validator on this var)
+  # and never burns RPC on per-candidate forks. unset defends against a
+  # stray value inherited from .env.
+  unset AETHER_EXECUTOR_ADDRESS
+  log "AETHER_ARM=A — analytical/observability run (no executor, backrun validator disabled)"
+else
+  # Arm B — AETHER_EXECUTOR_ADDRESS must point at an address with on-chain
+  # bytecode because cmd/executor/main.go runs eth_getCode at startup and
+  # aborts on an empty account. For the demo we use UniV3 SwapRouter02 as a
+  # placeholder — it has bytecode, so the check passes; revm's per-sim
+  # bytecode injection (#165) overrides it inside the actual sim. Shadow mode
+  # never broadcasts, so no risk of sending a real tx to the wrong contract.
+  export AETHER_EXECUTOR_ADDRESS="${AETHER_EXECUTOR_ADDRESS:-0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45}"
+fi
+
+# Hot-token discovery (Part 1) — opt-in via AETHER_DISCOVERY=1. The engine
+# gates the loop on this var (main.rs); it runs off ETH_RPC_URL with its own
+# longer FoT-screen timeout, independent of the latency hot path. Knob defaults
+# (60s cadence, 500-pool cap, 8s screen timeout) already match the run plan.
+#
+# Intended for the *canary* phase only: discovery APPENDS admitted pools to
+# config/pools.toml, which moves the price graph. Per the run methodology,
+# discovery and measurement must be SEQUENTIAL — run discovery during the
+# canary, then FREEZE pools.toml (unset AETHER_DISCOVERY) for the pure-
+# measurement days, else Arm-A profitability inflates as a function of
+# admissions rather than real opportunities.
+if [ "${AETHER_DISCOVERY:-0}" = "1" ]; then
+  export AETHER_DISCOVERY=1
+  # Static ETH-price proxy for the per-venue WETH-liquidity estimate.
+  export AETHER_ETH_PRICE_USD="${AETHER_ETH_PRICE_USD:-3000}"
+  warn "AETHER_DISCOVERY=1 — hot-token discovery ON (canary mode)."
+  warn "  -> appends to config/pools.toml; FREEZE it (unset AETHER_DISCOVERY) for"
+  warn "     the pure-measurement days or Arm-A profit inflates with admissions."
+else
+  # Defend against a stray AETHER_DISCOVERY inherited from .env during a
+  # frozen measurement run.
+  unset AETHER_DISCOVERY
+fi
 
 # Bytecode artifact path — produced by `forge build` in step 4.
 export AETHER_EXECUTOR_BYTECODE_PATH="${AETHER_EXECUTOR_BYTECODE_PATH:-contracts/out/AetherExecutor.sol/AetherExecutor.json}"
@@ -299,6 +340,14 @@ if [ ! -f target/release/aether-rust ]; then
   cargo build --release --bins 2>&1 | tail -3
 fi
 
+# The profit scorer is a Rust bin built by `--bins` above; build it explicitly
+# if the rust build was skipped (aether-rust present but scorer absent) so the
+# profitability ledger always has a producer to supervise.
+if [ ! -f target/release/aether-profit-scorer ]; then
+  log "Building aether-profit-scorer..."
+  cargo build --release --bin aether-profit-scorer 2>&1 | tail -3
+fi
+
 mkdir -p bin
 # Build each Go binary independently — earlier `if [ ! -f bin/aether-executor ]`
 # wrapper skipped the other two when executor existed, leaving demo with
@@ -315,7 +364,9 @@ if [ ! -f contracts/out/AetherExecutor.sol/AetherExecutor.json ]; then
   (cd contracts && forge build) 2>&1 | tail -3
 fi
 
-if [ ! -f "$AETHER_EXECUTOR_BYTECODE_PATH" ]; then
+# The bytecode artifact is only needed when the backrun validator/executor run
+# (Arm B). Arm A is analytical-only, so don't hard-fail on a missing artifact.
+if [ "$AETHER_ARM" != "A" ] && [ ! -f "$AETHER_EXECUTOR_BYTECODE_PATH" ]; then
   err "Bytecode artifact missing at $AETHER_EXECUTOR_BYTECODE_PATH"
   err "Run 'cd contracts && forge build' to produce it."
   exit 1
@@ -351,17 +402,39 @@ spawn_with_restart() {
   local log_file="$LOG_DIR/$name.log"
   shift
   (
+    # Crash-loop guard: count restarts in a rolling 60s window. >=5 restarts
+    # in that window is a crash-loop — emit a loud [ALERT] (log + stderr) and
+    # back off 60s instead of hammering every 5s. We keep retrying (a long
+    # unattended run should self-heal a transient outage) but slowly and
+    # visibly, so an operator or a log-based alert rule can catch it instead
+    # of a silent 5s respawn storm burning RPC/CPU for days.
+    restarts=0
+    window_start=$(date +%s)
     while true; do
       echo "[$(date -u +%FT%TZ)] starting $name: $*" >> "$log_file"
       "$@" >> "$log_file" 2>&1
       ec=$?
-      echo "[$(date -u +%FT%TZ)] $name exited code=$ec; restart in 5s" >> "$log_file"
+      now=$(date +%s)
+      echo "[$(date -u +%FT%TZ)] $name exited code=$ec" >> "$log_file"
       # Rotate if log >100MB.
       if [ -f "$log_file" ] && [ "$(stat -f%z "$log_file" 2>/dev/null || stat -c%s "$log_file" 2>/dev/null || echo 0)" -gt 104857600 ]; then
         mv "$log_file" "$log_file.$(date -u +%FT%TZ)"
         gzip "$log_file."* &
       fi
-      sleep 5
+      if [ $((now - window_start)) -le 60 ]; then
+        restarts=$((restarts + 1))
+      else
+        restarts=1
+        window_start=$now
+      fi
+      if [ "$restarts" -ge 5 ]; then
+        echo "[$(date -u +%FT%TZ)] [ALERT] $name crash-looping: $restarts restarts in <=60s (last exit=$ec); backing off 60s" | tee -a "$log_file" >&2
+        sleep 60
+        restarts=0
+        window_start=$(date +%s)
+      else
+        sleep 5
+      fi
     done
   ) &
   local loop_pid=$!
@@ -374,6 +447,46 @@ spawn_with_restart() {
   PID_VALUES+=("$child_pid")
   log "$name started (loop PID $loop_pid, child PID $child_pid). Log: $log_file"
 }
+
+# Background log janitor — bounds host-process log growth over long
+# (multi-day) shadow runs. spawn_with_restart only rotates a log when its
+# process *exits and restarts*; a process that stays up for days never hits
+# that path, so its log grows without bound. This loop runs independently and
+# copytruncate-rotates any oversized $LOG_DIR/*.log, truncating the file in
+# place so the live appender fd keeps working — a plain mv/rename would orphan
+# it and the process would keep writing to the moved inode while the new file
+# stayed empty. Tracked in CHILD_LOOPS so cleanup() stops it first.
+#   DEMO_LOG_CAP_BYTES          per-log size cap (default 200MB)
+#   DEMO_LOG_JANITOR_INTERVAL_SEC  scan cadence (default 300s)
+start_log_janitor() {
+  local cap_bytes="${DEMO_LOG_CAP_BYTES:-209715200}"
+  local interval="${DEMO_LOG_JANITOR_INTERVAL_SEC:-300}"
+  (
+    while true; do
+      sleep "$interval"
+      for f in "$LOG_DIR"/*.log; do
+        [ -f "$f" ] || continue
+        sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+        if [ "$sz" -gt "$cap_bytes" ]; then
+          # copytruncate: snapshot the last generation, then truncate in
+          # place. A few in-flight lines may be lost at the truncate
+          # boundary (same trade-off as logrotate's copytruncate); fine for
+          # forensic logs. Only one generation (.1.gz) is kept, so disk stays
+          # bounded at ~cap + compressed cap per log.
+          cp "$f" "$f.1" 2>/dev/null && : > "$f"
+          gzip -f "$f.1" 2>/dev/null &
+          echo "[$(date -u +%FT%TZ)] log-janitor: rotated $(basename "$f") (was $sz bytes > cap $cap_bytes)" \
+            >> "$LOG_DIR/_janitor.log"
+        fi
+      done
+    done
+  ) &
+  local janitor_pid=$!
+  CHILD_LOOPS+=("$janitor_pid")
+  log "Log janitor started (PID $janitor_pid, cap $((cap_bytes / 1048576))MB, every ${interval}s)"
+}
+
+start_log_janitor
 
 step 6 "Booting Rust core (ingestion + decode + BF + revm sim + gRPC publish)"
 spawn_with_restart aether-rust target/release/aether-rust
@@ -390,15 +503,20 @@ done
 # Step 7 — Go executor (shadow mode → bundles table)
 # ─────────────────────────────────────────────────────────────────────────
 
-step 7 "Booting Go executor in shadow mode"
-spawn_with_restart aether-executor bin/aether-executor
+if [ "$AETHER_ARM" = "A" ]; then
+  step 7 "Arm A — skipping Go executor + backrun validator (analytical only)"
+  log "executor not started; engine running with the backrun validator disabled"
+else
+  step 7 "Booting Go executor in shadow mode"
+  spawn_with_restart aether-executor bin/aether-executor
 
-for i in {1..60}; do
-  if curl -sf http://localhost:9090/metrics > /dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+  for i in {1..60}; do
+    if curl -sf http://localhost:9090/metrics > /dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
 
 # ─────────────────────────────────────────────────────────────────────────
 # Step 8 — Reconciler (newHeads watcher → mempool_reconciliation)
@@ -406,6 +524,14 @@ done
 
 step 8 "Booting Go reconciler (predicted-vs-actual fill)"
 spawn_with_restart aether-reconciler bin/aether-reconciler
+
+# Profit scorer (Rust bin) — writes mempool_profitability, the "would-be
+# profit" headline of the run. Supervised like the others; without it the
+# profitability ledger never fills. Reuses MEMPOOL_LEDGER_DSN + ETH_RPC_URL
+# (already exported); metrics on :9095.
+export PROFIT_SCORER_METRICS_ADDR="${PROFIT_SCORER_METRICS_ADDR:-:9095}"
+export AETHER_GIT_SHA="${AETHER_GIT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+spawn_with_restart aether-profit-scorer target/release/aether-profit-scorer
 
 # ─────────────────────────────────────────────────────────────────────────
 # Step 9 — Monitor (HTML dashboard at :8080)
