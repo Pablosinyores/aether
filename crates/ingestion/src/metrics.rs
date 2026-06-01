@@ -18,6 +18,7 @@ use prometheus::{IntCounter, Registry};
 /// Metric families owned by the mempool ingestion layer.
 pub struct MempoolIngestMetrics {
     raw_reencode_mismatch_total: IntCounter,
+    idle_reconnect_total: IntCounter,
 }
 
 impl MempoolIngestMetrics {
@@ -33,12 +34,23 @@ impl MempoolIngestMetrics {
         )
         .expect("aether_mempool_raw_reencode_mismatch_total counter");
 
+        let idle_reconnect_total = IntCounter::new(
+            "aether_mempool_idle_reconnect_total",
+            "Times the pending-tx subscription was dropped and reconnected because \
+             no event arrived within the idle-watchdog window (silent TCP half-close)",
+        )
+        .expect("aether_mempool_idle_reconnect_total counter");
+
         registry
             .register(Box::new(raw_reencode_mismatch_total.clone()))
             .expect("register aether_mempool_raw_reencode_mismatch_total");
+        registry
+            .register(Box::new(idle_reconnect_total.clone()))
+            .expect("register aether_mempool_idle_reconnect_total");
 
         Arc::new(Self {
             raw_reencode_mismatch_total,
+            idle_reconnect_total,
         })
     }
 
@@ -55,6 +67,17 @@ impl MempoolIngestMetrics {
     pub fn raw_reencode_mismatch_count(&self) -> u64 {
         self.raw_reencode_mismatch_total.get()
     }
+
+    /// Bump `aether_mempool_idle_reconnect_total`. Called when the idle
+    /// watchdog fires and the subscription is dropped to force a reconnect.
+    pub fn inc_idle_reconnect(&self) {
+        self.idle_reconnect_total.inc();
+    }
+
+    /// Read the current value of `aether_mempool_idle_reconnect_total`.
+    pub fn idle_reconnect_count(&self) -> u64 {
+        self.idle_reconnect_total.get()
+    }
 }
 
 #[cfg(test)]
@@ -70,6 +93,10 @@ mod tests {
         m.inc_raw_reencode_mismatch();
         assert_eq!(m.raw_reencode_mismatch_count(), 2);
 
+        assert_eq!(m.idle_reconnect_count(), 0);
+        m.inc_idle_reconnect();
+        assert_eq!(m.idle_reconnect_count(), 1);
+
         let names: Vec<_> = registry
             .gather()
             .iter()
@@ -80,6 +107,12 @@ mod tests {
                 .iter()
                 .any(|n| n == "aether_mempool_raw_reencode_mismatch_total"),
             "missing metric family aether_mempool_raw_reencode_mismatch_total"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "aether_mempool_idle_reconnect_total"),
+            "missing metric family aether_mempool_idle_reconnect_total"
         );
     }
 }

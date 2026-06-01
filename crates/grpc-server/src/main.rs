@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -11,6 +11,7 @@ use tokio::net::UnixListener;
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 
+mod discovery;
 mod engine;
 mod mempool_pipeline;
 mod mempool_writer;
@@ -134,11 +135,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             None
         } else {
+            // Idle-watchdog window for the pending-tx subscription. Default
+            // 60s; set 0 to disable. Guards against a silent TCP half-close
+            // stalling ingestion until the OS keepalive fires.
+            let idle_timeout_secs = std::env::var("MEMPOOL_WS_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    aether_ingestion::mempool::IDLE_TIMEOUT_DEFAULT.as_secs()
+                });
             let cfg = aether_ingestion::mempool::AlchemyMempoolConfig {
                 ws_url,
                 router_filter: aether_ingestion::mempool::default_router_addresses(),
+                idle_timeout: std::time::Duration::from_secs(idle_timeout_secs),
             };
-            let source = Arc::new(aether_ingestion::mempool::AlchemyMempool::new(cfg));
+            // Register the ingestion-layer metrics on the shared registry so
+            // the re-encode-mismatch and idle-reconnect counters surface on
+            // `/metrics`. Without this the source runs metric-blind.
+            let ingest_metrics = aether_ingestion::metrics::MempoolIngestMetrics::register(
+                metrics.registry(),
+            );
+            let source = Arc::new(aether_ingestion::mempool::AlchemyMempool::with_metrics(
+                cfg,
+                ingest_metrics,
+            ));
             let channels = Arc::clone(engine.event_channels());
             let source_shutdown = shutdown_rx.clone();
             let source_handle = tokio::spawn(async move {
@@ -220,6 +240,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sim_ctx_inner =
                 sim_ctx_inner.with_v2_reserves_cache(Some(engine.v2_reserves_cache()));
             let sim_ctx = Arc::new(sim_ctx_inner);
+
+            // Hot-token discovery loop (Part 1). Opt-in via AETHER_DISCOVERY=1;
+            // shares the SimContext's HotTokenTracker so it sees the same
+            // mempool-observed candidates. Runs off the decode hot path; admits
+            // qualifying pools to pools.toml and reloads the registry in-process.
+            if std::env::var("AETHER_DISCOVERY")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                if let Some(provider) = engine.rpc_provider() {
+                    let disc_cfg = discovery::DiscoveryConfig::from_env(pools_config.clone());
+                    let _discovery_handle = discovery::spawn_discovery(
+                        Arc::clone(&engine),
+                        Arc::clone(&sim_ctx.hot_tokens),
+                        provider,
+                        Arc::clone(&metrics),
+                        disc_cfg,
+                        shutdown_rx.clone(),
+                    );
+                    info!("AETHER_DISCOVERY enabled — hot-token discovery loop started");
+                } else {
+                    warn!("AETHER_DISCOVERY=1 but no RPC provider (set ETH_RPC_URL); discovery disabled");
+                }
+            }
+
             let pipeline_handle = mempool_pipeline::spawn_mempool_pipeline(
                 Arc::clone(engine.event_channels()),
                 Arc::clone(&metrics),

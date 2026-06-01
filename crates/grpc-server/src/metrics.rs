@@ -19,6 +19,19 @@ pub struct EngineMetrics {
     arbs_published: IntCounter,
     blocks_processed: IntCounter,
     decode_errors: IntCounterVec,
+    /// Hot-token discovery: pools appended to pools.toml, by reason
+    /// (low-cardinality; currently just `admitted`).
+    pools_admitted_total: IntCounterVec,
+    /// Hot-token discovery: candidate pairs rejected, by low-cardinality reason
+    /// (`no_weth_base`, `insufficient_venues`, `fot_not_clean`,
+    /// `insufficient_liquidity`, `at_cap`, `already_present`, `append_error`).
+    pools_rejected_total: IntCounterVec,
+    /// Hot-token discovery: fee-on-transfer round-trip screen outcomes, by
+    /// verdict (`clean`, `fee_on_transfer`, `honeypot`, `inconclusive`,
+    /// `screen_timeout`).
+    fot_screen_total: IntCounterVec,
+    /// Hot-token discovery: hot candidate pairs seen in the most recent tick.
+    hot_candidates: IntGauge,
     /// Counter for EVM fork-replay fallbacks invoked from the analytical
     /// post-state predictors. Bumped whenever an analytical predictor
     /// returns a low-confidence result and the caller escalates to an
@@ -468,6 +481,35 @@ impl EngineMetrics {
             "Multicall3 batches that errored and forced a per-pool eth_getStorageAt fallback",
         )
         .expect("aether_prewarm_multicall_fallbacks_total counter");
+        let pools_admitted_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pools_admitted_total",
+                "Hot-token discovery: pools appended to pools.toml, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pools_admitted_total counter vec");
+        let pools_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "aether_pools_rejected_total",
+                "Hot-token discovery: candidate pairs rejected, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("aether_pools_rejected_total counter vec");
+        let fot_screen_total = IntCounterVec::new(
+            Opts::new(
+                "aether_fot_screen_total",
+                "Hot-token discovery: fee-on-transfer round-trip screen outcomes, by verdict",
+            ),
+            &["verdict"],
+        )
+        .expect("aether_fot_screen_total counter vec");
+        let hot_candidates = IntGauge::new(
+            "aether_hot_candidates",
+            "Hot-token discovery: hot candidate pairs seen in the most recent tick",
+        )
+        .expect("aether_hot_candidates gauge");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -574,6 +616,18 @@ impl EngineMetrics {
         registry
             .register(Box::new(prewarm_multicall_fallbacks_total.clone()))
             .expect("register aether_prewarm_multicall_fallbacks_total");
+        registry
+            .register(Box::new(pools_admitted_total.clone()))
+            .expect("register aether_pools_admitted_total");
+        registry
+            .register(Box::new(pools_rejected_total.clone()))
+            .expect("register aether_pools_rejected_total");
+        registry
+            .register(Box::new(fot_screen_total.clone()))
+            .expect("register aether_fot_screen_total");
+        registry
+            .register(Box::new(hot_candidates.clone()))
+            .expect("register aether_hot_candidates");
 
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
@@ -603,6 +657,30 @@ impl EngineMetrics {
                 .with_label_values(&[outcome])
                 .reset();
         }
+
+        // Pre-touch hot-token discovery label sets so dashboards render zero
+        // rows from boot rather than "No data".
+        for v in [
+            "clean",
+            "fee_on_transfer",
+            "honeypot",
+            "inconclusive",
+            "screen_timeout",
+        ] {
+            fot_screen_total.with_label_values(&[v]);
+        }
+        for r in [
+            "no_weth_base",
+            "insufficient_venues",
+            "fot_not_clean",
+            "insufficient_liquidity",
+            "at_cap",
+            "already_present",
+            "append_error",
+        ] {
+            pools_rejected_total.with_label_values(&[r]);
+        }
+        pools_admitted_total.with_label_values(&["admitted"]);
 
         Self {
             registry,
@@ -641,6 +719,10 @@ impl EngineMetrics {
             prewarm_multicall_batches_total,
             prewarm_multicall_v2_slots_total,
             prewarm_multicall_fallbacks_total,
+            pools_admitted_total,
+            pools_rejected_total,
+            fot_screen_total,
+            hot_candidates,
         }
     }
 
@@ -787,6 +869,28 @@ impl EngineMetrics {
     /// stable and enumerable for dashboards / alerts.
     pub fn inc_decode_errors(&self, reason: &str) {
         self.decode_errors.with_label_values(&[reason]).inc();
+    }
+
+    /// Bump `aether_pools_admitted_total{reason}` (hot-token discovery).
+    pub fn inc_pools_admitted(&self, reason: &str) {
+        self.pools_admitted_total.with_label_values(&[reason]).inc();
+    }
+
+    /// Bump `aether_pools_rejected_total{reason}` (hot-token discovery). Reason
+    /// must be from the pre-touched low-cardinality set.
+    pub fn inc_pools_rejected(&self, reason: &str) {
+        self.pools_rejected_total.with_label_values(&[reason]).inc();
+    }
+
+    /// Bump `aether_fot_screen_total{verdict}` (hot-token discovery). Verdict
+    /// comes from `RoundTripVerdict::metric_label()`.
+    pub fn inc_fot_screen(&self, verdict: &str) {
+        self.fot_screen_total.with_label_values(&[verdict]).inc();
+    }
+
+    /// Set `aether_hot_candidates` to the latest discovery tick's count.
+    pub fn set_hot_candidates(&self, n: i64) {
+        self.hot_candidates.set(n);
     }
 
     /// Bump `aether_sim_evm_fallback_total{reason="..."}` for an EVM

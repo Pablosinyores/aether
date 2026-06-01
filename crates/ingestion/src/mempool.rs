@@ -41,6 +41,15 @@ use crate::subscription::{EventChannels, PendingTxEvent};
 /// Default reconnect backoff after a transport error.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Default idle-watchdog window. If no pending tx is delivered within this
+/// span the connection is assumed dead and dropped so the reconnect loop
+/// re-establishes it. Without this a silent TCP half-close (the peer vanishes
+/// without a FIN/RST) leaves `stream.next()` parked indefinitely — up to the
+/// OS keepalive (~2 h on Linux defaults) — so the subscription silently stops
+/// delivering events while every health signal still looks "connected".
+/// Override via `MEMPOOL_WS_IDLE_TIMEOUT_SECS`; set 0 to disable.
+pub const IDLE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+
 /// Returns `true` when `MEMPOOL_TRACKING` is set to a truthy value.
 ///
 /// Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Any
@@ -71,6 +80,11 @@ pub struct AlchemyMempoolConfig {
     /// Empty means "no filter" — emit every pending tx Alchemy sees, which
     /// is firehose-grade and not recommended for production wiring.
     pub router_filter: Vec<Address>,
+    /// Idle-watchdog window. If no pending tx is delivered within this span the
+    /// connection is treated as dead (silent half-close) and dropped so the
+    /// reconnect loop re-establishes it. [`Duration::ZERO`] disables the
+    /// watchdog. Defaults to [`IDLE_TIMEOUT_DEFAULT`].
+    pub idle_timeout: Duration,
 }
 
 impl AlchemyMempoolConfig {
@@ -162,7 +176,11 @@ impl AlchemyMempool {
             .await?;
         let mut stream = sub.into_stream();
 
+        let idle_timeout = self.config.idle_timeout;
         loop {
+            // Recreated each iteration, so every delivered event resets the
+            // idle window. The `if` guard disables the arm entirely (and skips
+            // arming the timer) when the watchdog is configured off.
             tokio::select! {
                 next = stream.next() => {
                     match next {
@@ -175,6 +193,18 @@ impl AlchemyMempool {
                             return Err("stream closed".into());
                         }
                     }
+                }
+                _ = tokio::time::sleep(idle_timeout), if !idle_timeout.is_zero() => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.inc_idle_reconnect();
+                    }
+                    warn!(
+                        target: "aether::mempool",
+                        idle_secs = idle_timeout.as_secs(),
+                        "no pending tx within idle window; assuming silent half-close, \
+                         dropping connection to force reconnect"
+                    );
+                    return Err("idle timeout".into());
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -395,6 +425,7 @@ mod tests {
         let cfg = AlchemyMempoolConfig {
             ws_url: "wss://example".into(),
             router_filter: vec![],
+            idle_timeout: IDLE_TIMEOUT_DEFAULT,
         };
         let v = cfg.subscribe_params();
         assert_eq!(v, json!(["alchemy_pendingTransactions"]));
@@ -406,6 +437,7 @@ mod tests {
         let cfg = AlchemyMempoolConfig {
             ws_url: "wss://example".into(),
             router_filter: vec![address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D")],
+            idle_timeout: IDLE_TIMEOUT_DEFAULT,
         };
         let v = cfg.subscribe_params();
         let expected = json!([
