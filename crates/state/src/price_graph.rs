@@ -31,10 +31,22 @@ pub struct PriceEdge {
     pub reserve_out: f64,
     /// `true` when this edge is excluded from arbitrage detection because the
     /// backing pool's liquidity is below the configured minimum-liquidity floor
-    /// (see [`PriceGraph::set_min_liquidity_weth`]). Bellman-Ford skips filtered
-    /// edges during relaxation, so dead/drained pools never produce phantom
-    /// cycles. Placeholder edges (no real reserves) are never filtered.
+    /// (see [`PriceGraph::set_min_liquidity_weth`]) OR it was quarantined as a
+    /// never-updated placeholder (see [`PriceGraph::quarantine_stale_edges`]).
+    /// Bellman-Ford skips filtered edges during relaxation, so dead/drained
+    /// pools never produce phantom cycles.
     pub filtered: bool,
+    /// Chain block height at which this edge last received a real reserve
+    /// update via [`update_edge_from_reserves`]. `0` = never updated — i.e. a
+    /// placeholder edge from [`add_edge`] that carries no real reserves.
+    ///
+    /// NOTE: for an AMM, an edge with no *recent* update is NOT stale — a quiet
+    /// pool's cached reserves are still exact, because reserves only change when
+    /// the pool trades (and a trade emits the event that updates this edge). So
+    /// raw age is a liveness signal, not a corruption signal;
+    /// [`PriceGraph::quarantine_stale_edges`] treats it as an opt-in
+    /// missed-event backstop only, never the primary filter.
+    pub last_update_block: u64,
 }
 
 /// Directed price graph for arbitrage detection.
@@ -68,6 +80,12 @@ pub struct PriceGraph {
     /// for a WETH-paired pool's edges to participate in detection. `0.0` (the
     /// default) disables the floor.
     min_liquidity_weth: f64,
+    /// Most recent chain block the writer has applied updates for. Stamped onto
+    /// each edge by [`update_edge_from_reserves`] and read by
+    /// [`quarantine_stale_edges`]. `0` until the writer calls
+    /// [`set_current_block`]; while `0`, edge age is unknown so the age backstop
+    /// is inert (placeholder quarantine still works — it is block-independent).
+    current_block: u64,
 }
 
 impl PriceGraph {
@@ -82,6 +100,7 @@ impl PriceGraph {
             token_decimals: vec![DEFAULT_TOKEN_DECIMALS; num_vertices],
             weth_vertex: None,
             min_liquidity_weth: 0.0,
+            current_block: 0,
         }
     }
 
@@ -126,6 +145,9 @@ impl PriceGraph {
             // Placeholder edges carry no real reserves and are never floored;
             // the follow-up `update_edge_from_reserves` sets the real flag.
             filtered: false,
+            // 0 = never updated. `quarantine_stale_edges` filters such edges
+            // until `update_edge_from_reserves` stamps a real block.
+            last_update_block: 0,
         };
 
         // Try to update an existing edge with matching (from, to, pool_id).
@@ -185,6 +207,9 @@ impl PriceGraph {
         if reserve_in <= 0.0 || reserve_out <= 0.0 {
             return;
         }
+        // Capture before the mutable edge borrow below (can't read &self while
+        // self.edges is borrowed mutably).
+        let cur_block = self.current_block;
         let dec_in = self
             .token_decimals
             .get(from)
@@ -243,6 +268,7 @@ impl PriceGraph {
             existing.reserve_in = reserve_in;
             existing.reserve_out = reserve_out;
             existing.filtered = filtered;
+            existing.last_update_block = cur_block;
             // Mirror the update in the flat edge list via O(1) index lookup.
             // Direct indexing: panics if the key is missing, which is correct —
             // the adjacency list found the edge, so edge_index must agree.
@@ -251,6 +277,7 @@ impl PriceGraph {
             self.all_edges[idx].reserve_in = reserve_in;
             self.all_edges[idx].reserve_out = reserve_out;
             self.all_edges[idx].filtered = filtered;
+            self.all_edges[idx].last_update_block = cur_block;
             self.dirty[idx] = true;
         }
     }
@@ -282,6 +309,84 @@ impl PriceGraph {
             self.all_edges[idx].filtered = filtered;
             self.dirty[idx] = true;
         }
+    }
+
+    /// Record the chain block the writer is currently applying updates for.
+    /// Subsequent [`update_edge_from_reserves`] calls stamp this onto each
+    /// edge's `last_update_block`, and [`quarantine_stale_edges`] uses it to
+    /// compute edge age. Set it once per block before applying that block's
+    /// reserve updates.
+    pub fn set_current_block(&mut self, block: u64) {
+        self.current_block = block;
+    }
+
+    /// The most recent block recorded via [`set_current_block`] (`0` if unset).
+    #[inline]
+    pub fn current_block(&self) -> u64 {
+        self.current_block
+    }
+
+    /// Quarantine stale / corrupt edges by setting their `filtered` flag so
+    /// Bellman-Ford skips them — preventing the placeholder rate=1.0 edge from
+    /// [`add_edge`] from chaining into phantom cycles (the same failure
+    /// [`set_edge_filtered`] guards at boot).
+    ///
+    /// Two signals, deliberately asymmetric:
+    ///
+    /// * **Never-updated placeholders** (`reserve_in <= 0 || reserve_out <= 0`)
+    ///   are ALWAYS quarantined. These carry no real reserves — they are the
+    ///   genuine corruption source. This signal is block-independent and safe.
+    ///
+    /// * **Raw age** (`current_block - last_update_block > max_age_blocks`) is
+    ///   an OPT-IN backstop, applied ONLY when `max_age_blocks > 0` and ONLY to
+    ///   edges that already hold real reserves. It is OFF by default
+    ///   (`max_age_blocks == 0`) because for an AMM a quiet pool's reserves stay
+    ///   exact between trades — age means "no recent trade", not "wrong data".
+    ///   Enable it only as a missed-event / lost-subscription safety net, where
+    ///   dropping coverage on genuinely quiet pools is an acceptable trade.
+    ///
+    /// Quarantine is additive: it only ever SETS `filtered = true`; it never
+    /// clears it. A subsequent [`update_edge_from_reserves`] re-derives
+    /// `filtered` from the liquidity floor, so a quarantined edge that receives
+    /// fresh reserves automatically heals. Returns the number of edges newly
+    /// quarantined by this call.
+    pub fn quarantine_stale_edges(&mut self, max_age_blocks: u64) -> usize {
+        let cur = self.current_block;
+        let mut count = 0usize;
+        for idx in 0..self.all_edges.len() {
+            let (from, to, pool_id, already, reserve_in, reserve_out, last_update) = {
+                let e = &self.all_edges[idx];
+                (
+                    e.from,
+                    e.to,
+                    e.pool_id,
+                    e.filtered,
+                    e.reserve_in,
+                    e.reserve_out,
+                    e.last_update_block,
+                )
+            };
+            if already {
+                continue;
+            }
+            let is_placeholder = reserve_in <= 0.0 || reserve_out <= 0.0;
+            let is_too_old = max_age_blocks > 0
+                && cur > 0
+                && last_update > 0
+                && cur.saturating_sub(last_update) > max_age_blocks;
+            if is_placeholder || is_too_old {
+                self.all_edges[idx].filtered = true;
+                self.dirty[idx] = true;
+                if let Some(adj) = self.edges[from]
+                    .iter_mut()
+                    .find(|x| x.to == to && x.pool_id == pool_id)
+                {
+                    adj.filtered = true;
+                }
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Get all outgoing edges from a vertex.
@@ -1425,5 +1530,73 @@ mod tests {
             (edge.weight - expected_weight).abs() < 1e-12,
             "18/18 decimal pair must match pre-change weight"
         );
+    }
+
+    // --------------- Stale / placeholder quarantine ---------------
+
+    #[test]
+    fn quarantine_filters_never_updated_placeholder() {
+        // add_edge alone leaves reserves at 0 (placeholder). Quarantine with the
+        // age backstop OFF must still filter it on the placeholder signal.
+        let mut g = PriceGraph::new(2);
+        let pool_id = make_pool_id(1, ProtocolType::UniswapV2);
+        g.add_edge(0, 1, 1.0, pool_id, Address::repeat_byte(1), ProtocolType::UniswapV2, U256::from(1u64));
+        assert!(!g.edges_from(0)[0].filtered, "placeholder starts unfiltered");
+
+        let n = g.quarantine_stale_edges(0);
+        assert_eq!(n, 1, "the one placeholder edge should be quarantined");
+        assert!(g.edges_from(0)[0].filtered, "placeholder must be filtered");
+        assert!(g.all_edges()[0].filtered, "mirror in all_edges must agree");
+    }
+
+    #[test]
+    fn quarantine_keeps_updated_edge_regardless_of_age_when_backstop_off() {
+        // A real, updated edge that has not traded for many blocks is NOT stale
+        // for an AMM — its reserves are still exact. With the age backstop off
+        // (max_age_blocks = 0) it must be kept.
+        let mut g = PriceGraph::new(2);
+        let pool_id = make_pool_id(2, ProtocolType::UniswapV2);
+        g.add_edge(0, 1, 1.0, pool_id, Address::repeat_byte(2), ProtocolType::UniswapV2, U256::from(1u64));
+        g.set_current_block(100);
+        g.update_edge_from_reserves(0, 1, pool_id, 1_000.0, 2_000.0, 0.997);
+        // Chain advanced far past the last update.
+        g.set_current_block(1_000_000);
+
+        let n = g.quarantine_stale_edges(0);
+        assert_eq!(n, 0, "quiet-but-valid edge must NOT be filtered when age backstop is off");
+        assert!(!g.edges_from(0)[0].filtered);
+        assert_eq!(g.all_edges()[0].last_update_block, 100, "stamp records the update block");
+    }
+
+    #[test]
+    fn quarantine_age_backstop_is_opt_in() {
+        let mut g = PriceGraph::new(2);
+        let pool_id = make_pool_id(3, ProtocolType::UniswapV2);
+        g.add_edge(0, 1, 1.0, pool_id, Address::repeat_byte(3), ProtocolType::UniswapV2, U256::from(1u64));
+        g.set_current_block(100);
+        g.update_edge_from_reserves(0, 1, pool_id, 1_000.0, 2_000.0, 0.997);
+        g.set_current_block(100 + 51); // 51 blocks since update
+
+        // max_age 50 → 51 > 50 → filtered (opt-in backstop enabled).
+        let n = g.quarantine_stale_edges(50);
+        assert_eq!(n, 1, "updated edge older than max_age must be filtered when backstop enabled");
+        assert!(g.edges_from(0)[0].filtered);
+    }
+
+    #[test]
+    fn quarantine_self_heals_on_fresh_update() {
+        // A quarantined placeholder that later receives real reserves must
+        // un-filter (update_edge_from_reserves re-derives filtered from the
+        // liquidity floor, which is disabled here → false).
+        let mut g = PriceGraph::new(2);
+        let pool_id = make_pool_id(4, ProtocolType::UniswapV2);
+        g.add_edge(0, 1, 1.0, pool_id, Address::repeat_byte(4), ProtocolType::UniswapV2, U256::from(1u64));
+        g.quarantine_stale_edges(0);
+        assert!(g.edges_from(0)[0].filtered, "placeholder quarantined");
+
+        g.set_current_block(500);
+        g.update_edge_from_reserves(0, 1, pool_id, 1_000.0, 2_000.0, 0.997);
+        assert!(!g.edges_from(0)[0].filtered, "fresh reserves must clear the quarantine");
+        assert_eq!(g.edges_from(0)[0].last_update_block, 500);
     }
 }
