@@ -37,7 +37,9 @@ use aether_pools::{
     predict_post_state_with_replay, Pool, PoolState, PoolStateCache, ReplayProtocol,
     UnifiedPostState,
 };
-use aether_simulator::calldata::build_execute_arb_calldata;
+use aether_simulator::calldata::{
+    build_execute_arb_calldata, build_univ2_swap_calldata, build_univ3_swap_calldata,
+};
 use aether_simulator::mempool_backrun::{
     validate_backrun_rpc, ArbTx, RejectReason, ValidatorParams, VictimTx,
 };
@@ -1190,7 +1192,10 @@ fn try_post_state_scan(
                 metrics,
                 publisher,
                 cfg,
-                &snapshot.graph,
+                // Post-victim clone the cycle was detected & gated on — so
+                // cycle_to_swap_steps routes the victim hop through the SAME
+                // pool Bellman-Ford scored (was &snapshot.graph = pre-victim).
+                &graph,
                 ctx.token_index.load().as_ref(),
                 best,
                 event,
@@ -1491,7 +1496,10 @@ fn try_post_state_scan_bancor_multihop(
                 metrics,
                 publisher,
                 cfg,
-                &snapshot.graph,
+                // Post-victim clone the cycle was detected & gated on — so
+                // cycle_to_swap_steps routes the victim hop through the SAME
+                // pool Bellman-Ford scored (was &snapshot.graph = pre-victim).
+                &graph,
                 ctx.token_index.load().as_ref(),
                 best,
                 event,
@@ -1598,14 +1606,36 @@ fn try_post_state_replay(
     // so the dashboard separates dispatch-time failures from per-protocol
     // reader failures.
     let started = Instant::now();
-    let result: Result<UnifiedPostState, &'static str> = match protocol {
-        ReplayProtocol::UniswapV3 => {
-            let state = match aether_simulator::fork::RpcForkedState::new_at_latest(
+    // Pin the detection-time replay fork to the SAME block the validating sim
+    // defaults to (`block_number`), so the analytical victim post-state that
+    // shapes the detection graph is computed against the same state the pinned
+    // sim executes against — no detection-vs-sim block asymmetry.
+    // `AETHER_BACKRUN_FORK_LATEST=1` falls back to chain HEAD in lockstep with
+    // the validator (the Anvil-fork escape hatch).
+    let fork_latest = std::env::var("AETHER_BACKRUN_FORK_LATEST")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let make_replay_fork = || {
+        if fork_latest {
+            aether_simulator::fork::RpcForkedState::new_at_latest(
                 provider.clone(),
                 block_number,
                 now_secs,
                 1_000_000_000,
-            ) {
+            )
+        } else {
+            aether_simulator::fork::RpcForkedState::new(
+                provider.clone(),
+                block_number,
+                now_secs,
+                1_000_000_000,
+            )
+        }
+    };
+    let result: Result<UnifiedPostState, &'static str> = match protocol {
+        ReplayProtocol::UniswapV3 => {
+            let state = match make_replay_fork() {
                 Some(s) => s,
                 None => {
                     metrics.inc_mempool_post_state_replay("sim_error");
@@ -1635,12 +1665,7 @@ fn try_post_state_replay(
                 metrics.inc_mempool_post_state_replay("decode_failed");
                 return None;
             };
-            let state = match aether_simulator::fork::RpcForkedState::new_at_latest(
-                provider.clone(),
-                block_number,
-                now_secs,
-                1_000_000_000,
-            ) {
+            let state = match make_replay_fork() {
                 Some(s) => s,
                 None => {
                     metrics.inc_mempool_post_state_replay("sim_error");
@@ -1668,12 +1693,7 @@ fn try_post_state_replay(
                 metrics.inc_mempool_post_state_replay("decode_failed");
                 return None;
             };
-            let state = match aether_simulator::fork::RpcForkedState::new_at_latest(
-                provider.clone(),
-                block_number,
-                now_secs,
-                1_000_000_000,
-            ) {
+            let state = match make_replay_fork() {
                 Some(s) => s,
                 None => {
                     metrics.inc_mempool_post_state_replay("sim_error");
@@ -1836,6 +1856,43 @@ fn run_backrun_validation(
         SizingOutcome::Fallback => cfg.input_amount_wei,
     };
 
+    // Populate each hop's inner swap calldata. The AetherExecutor runs
+    // `step.pool.call(step.data)` verbatim — an EMPTY `data` reverts
+    // (SwapFailed), so this MUST happen before the sim/publish (leaving it
+    // empty made every backrun sim revert). Build it AFTER sizing so the V2
+    // amountOut reflects the optimizer-sized per-hop input; overlay the
+    // victim pool's post-victim reserves so the requested amountOut matches
+    // what the pool yields after the victim swap lands.
+    for step in steps.iter_mut() {
+        let Some(entry) = pool_states.get(&step.pool_address) else {
+            metrics.inc_mempool_backrun_rejected("pool_state_missing_calldata");
+            return None;
+        };
+        let mut ps = entry.value().as_ref().clone();
+        drop(entry);
+        if step.pool_address == victim_pool {
+            if let PoolState::UniswapV2(p) | PoolState::SushiSwap(p) = &mut ps {
+                if let Some((r0, r1)) =
+                    victim_post_reserves(p, victim_token_in, victim_post_in, victim_post_out)
+                {
+                    p.update_state(r0, r1);
+                }
+            }
+        }
+        match build_inner_swap_calldata(&ps, step, cfg.executor_address) {
+            Some((cd, plabel)) => {
+                step.calldata = cd;
+                metrics.inc_mempool_backrun_calldata_built(plabel);
+            }
+            None => {
+                // Curve/Balancer/Bancor hop with no inner-calldata builder:
+                // drop rather than publish a bundle that reverts on-chain.
+                metrics.inc_mempool_backrun_rejected("unsupported_protocol_calldata");
+                return None;
+            }
+        }
+    }
+
     // Deadline: now + 24s (~2 blocks of mainnet slot time). Mirrors the
     // block-driven path's deadline convention.
     let now_secs = std::time::SystemTime::now()
@@ -1843,13 +1900,26 @@ fn run_backrun_validation(
         .unwrap_or_default()
         .as_secs();
     let deadline = U256::from(now_secs + 24);
-    let calldata = build_execute_arb_calldata(
+    // SIM calldata uses tipBps=0 so 100% of profit lands at
+    // owner()==profit_recipient and the measured balance delta is the FULL arb
+    // profit (not the ~10% the owner keeps after a 90% coinbase tip). The
+    // PUBLISHED calldata carries the real builder tip so the submitted bundle
+    // still pays the coinbase — the two are deliberately separate.
+    let sim_calldata = build_execute_arb_calldata(
         &steps,
         flashloan_token,
         flashloan_amount,
         deadline,
         cfg.min_profit_wei,
-        U256::from(9000u64), // 90% tip share — conservative starting point
+        U256::ZERO,
+    );
+    let exec_calldata = build_execute_arb_calldata(
+        &steps,
+        flashloan_token,
+        flashloan_amount,
+        deadline,
+        cfg.min_profit_wei,
+        U256::from(9000u64), // 90% tip share — what the on-chain bundle pays
     );
 
     let victim = VictimTx {
@@ -1866,7 +1936,8 @@ fn run_backrun_validation(
         // A flashloan + multi-hop arb (Aave ~80k + per-hop swaps + executor
         // overhead) routinely exceeds 1.5M for 3+ hops, OOG-halting a valid
         // arb leg. 3M matches the live-fork integration test's budget.
-        data: calldata,
+        // tipBps=0 sim calldata so the sim measures FULL profit (see above).
+        data: sim_calldata,
         gas_limit: 3_000_000,
     };
     let params = ValidatorParams {
@@ -2002,7 +2073,27 @@ fn run_backrun_validation(
     // over-estimating profit versus what revm actually realized against the
     // (pinned) forked state — a stale-snapshot signature. Drop before
     // publishing rather than handing the executor a contradicted arb.
-    let actual_profit_u128: u128 = result.gross_profit_wei.try_into().unwrap_or(u128::MAX);
+    // Align units before the gate. revm reports FULL gross profit (the sim ran
+    // with tipBps=0 so 100% lands at the recipient); subtract the sim's gas
+    // cost so it is a NET figure comparable to the optimizer's net
+    // `expected_net_wei`. Without this the gate compared net-vs-gross (and,
+    // pre-fix, full-net-vs-10%-owner-share), producing frac_diff ~0.9 and
+    // dropping genuine marginal arbs as revm_contradicts.
+    let sim_gas_cost_wei =
+        U256::from(result.arb_gas_used).saturating_mul(U256::from(params.base_fee));
+    let actual_net_wei = result.gross_profit_wei.saturating_sub(sim_gas_cost_wei);
+    let actual_profit_u128: u128 = actual_net_wei.try_into().unwrap_or(u128::MAX);
+    // Discrepancy gauge: revm-actual NET vs optimizer-expected NET. Clusters at
+    // ~1.0 when detection-state matches sim-state. Only meaningful when the
+    // optimizer sized the arb; the Fallback path leaves expected_net_wei == 0
+    // and bypasses the cross-check entirely (tracked separately).
+    if expected_net_wei > 0 {
+        metrics.observe_mempool_backrun_profit_ratio(
+            actual_profit_u128 as f64 / expected_net_wei as f64,
+        );
+    } else {
+        metrics.inc_mempool_post_sim_gate_bypassed();
+    }
     if let PostSimGateVerdict::Drop(_) =
         cycle_gating::gate_post_sim(expected_net_wei, actual_profit_u128, &gating, metrics)
     {
@@ -2026,12 +2117,14 @@ fn run_backrun_validation(
                 .unwrap_or(0)
         ),
         hops: vec![], // detailed hop info lives on the SwapStep list below
+        // FULL arb profit (sim ran tipBps=0 so the recipient delta is the
+        // whole profit, not the post-tip owner share).
         total_profit_wei: u256_bytes(result.gross_profit_wei),
         total_gas: result.arb_gas_used,
-        gas_cost_wei: u256_bytes(
-            U256::from(result.arb_gas_used).saturating_mul(U256::from(params.base_fee)),
-        ),
-        net_profit_wei: u256_bytes(result.gross_profit_wei),
+        gas_cost_wei: u256_bytes(sim_gas_cost_wei),
+        // Net = full gross − gas (previously duplicated gross with no gas
+        // subtraction, overstating net to the reconciler/executor).
+        net_profit_wei: u256_bytes(actual_net_wei),
         block_number,
         timestamp_ns: now_secs as i64 * 1_000_000_000,
         flashloan_token: flashloan_token.to_vec().into(),
@@ -2041,7 +2134,9 @@ fn run_backrun_validation(
         // the reconciler would compare against the wrong size.
         flashloan_amount: u256_bytes(flashloan_amount),
         steps: steps.into_iter().map(swap_step_to_proto).collect(),
-        calldata: arb.data.into(),
+        // Publish the EXECUTION calldata (real builder tip), NOT the tipBps=0
+        // calldata the sim ran for full-profit measurement.
+        calldata: exec_calldata.into(),
         source: aether_proto::ArbSource::MempoolBackrun as i32,
         victim_tx_hash: event.tx_hash.0.to_vec().into(),
         target_block: block_number.saturating_add(1),
@@ -2157,6 +2252,74 @@ fn poolstate_quote(ps: &PoolState, token_in: Address, amount_in: U256) -> Option
         PoolState::Curve(p) => p.get_amount_out(token_in, amount_in),
         PoolState::Balancer(p) => p.get_amount_out(token_in, amount_in),
         PoolState::Bancor(p) => p.get_amount_out(token_in, amount_in),
+    }
+}
+
+/// Build the protocol-specific inner swap calldata the `AetherExecutor`
+/// executes verbatim via `pool.call(step.data)`. EMPTY calldata reverts
+/// on-chain (`SwapFailed`), so every published hop MUST carry this — leaving
+/// it empty is what made every backrun sim revert (false negatives).
+///
+/// V2/Sushi: `swap(amount0Out, amount1Out, executor, "")` with the exact
+/// per-hop output (quoted against `ps`, which the caller has already overlaid
+/// with the post-victim reserves for the victim pool so the requested
+/// `amountOut` matches what the pool yields after the victim swap). V3:
+/// exact-input `swap(executor, zeroForOne, +amountIn, sqrtPriceLimit, "")`.
+///
+/// Curve / Balancer / Bancor have no inner-calldata builder yet — returns
+/// `None` so the caller drops the candidate with a distinct reject reason
+/// rather than publishing a bundle that reverts.
+// TODO: add Curve/Balancer/Bancor inner-swap calldata builders so those hops
+// can be backrun instead of dropped.
+fn build_inner_swap_calldata(
+    ps: &PoolState,
+    step: &aether_common::types::SwapStep,
+    executor: Address,
+) -> Option<(Vec<u8>, &'static str)> {
+    match (step.protocol, ps) {
+        (
+            ProtocolType::UniswapV2 | ProtocolType::SushiSwap,
+            PoolState::UniswapV2(p) | PoolState::SushiSwap(p),
+        ) => {
+            let out = poolstate_quote(ps, step.token_in, step.amount_in)?;
+            if out.is_zero() {
+                return None;
+            }
+            // amountOut goes to the slot of the OUTPUT token; token_in==token0
+            // means we receive token1 (amount1Out), and vice-versa.
+            let zero_for_one = step.token_in == p.token0;
+            let (amount0_out, amount1_out) = if zero_for_one {
+                (U256::ZERO, out)
+            } else {
+                (out, U256::ZERO)
+            };
+            let label = if step.protocol == ProtocolType::SushiSwap {
+                "sushiswap"
+            } else {
+                "uniswap_v2"
+            };
+            Some((
+                build_univ2_swap_calldata(amount0_out, amount1_out, executor),
+                label,
+            ))
+        }
+        (ProtocolType::UniswapV3, PoolState::UniswapV3(p)) => {
+            let zero_for_one = step.token_in == p.token0;
+            // Exact-input swap: positive amountSpecified; price limit set to
+            // the extreme tick in the swap direction (MIN_SQRT_RATIO+1 /
+            // MAX_SQRT_RATIO-1), matching `aether_profit_scorer`.
+            let sqrt_limit = if zero_for_one {
+                U256::from(4_295_128_740u64)
+            } else {
+                (U256::from(1u8) << 160) - U256::from(2u8)
+            };
+            let amt = i128::try_from(step.amount_in.saturating_to::<u128>()).ok()?;
+            Some((
+                build_univ3_swap_calldata(executor, zero_for_one, amt, sqrt_limit),
+                "uniswap_v3",
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -2967,6 +3130,107 @@ mod tests {
             100,
             4,
         ))
+    }
+
+    // ── FIX 1 (empty-calldata) regression: cycle_to_swap_steps / the
+    // run_backrun_validation calldata loop MUST populate step.data, or the
+    // AetherExecutor's `pool.call(step.data)` reverts SwapFailed and every
+    // backrun sim is a false negative. These prove build_inner_swap_calldata
+    // emits non-empty, direction-correct calldata for V2/V3 and refuses
+    // protocols with no builder. ──
+    #[test]
+    fn build_inner_swap_calldata_v2_nonempty_and_direction_dependent() {
+        use aether_pools::uniswap_v2::UniswapV2Pool;
+        let t0 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"); // USDC
+        let t1 = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"); // WETH
+        let pool = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+        let executor = address!("00000000000000000000000000000000000000aa");
+        let mut p = UniswapV2Pool::new(pool, t0, t1, 30);
+        p.reserve0 = U256::from(1_000_000_000_000_000_000u128);
+        p.reserve1 = U256::from(1_000_000_000_000_000_000u128);
+        let ps = PoolState::UniswapV2(p);
+
+        let step_fwd = aether_common::types::SwapStep {
+            protocol: ProtocolType::UniswapV2,
+            pool_address: pool,
+            token_in: t0,
+            token_out: t1,
+            amount_in: U256::from(1_000_000_000_000_000u128),
+            min_amount_out: U256::ZERO,
+            calldata: Vec::new(),
+        };
+        let (cd_fwd, label) =
+            build_inner_swap_calldata(&ps, &step_fwd, executor).expect("V2 calldata must build");
+        assert_eq!(label, "uniswap_v2");
+        assert!(
+            !cd_fwd.is_empty() && cd_fwd.len() >= 4,
+            "calldata must NOT be empty — empty data reverts SwapFailed on-chain"
+        );
+
+        // Flipping token_in moves amountOut to the other slot → different bytes.
+        let step_rev = aether_common::types::SwapStep {
+            protocol: ProtocolType::UniswapV2,
+            pool_address: pool,
+            token_in: t1,
+            token_out: t0,
+            amount_in: U256::from(1_000_000_000_000_000u128),
+            min_amount_out: U256::ZERO,
+            calldata: Vec::new(),
+        };
+        let (cd_rev, _) =
+            build_inner_swap_calldata(&ps, &step_rev, executor).expect("V2 reverse must build");
+        assert_ne!(
+            cd_fwd, cd_rev,
+            "amount0Out/amount1Out orientation must depend on swap direction"
+        );
+    }
+
+    #[test]
+    fn build_inner_swap_calldata_v3_nonempty() {
+        let ps = synthetic_v3_pool_state();
+        let (t0, t1) = match &ps {
+            PoolState::UniswapV3(p) => (p.token0, p.token1),
+            _ => unreachable!(),
+        };
+        let step = aether_common::types::SwapStep {
+            protocol: ProtocolType::UniswapV3,
+            pool_address: address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
+            token_in: t0,
+            token_out: t1,
+            amount_in: U256::from(1_000_000_000_000_000_000u128),
+            min_amount_out: U256::ZERO,
+            calldata: Vec::new(),
+        };
+        let (cd, label) =
+            build_inner_swap_calldata(&ps, &step, address!("00000000000000000000000000000000000000aa"))
+                .expect("V3 calldata must build");
+        assert_eq!(label, "uniswap_v3");
+        assert!(!cd.is_empty() && cd.len() >= 4);
+    }
+
+    #[test]
+    fn build_inner_swap_calldata_unsupported_protocol_returns_none() {
+        let t0 = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let t1 = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let ps = synthetic_curve_pool_state([t0, t1]);
+        let step = aether_common::types::SwapStep {
+            protocol: ProtocolType::Curve,
+            pool_address: address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"),
+            token_in: t0,
+            token_out: t1,
+            amount_in: U256::from(1_000_000u128),
+            min_amount_out: U256::ZERO,
+            calldata: Vec::new(),
+        };
+        assert!(
+            build_inner_swap_calldata(
+                &ps,
+                &step,
+                address!("00000000000000000000000000000000000000aa")
+            )
+            .is_none(),
+            "Curve/Balancer/Bancor have no inner-calldata builder → must drop, not emit empty"
+        );
     }
 
     /// Build a synthetic 80/20-weight Balancer `PoolState` so the

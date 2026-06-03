@@ -1176,3 +1176,71 @@ tier = "warm"
 # token1 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
 # fee_bps = 1
 # tier = "cold"
+
+# ---------------------------------------------------------------------------
+# Extra venues for high-traction pairs — gives the most-traded pairs >=2
+# *executable* venues (UniV2/V3/Sushi; the mempool-backrun path builds calldata
+# only for these). Every address verified on-chain (getCode + token0/token1 +
+# fee) at block ~25.24M via cast against mainnet before being added.
+#   - USDC/USDT had only same-family UniV3 tiers → add UniV2 (cross-AMM).
+#   - WETH/USDT, DAI/USDC, WBTC/WETH, wstETH/WETH → add the missing UniV3 tier.
+#   - DAI/USDT was unlisted → add UniV2 + UniV3 so the pair itself is 2-venue
+#     and the USDC/USDT/DAI stable triangle is denser.
+# fee_bps convention: UniV3 fee / 100 (fee 100→1, 500→5, 3000→30, 10000→100).
+# ---------------------------------------------------------------------------
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0x3041CbD36888bECc7bbCBc0045E3B1f144466f5f"
+token0 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0xC5aF84701f98Fa483eCe78aF83F11b6C38ACA71D"
+token0 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 100  # UniV3 1.0%
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x6c6Bc977E13Df9b0de53b251522280BB72383700"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # DAI
+token1 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"  # USDC
+fee_bps = 5  # UniV3 0.05%
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0xD340B57AAcDD10F96FC1CF10e15921936F41E29c"
+token0 = "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"  # wstETH
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 5  # UniV3 0.05%
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x6Ab3bba2F41e7eAA262fa5A1A9b3932fA161526F"
+token0 = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"  # WBTC
+token1 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"  # WETH
+fee_bps = 100  # UniV3 1.0%
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v2"
+address = "0xB20bd5D04BE54f870D5C0d3cA85d82b34B836405"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # DAI
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 30
+tier = "hot"
+
+[[pools]]
+protocol = "uniswap_v3"
+address = "0x48DA0965ab2d2cbf1C17C09cFB5Cbe67Ad5B1406"
+token0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"  # DAI
+token1 = "0xdAC17F958D2ee523a2206206994597C13D831ec7"  # USDT
+fee_bps = 1  # UniV3 0.01%
+tier = "hot"

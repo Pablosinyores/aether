@@ -1429,6 +1429,9 @@ impl AetherEngine {
         let mut fetched: u32 = 0;
         {
             let mut graph = self.working_graph.lock().await;
+            // Stamp the block so update_edge_from_reserves records each edge's
+            // freshness (used by quarantine_stale_edges' age backstop).
+            graph.set_current_block(self.current_block.load().number);
             for reserve in all_results {
                 match reserve {
                     ReserveResult::V2 { pool_addr, meta, r0, r1 } => {
@@ -1872,9 +1875,28 @@ impl AetherEngine {
         // update would never trigger a detection scan (TOCTOU on dirty flags).
         let (detection_graph, block_number, timestamp_ns) = {
             let mut graph = self.working_graph.lock().await;
+            let block = (**self.current_block.load()).clone();
+            // Stamp the block, then quarantine never-updated placeholder edges
+            // (always) plus, if AETHER_EDGE_MAX_AGE_BLOCKS>0, missed-event-stale
+            // edges. Filtered edges are skipped by Bellman-Ford, so this kills
+            // the placeholder rate=1.0 phantom-cycle source before detection.
+            // Done under the lock before the clone so the filter both feeds this
+            // cycle's detection_graph and persists in the working graph.
+            graph.set_current_block(block.number);
+            let max_age_blocks = std::env::var("AETHER_EDGE_MAX_AGE_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let quarantined = graph.quarantine_stale_edges(max_age_blocks);
+            if quarantined > 0 {
+                debug!(
+                    quarantined,
+                    block = block.number,
+                    "quarantined stale/placeholder edges before detection"
+                );
+            }
             let snapshot_graph = graph.clone();
             graph.clear_dirty();
-            let block = (**self.current_block.load()).clone();
             (snapshot_graph, block.number, block.timestamp as i64)
         };
 
@@ -3737,6 +3759,7 @@ fee_bps = 30
             reserve_in: 0.0,
             reserve_out: 0.0,
             filtered: false,
+            last_update_block: 0,
         }
     }
 
