@@ -1057,6 +1057,166 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "⑥ Arb reality & discrepancy (detection vs revm)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Profit ratio: revm-actual ÷ optimizer-expected (p50/p95)",
+      "description": "THE discrepancy gauge. revm-measured NET profit divided by the optimizer's expected NET profit for validated backruns. ~1.0 = detection-state matches sim-state (no discrepancy). A persistent left tail (<<1.0) means stale snapshot / unit mismatch.",
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 0,
+        "y": 67
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(aether_mempool_backrun_profit_ratio_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(aether_mempool_backrun_profit_ratio_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Inner swap calldata built by protocol (5m rate)",
+      "description": "Proves the AetherExecutor receives non-empty step.data per hop (empty data reverts SwapFailed). uniswap_v2 / uniswap_v3 / sushiswap build; curve/balancer/bancor have no builder and instead show under rejections as unsupported_protocol_calldata.",
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 9,
+        "y": 67
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (protocol) (rate(aether_mempool_backrun_calldata_built_total{job=~\"aether-rust|aether-host-rust\"}[5m]))",
+          "legendFormat": "{{protocol}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Post-sim cross-check bypassed (5m rate)",
+      "description": "Backruns published WITHOUT the detector-vs-revm profit cross-check because the optimizer fell back (expected_net == 0). Watch this share — these rely on the sim's own accept criteria only.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 67
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(aether_mempool_post_sim_gate_bypassed_total{job=~\"aether-rust|aether-host-rust\"}[5m]))",
+          "legendFormat": "bypassed/s"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      }
     }
   ]
 }

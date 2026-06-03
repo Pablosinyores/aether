@@ -221,6 +221,21 @@ pub struct EngineMetrics {
     /// signal that the configured Multicall3 deployment is unreachable on
     /// this chain.
     prewarm_multicall_fallbacks_total: IntCounter,
+    /// Discrepancy gauge: ratio of revm-measured actual NET profit to the
+    /// optimizer's expected NET profit for validated mempool backruns. After
+    /// the calldata/tip/gas-unit fixes this clusters at ~1.0; a fat left tail
+    /// means detection-state and sim-state disagree (stale-snapshot signature).
+    mempool_backrun_profit_ratio: Histogram,
+    /// Count of mempool-backrun sims where the post-sim profit cross-check was
+    /// bypassed because the optimizer fell back (expected_net == 0). These
+    /// arbs publish on the sim's own accept criteria with no detector-vs-revm
+    /// cross-check, so operators should watch this share.
+    mempool_post_sim_gate_bypassed_total: IntCounter,
+    /// Inner swap calldata successfully built per hop, by protocol. Proves the
+    /// AetherExecutor receives non-empty `step.data` (empty data reverts
+    /// SwapFailed). Curve/Balancer/Bancor have no builder yet and instead bump
+    /// `mempool_backrun_rejected_total{reason="unsupported_protocol_calldata"}`.
+    mempool_backrun_calldata_built_total: IntCounterVec,
 }
 
 impl EngineMetrics {
@@ -472,6 +487,29 @@ impl EngineMetrics {
             "Multicall3 batches that errored and forced a per-pool eth_getStorageAt fallback",
         )
         .expect("aether_prewarm_multicall_fallbacks_total counter");
+        let mempool_backrun_profit_ratio = Histogram::with_opts(
+            HistogramOpts::new(
+                "aether_mempool_backrun_profit_ratio",
+                "Ratio of revm actual net profit to optimizer expected net profit for validated mempool backruns",
+            )
+            .buckets(vec![
+                0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0,
+            ]),
+        )
+        .expect("aether_mempool_backrun_profit_ratio histogram");
+        let mempool_post_sim_gate_bypassed_total = IntCounter::new(
+            "aether_mempool_post_sim_gate_bypassed_total",
+            "Mempool-backrun sims where the post-sim profit cross-check was bypassed (expected_net == 0)",
+        )
+        .expect("aether_mempool_post_sim_gate_bypassed_total counter");
+        let mempool_backrun_calldata_built_total = IntCounterVec::new(
+            Opts::new(
+                "aether_mempool_backrun_calldata_built_total",
+                "Inner swap calldata built per hop for the mempool-backrun path, by protocol",
+            ),
+            &["protocol"],
+        )
+        .expect("aether_mempool_backrun_calldata_built_total counter vec");
 
         registry
             .register(Box::new(detection_latency_ms.clone()))
@@ -578,6 +616,15 @@ impl EngineMetrics {
         registry
             .register(Box::new(prewarm_multicall_fallbacks_total.clone()))
             .expect("register aether_prewarm_multicall_fallbacks_total");
+        registry
+            .register(Box::new(mempool_backrun_profit_ratio.clone()))
+            .expect("register aether_mempool_backrun_profit_ratio");
+        registry
+            .register(Box::new(mempool_post_sim_gate_bypassed_total.clone()))
+            .expect("register aether_mempool_post_sim_gate_bypassed_total");
+        registry
+            .register(Box::new(mempool_backrun_calldata_built_total.clone()))
+            .expect("register aether_mempool_backrun_calldata_built_total");
 
         // Pre-touch every label so dashboards see zero rows from boot.
         for ev in &[
@@ -645,6 +692,9 @@ impl EngineMetrics {
             prewarm_multicall_batches_total,
             prewarm_multicall_v2_slots_total,
             prewarm_multicall_fallbacks_total,
+            mempool_backrun_profit_ratio,
+            mempool_post_sim_gate_bypassed_total,
+            mempool_backrun_calldata_built_total,
         }
     }
 
@@ -949,6 +999,24 @@ impl EngineMetrics {
     pub fn inc_mempool_backrun_rejected(&self, reason: &str) {
         self.mempool_backrun_rejected_total
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// Observe the revm-actual / optimizer-expected NET profit ratio for a
+    /// validated mempool backrun. ~1.0 means detection-state matched sim-state.
+    pub fn observe_mempool_backrun_profit_ratio(&self, ratio: f64) {
+        self.mempool_backrun_profit_ratio.observe(ratio);
+    }
+
+    /// Bump `aether_mempool_post_sim_gate_bypassed_total`.
+    pub fn inc_mempool_post_sim_gate_bypassed(&self) {
+        self.mempool_post_sim_gate_bypassed_total.inc();
+    }
+
+    /// Bump `aether_mempool_backrun_calldata_built_total{protocol}`.
+    pub fn inc_mempool_backrun_calldata_built(&self, protocol: &str) {
+        self.mempool_backrun_calldata_built_total
+            .with_label_values(&[protocol])
             .inc();
     }
 
