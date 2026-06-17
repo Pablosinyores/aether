@@ -1985,6 +1985,28 @@ fn run_backrun_validation(
         }
         metrics.inc_mempool_backrun_rejected(reason);
         metrics.observe_mempool_backrun_validation_latency_ms("reject", elapsed_ms);
+        // Record the gross / gas-cost / deficit triple so dashboards can
+        // distinguish "missed breakeven by ε" (gas-model tuning win) from
+        // "missed by miles" (paths fundamentally too thin) without
+        // grepping `aether-rust` logs for the matching info! line. Gas cost
+        // is pinned to `params.base_fee` so the histogram matches the
+        // simulator's own NegativeAfterGas accounting; the executor's real
+        // gas pricing lives on a separate counter on the Go side.
+        let gas_cost_wei = alloy::primitives::U256::from(result.arb_gas_used)
+            .saturating_mul(alloy::primitives::U256::from(params.base_fee));
+        let gross_eth = EngineMetrics::wei_to_eth_f64(result.gross_profit_wei);
+        let gas_cost_eth = EngineMetrics::wei_to_eth_f64(gas_cost_wei);
+        let deficit_wei = gas_cost_wei.saturating_sub(result.gross_profit_wei);
+        let deficit_eth = EngineMetrics::wei_to_eth_f64(deficit_wei);
+        metrics.observe_mempool_backrun_gross_profit_eth(reason, gross_eth);
+        metrics.observe_mempool_backrun_gas_cost_eth(reason, gas_cost_eth);
+        // Only emit the deficit observation when the math is meaningful —
+        // RpcTransport / SimTimeout / fork_construction-style rejects have
+        // arb_gas_used == 0 and would skew the deficit histogram toward 0
+        // with samples that aren't really "near breakeven".
+        if result.arb_gas_used > 0 && deficit_wei > alloy::primitives::U256::ZERO {
+            metrics.observe_mempool_backrun_deficit_eth(reason, deficit_eth);
+        }
         debug!(
             target: "aether::mempool",
             tx_hash = %event.tx_hash,
@@ -2014,6 +2036,19 @@ fn run_backrun_validation(
     metrics.observe_mempool_backrun_validation_latency_ms("accept", elapsed_ms);
     let bucket = gross_profit_bucket(result.gross_profit_wei);
     metrics.inc_mempool_backrun_validated(bucket);
+    // Mirror the reject-path histogram observations under reason="accepted"
+    // so a single PromQL series can compare survivor gross/gas distributions
+    // against each rejected bucket without joining two metric names.
+    let accept_gas_cost_wei = alloy::primitives::U256::from(result.arb_gas_used)
+        .saturating_mul(alloy::primitives::U256::from(params.base_fee));
+    metrics.observe_mempool_backrun_gross_profit_eth(
+        "accepted",
+        EngineMetrics::wei_to_eth_f64(result.gross_profit_wei),
+    );
+    metrics.observe_mempool_backrun_gas_cost_eth(
+        "accepted",
+        EngineMetrics::wei_to_eth_f64(accept_gas_cost_wei),
+    );
 
     let proto = aether_proto::ValidatedArb {
         id: format!(
