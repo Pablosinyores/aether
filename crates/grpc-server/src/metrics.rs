@@ -121,6 +121,21 @@ pub struct EngineMetrics {
     /// `AETHER_MEMPOOL_SIM_CONCURRENCY` semaphore; exposed so dashboards can
     /// alert on saturation (gauge at ceiling = victims being dropped).
     mempool_backrun_sim_concurrent: IntGauge,
+    /// Gross profit (ETH) measured at the moment of accept-or-reject, labelled
+    /// by [`mempool_backrun_rejected_total`]'s `reason` set (plus `"accepted"`).
+    /// Lets dashboards compare the profit distribution of survivors vs each
+    /// reject bucket — for example, whether `negative_after_gas` candidates
+    /// cluster at small gross or have a fat tail the gas model is eating.
+    mempool_backrun_gross_profit_eth: HistogramVec,
+    /// Gas cost (ETH, at sim base fee) charged to the arb leg at the moment
+    /// of accept-or-reject. Same label set as `gross_profit_eth`. Pairs with
+    /// it so PromQL can compute net = gross - gas_cost downstream.
+    mempool_backrun_gas_cost_eth: HistogramVec,
+    /// `gas_cost - gross_profit` (ETH) for rejected backruns where the math is
+    /// meaningful (`negative_after_gas` primarily; `arb_reverted` / `arb_halted`
+    /// observe with gross=0). Answers "by how much did we miss breakeven?"
+    /// without grepping logs. Label set matches `mempool_backrun_rejected_total`.
+    mempool_backrun_deficit_eth: HistogramVec,
     /// Wall-clock delta between when this process first saw a pending tx
     /// (`PendingTxEvent::first_seen_unix_nanos` stamp at the ingestion
     /// boundary) and when that tx landed on chain (observed via
@@ -362,6 +377,40 @@ impl EngineMetrics {
             "In-flight mempool-backrun validation sims, bounded by the semaphore",
         )
         .expect("aether_mempool_backrun_sim_concurrent gauge");
+        // Log-scale buckets spanning a 1e-7 → 10 ETH range (so we catch both
+        // dust-level deficits on thin arbs and the occasional fat-tail miss
+        // without saturating either end). Shared across all three histograms
+        // so PromQL queries can subtract / divide buckets cleanly.
+        let backrun_eth_buckets = vec![
+            1e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, 10.0,
+        ];
+        let mempool_backrun_gross_profit_eth = HistogramVec::new(
+            HistogramOpts::new(
+                "aether_mempool_backrun_gross_profit_eth",
+                "Gross ETH profit observed at accept/reject time, by RejectReason label (plus 'accepted')",
+            )
+            .buckets(backrun_eth_buckets.clone()),
+            &["reason"],
+        )
+        .expect("aether_mempool_backrun_gross_profit_eth histogram vec");
+        let mempool_backrun_gas_cost_eth = HistogramVec::new(
+            HistogramOpts::new(
+                "aether_mempool_backrun_gas_cost_eth",
+                "Arb-leg gas cost in ETH at sim base fee, by RejectReason label (plus 'accepted')",
+            )
+            .buckets(backrun_eth_buckets.clone()),
+            &["reason"],
+        )
+        .expect("aether_mempool_backrun_gas_cost_eth histogram vec");
+        let mempool_backrun_deficit_eth = HistogramVec::new(
+            HistogramOpts::new(
+                "aether_mempool_backrun_deficit_eth",
+                "gas_cost - gross_profit (ETH) for rejected backruns; answers 'how close to breakeven'",
+            )
+            .buckets(backrun_eth_buckets),
+            &["reason"],
+        )
+        .expect("aether_mempool_backrun_deficit_eth histogram vec");
         let mempool_first_seen_to_inclusion_ms = Histogram::with_opts(
             HistogramOpts::new(
                 "aether_mempool_first_seen_to_inclusion_ms",
@@ -531,6 +580,15 @@ impl EngineMetrics {
             .register(Box::new(mempool_backrun_sim_concurrent.clone()))
             .expect("register aether_mempool_backrun_sim_concurrent");
         registry
+            .register(Box::new(mempool_backrun_gross_profit_eth.clone()))
+            .expect("register aether_mempool_backrun_gross_profit_eth");
+        registry
+            .register(Box::new(mempool_backrun_gas_cost_eth.clone()))
+            .expect("register aether_mempool_backrun_gas_cost_eth");
+        registry
+            .register(Box::new(mempool_backrun_deficit_eth.clone()))
+            .expect("register aether_mempool_backrun_deficit_eth");
+        registry
             .register(Box::new(mempool_first_seen_to_inclusion_ms.clone()))
             .expect("register aether_mempool_first_seen_to_inclusion_ms");
         registry
@@ -629,6 +687,9 @@ impl EngineMetrics {
             mempool_backrun_validated_total,
             mempool_backrun_rejected_total,
             mempool_backrun_sim_concurrent,
+            mempool_backrun_gross_profit_eth,
+            mempool_backrun_gas_cost_eth,
+            mempool_backrun_deficit_eth,
             mempool_first_seen_to_inclusion_ms,
             mempool_first_seen_events_total,
             mempool_post_state_replay_total,
@@ -952,6 +1013,53 @@ impl EngineMetrics {
             .inc();
     }
 
+    /// Observe one gross-profit sample (ETH) on the backrun funnel, tagged
+    /// with the same `reason` label set as
+    /// [`inc_mempool_backrun_rejected`] (or `"accepted"` for survivors).
+    pub fn observe_mempool_backrun_gross_profit_eth(&self, reason: &str, eth: f64) {
+        self.mempool_backrun_gross_profit_eth
+            .with_label_values(&[reason])
+            .observe(eth);
+    }
+
+    /// Observe one arb-leg gas-cost sample (ETH) at the sim base fee.
+    pub fn observe_mempool_backrun_gas_cost_eth(&self, reason: &str, eth: f64) {
+        self.mempool_backrun_gas_cost_eth
+            .with_label_values(&[reason])
+            .observe(eth);
+    }
+
+    /// Observe one deficit sample (ETH) — `gas_cost - gross_profit`. Only
+    /// meaningful where the deficit is positive (i.e. the sim produced gas
+    /// usage and the gross was either zero or below cost); callers in the
+    /// `accepted` branch should skip this one.
+    pub fn observe_mempool_backrun_deficit_eth(&self, reason: &str, eth: f64) {
+        self.mempool_backrun_deficit_eth
+            .with_label_values(&[reason])
+            .observe(eth);
+    }
+
+    /// Convert a wei-denominated `U256` to a lossy `f64` ETH amount, suitable
+    /// for histogram observation. Saturates at `f64::MAX` for values that
+    /// don't fit (in practice anything ≥ ~1e21 ETH — a non-event).
+    pub fn wei_to_eth_f64(wei: alloy::primitives::U256) -> f64 {
+        // 1 ETH = 1e18 wei. We do the divide in fixed-point: u128 cast of the
+        // truncated `wei / 1e9`, then convert to f64 and divide by 1e9 again.
+        // Two stages keep us under the 2^53 mantissa boundary for typical
+        // backrun-profit ranges (~10 ETH = 1e19 wei).
+        const WEI_PER_GWEI: u128 = 1_000_000_000u128;
+        let gwei: u128 = if wei.bit_len() <= 128 {
+            // U256 → u128 lossy when bit_len > 128; guarded above. Divide
+            // first to keep magnitude small.
+            (wei / alloy::primitives::U256::from(WEI_PER_GWEI))
+                .try_into()
+                .unwrap_or(u128::MAX)
+        } else {
+            u128::MAX
+        };
+        (gwei as f64) / 1e9
+    }
+
     /// Bump `aether_mempool_prewarm_inject_total{result="hit"}`.
     pub fn inc_mempool_prewarm_hit(&self) {
         self.mempool_prewarm_inject_total
@@ -1227,5 +1335,69 @@ mod tests {
         ] {
             assert!(output.contains(name), "missing or wrong: {name}");
         }
+    }
+
+    /// `wei_to_eth_f64` must produce sane ETH values across the range we
+    /// actually observe (sub-mwei → ~10 ETH). Catches any future regression
+    /// in the two-stage divide that keeps us under the 2^53 f64 boundary.
+    #[test]
+    fn wei_to_eth_f64_handles_typical_range() {
+        use alloy::primitives::U256;
+        // 0 wei → 0 ETH (exact).
+        assert_eq!(EngineMetrics::wei_to_eth_f64(U256::ZERO), 0.0);
+        // 1 ETH = 1e18 wei.
+        let one_eth_wei = U256::from(1_000_000_000_000_000_000u128);
+        assert!((EngineMetrics::wei_to_eth_f64(one_eth_wei) - 1.0).abs() < 1e-9);
+        // 0.001 ETH = 1e15 wei.
+        let milli = U256::from(1_000_000_000_000_000u128);
+        assert!((EngineMetrics::wei_to_eth_f64(milli) - 0.001).abs() < 1e-12);
+        // 1 gwei = 1e9 wei → 1e-9 ETH.
+        let one_gwei = U256::from(1_000_000_000u128);
+        assert!((EngineMetrics::wei_to_eth_f64(one_gwei) - 1e-9).abs() < 1e-18);
+        // Sub-gwei truncates to 0 (fine — below histogram floor of 1e-7).
+        assert_eq!(EngineMetrics::wei_to_eth_f64(U256::from(999u128)), 0.0);
+    }
+
+    /// All three reject-funnel histograms must emit at least one labelled
+    /// series per known reject reason plus `"accepted"`, so PromQL queries
+    /// keyed on those labels never miss a bucket.
+    #[test]
+    fn backrun_reject_histograms_emit_per_reason_label() {
+        let metrics = EngineMetrics::new();
+
+        // Observe one sample per known RejectReason label + the accept label.
+        for reason in [
+            "victim_reverted",
+            "victim_halted",
+            "arb_reverted",
+            "arb_halted",
+            "negative_after_gas",
+            "rpc_transport",
+            "sim_timeout",
+            "sim_error",
+            "accepted",
+        ] {
+            metrics.observe_mempool_backrun_gross_profit_eth(reason, 0.001);
+            metrics.observe_mempool_backrun_gas_cost_eth(reason, 0.002);
+            if reason != "accepted" {
+                metrics.observe_mempool_backrun_deficit_eth(reason, 0.001);
+            }
+        }
+
+        let output = String::from_utf8(metrics.render()).expect("metrics output utf-8");
+        for hist in [
+            "aether_mempool_backrun_gross_profit_eth",
+            "aether_mempool_backrun_gas_cost_eth",
+            "aether_mempool_backrun_deficit_eth",
+        ] {
+            assert!(
+                output.contains(&format!("{hist}_count")),
+                "missing histogram series: {hist}"
+            );
+        }
+        // Spot-check one labelled series end-to-end so a future label rename
+        // (RejectReason::as_str()) cannot silently break the dashboard query.
+        assert!(output.contains(r#"reason="negative_after_gas""#));
+        assert!(output.contains(r#"reason="accepted""#));
     }
 }
