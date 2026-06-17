@@ -211,7 +211,7 @@
     {
       "id": 11,
       "type": "stat",
-      "title": "Block accuracy (1h) — Δ ≤ 0",
+      "title": "Block accuracy (1h) \u2014 \u0394 \u2264 0",
       "description": "Fraction of confirmed predictions whose actual_target_block landed at or before the predicted block. Computed from the aether_mempool_block_delta histogram's le=0 bucket over a 1h window.",
       "datasource": {
         "type": "prometheus",
@@ -221,7 +221,7 @@
         {
           "refId": "A",
           "expr": "100 * sum(rate(aether_mempool_block_delta_bucket{job=\"aether-host-reconciler\",le=\"0\"}[1h])) / clamp_min(sum(rate(aether_mempool_block_delta_count{job=\"aether-host-reconciler\"}[1h])), 1e-9)",
-          "legendFormat": "Δ≤0"
+          "legendFormat": "\u0394\u22640"
         }
       ],
       "fieldConfig": {
@@ -232,16 +232,27 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red", "value": null},
-              {"color": "orange", "value": 60},
-              {"color": "green", "value": 85}
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 60
+              },
+              {
+                "color": "green",
+                "value": 85
+              }
             ]
           }
         }
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "value",
@@ -278,16 +289,27 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "red", "value": null},
-              {"color": "orange", "value": 70},
-              {"color": "green", "value": 90}
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 70
+              },
+              {
+                "color": "green",
+                "value": 90
+              }
             ]
           }
         }
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "value",
@@ -304,7 +326,7 @@
       "id": 13,
       "type": "stat",
       "title": "Reconciler queue depth",
-      "description": "Pending reconciliation writes sitting in the writer-goroutine channel. Saturation → drops increment.",
+      "description": "Pending reconciliation writes sitting in the writer-goroutine channel. Saturation \u2192 drops increment.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -318,7 +340,9 @@
       ],
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "value",
@@ -352,15 +376,23 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "red", "value": 0.01}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
             ]
           }
         }
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "background",
@@ -418,7 +450,14 @@
         }
       ],
       "options": {
-        "legend": {"displayMode": "list", "placement": "right", "values": ["value", "percent"]}
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        }
       },
       "gridPos": {
         "x": 12,
@@ -482,7 +521,9 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {"unit": "ms"}
+        "defaults": {
+          "unit": "ms"
+        }
       },
       "gridPos": {
         "x": 12,
@@ -494,7 +535,7 @@
     {
       "id": 200,
       "type": "row",
-      "title": "Profitability scorer (PR #135–#137)",
+      "title": "Profitability scorer (PR #135\u2013#137)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -520,7 +561,14 @@
         }
       ],
       "options": {
-        "legend": {"displayMode": "list", "placement": "right", "values": ["value", "percent"]}
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        }
       },
       "gridPos": {
         "x": 0,
@@ -570,7 +618,9 @@
       ],
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "value",
@@ -604,15 +654,23 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "red", "value": 0.01}
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
             ]
           }
         }
       },
       "options": {
         "reduceOptions": {
-          "calcs": ["lastNotNull"],
+          "calcs": [
+            "lastNotNull"
+          ],
           "fields": ""
         },
         "colorMode": "background",
@@ -647,13 +705,109 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {"unit": "ms"}
+        "defaults": {
+          "unit": "ms"
+        }
       },
       "gridPos": {
         "x": 12,
         "y": 65,
         "w": 12,
         "h": 6
+      }
+    },
+    {
+      "id": 300,
+      "type": "timeseries",
+      "title": "Backrun deficit p50 / p95 by reason (5m, ETH)",
+      "description": "How far below breakeven each reject bucket landed. p50 \u2248 0.0001 ETH \u2192 gas-model tuning likely fixes most; p50 \u2248 0.01 ETH \u2192 paths fundamentally thin.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, reason) (rate(aether_mempool_backrun_deficit_eth_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p50 {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, reason) (rate(aether_mempool_backrun_deficit_eth_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p95 {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ETH",
+          "decimals": 6
+        }
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 9
+      }
+    },
+    {
+      "id": 301,
+      "type": "heatmap",
+      "title": "negative_after_gas deficit distribution (heatmap, ETH)",
+      "description": "Y axis is deficit bucket. Color is sample count per bucket per 5m. Shows whether the 'gas ate it' miss is concentrated near zero (tunable) or spread across orders of magnitude (paths thin).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (le) (rate(aether_mempool_backrun_deficit_eth_bucket{job=~\"aether-rust|aether-host-rust\",reason=\"negative_after_gas\"}[5m]))",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {
+          "unit": "ETH",
+          "decimals": 6
+        }
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 9
+      }
+    },
+    {
+      "id": 302,
+      "type": "timeseries",
+      "title": "Backrun gross profit p50 by reason (5m, ETH)",
+      "description": "Median gross profit at the moment of accept/reject. 'accepted' line is your earnings; reject lines show what detection thinks vs what survives.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, reason) (rate(aether_mempool_backrun_gross_profit_eth_bucket{job=~\"aether-rust|aether-host-rust\"}[5m])))",
+          "legendFormat": "p50 {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ETH",
+          "decimals": 6
+        }
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 24,
+        "h": 9
       }
     }
   ]
