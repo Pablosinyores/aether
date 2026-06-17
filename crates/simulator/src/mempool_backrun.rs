@@ -370,7 +370,7 @@ where
             };
         }
         Ok(ExecutionResult::Halt { reason, gas_used }) => {
-            debug!(?reason, gas_used, "mempool-backrun: victim halted");
+            info!(?reason, gas_used, "mempool-backrun: victim halted");
             return BackrunSimResult::rejected(RejectReason::VictimHalted, gas_used, 0);
         }
         Err(e) => {
@@ -414,9 +414,11 @@ where
                 // here saves a publish + a downstream pipeline step.
                 let gas_cost_wei = U256::from(gas_used).saturating_mul(U256::from(params.base_fee));
                 if gross <= gas_cost_wei {
-                    debug!(
+                    info!(
                         %gross,
                         %gas_cost_wei,
+                        deficit_wei = %gas_cost_wei.saturating_sub(gross),
+                        arb_gas_used = gas_used,
                         "mempool-backrun: gross profit does not cover gas at sim base fee"
                     );
                     return BackrunSimResult::rejected(
@@ -446,10 +448,11 @@ where
             ExecutionResult::Revert { gas_used, output } => {
                 let selector = revert_selector(&output);
                 let reason = decode_revert_reason(&output);
-                debug!(
+                info!(
                     gas_used,
                     reason = %reason,
-                    ?selector,
+                    selector = %alloy::hex::encode(selector),
+                    output_hex = %alloy::primitives::hex::encode(output.as_ref()),
                     "mempool-backrun: arb leg reverted"
                 );
                 BackrunSimResult {
@@ -462,7 +465,7 @@ where
                 }
             }
             ExecutionResult::Halt { reason, gas_used } => {
-                debug!(?reason, gas_used, "mempool-backrun: arb leg halted");
+                info!(?reason, gas_used, "mempool-backrun: arb leg halted");
                 BackrunSimResult::rejected(RejectReason::ArbHalted, victim_gas_used, gas_used)
             }
         },
